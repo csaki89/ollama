@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr:*)", "Bash(gh issue:*)", "Bash(gh api:*)", "Bash(gh repo fork:*)",
+      "PowerShell(gh pr:*)", "PowerShell(gh issue:*)", "PowerShell(gh api:*)", "PowerShell(gh repo fork:*)",
+      "Bash(git push upstream:*)", "Bash(git push * upstream*)", "Bash(git push *ollama/ollama*)",
+      "PowerShell(git push upstream:*)", "PowerShell(git push * upstream*)", "PowerShell(git push *ollama/ollama*)",
+      "Bash(winget:*)", "Bash(choco:*)", "Bash(scoop:*)", "Bash(pip install:*)", "Bash(pip3 install:*)",
+      "Bash(npm install:*)", "Bash(npm i:*)", "Bash(go install:*)", "Bash(cargo install:*)",
+      "PowerShell(winget:*)", "PowerShell(choco:*)", "PowerShell(scoop:*)", "PowerShell(pip install:*)",
+      "PowerShell(npm install:*)", "PowerShell(npm i:*)", "PowerShell(go install:*)", "PowerShell(cargo install:*)",
+      "PowerShell(Install-Module:*)", "PowerShell(msiexec:*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "PowerShell(git push:*)"
+    ]
+  }
+}
