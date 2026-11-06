@@ -27,6 +27,24 @@ services:
       - render
     ulimits:
       memlock: -1
+    # cgroup limit: the dual-buffer RAM guard reads it (free RAM = memory limit - usage), so the
+    # extra host copy is sized against these 100 GB, not against the NAS total
+    deploy:
+      resources:
+        limits:
+          cpus: "60"
+          memory: 100G
+    healthcheck:
+      test: ["CMD", "/bin/ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       # RX 6700 is gfx1031, the image only contains gfx1030 code
       HSA_OVERRIDE_GFX_VERSION: "10.3.0"
@@ -45,4 +63,5 @@ services:
       OLLAMA_MODELS: /models
       OLLAMA_HOST: 0.0.0.0:11434
     volumes:
+      # read-write on purpose: Modelfile variants (use_mmap false) write a manifest here
       - /mnt/nvme/ollama/models:/models
