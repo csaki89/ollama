@@ -87,3 +87,20 @@ IMG=ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-7ce1f36
 docker pull $IMG && docker run --rm --entrypoint /bin/sh $IMG -c 'ollama --version 2>&1 | tail -1; du -sh /usr/lib/ollama/*/; ls -la /usr/lib/ollama/rocm_v7_2; echo "rocBLAS gfx targets:"; ls /usr/lib/ollama/rocm_v7_2/rocblas/library | grep -o "gfx[0-9a-z]*" | sort | uniq -c'
 ```
 Várt: `0.40.2`, a rocBLAS-nél csak `gfx1030`. A tényleges ROCm-futást a teszt-instance indítása után a naplóban kell nézni (`docker logs ollama-dualbuf`: `ROCm0` eszköz, `HSA_OVERRIDE_GFX_VERSION`).
+
+## Rugalmas sáv (`--flex-layers`): mérés a NAS-on
+A patch (`003`) tartalmazza a rugalmas sávot is (a GPU-s rétegek első N-je futás közben a CPU-ra vehető és visszatehető; DECISIONS.md 12–18). Az Ollama alapból nem kapcsolja be, és nincs zónaváltási szabály: a mozgatást csak a hibakereső `LLAMA_FLEX_TEST` váltja ki. A mérőszkript ezt használja, a produkciós compose-ba **nem** kell semmit tenni.
+
+**Futtatás a NAS-on** (a repó klónjából, root vagy docker-csoport; a szkript Python 3, nem a zsh):
+```
+sudo python3 tools/dualbuf/nas-flex-bench.py --image ghcr.io/csaki89/ollama-dualbuf:<címke>
+```
+- Előtte a produkciós Ollama ne tartson modellt a GPU-n (a VRAM-értékeket torzítaná): `curl -s localhost:30068/api/generate -d '{"model":"<modell>","keep_alive":0}'`, vagy várd meg a lejáratot. A szkript figyelmeztet, ha a GPU 300 MiB-nál többet használ indulás előtt.
+- Alapból: modellek `qwen3-vl:8b` (dense) és `qwen3-coder:30b` (MoE), 0/1/2 levett réteg, mindegyik HIP-gráfokkal és `GGML_CUDA_DISABLE_GRAPHS=1`-gyel (12 konténerindítás, modellenként néhány perc betöltéssel; a teljes futás kb. fél–egy óra). A tesztkonténer: 100 GB memória- és 60 CPU-korlát, `/dev/kfd`, `/dev/dri/renderD129`, `HSA_OVERRIDE_GFX_VERSION=10.3.0`, a `/mnt/nvme/ollama/models` csak olvashatóan, port 30070.
+- Részhalmaz: `--models qwen3-vl:8b --layers 0,1 --no-graphs-off`; a dense modellnél beállítható az `-ngl`: `--num-gpu qwen3-vl:8b=30`; a MoE-nél ne add meg (az Ollama/`--fit` dönt). `--dry-run` csak kiírja a docker parancsokat.
+- Eredmény: `flex-bench-<időbélyeg>/results.md` (táblázat: generálás és hosszú prompt tok/s, VRAM, felszabadult MiB, levétel/visszatétel ideje, gráfhasítások, értelmes-e a kimenet, eltér-e a k=0-tól és a gráfok nélküli futástól), `results.json` és a konténernaplók a `logs/` alatt.
+- Ha az Ollama a csak olvasható modellmappán nem indulna el, a napló mutatja; ilyenkor a mappát ideiglenesen írhatóra kell csatolni (a szkriptben a `:ro`).
+
+**Mit mér és hogyan:** a bemelegítő kérés tölti be a modellt, ennek első tokenjei után a `LLAMA_FLEX_TEST="1:take,..."` leveszi a rétegeket (a levétel és a K/V mozgatása a naplóból: `flex_move: layer N moved to CPU (…ms…)`). A szabad VRAM a `mem_info_vram_used` (`0000:86:00.0`) különbsége a k=0 esethez képest. A visszatételt (`20000:put`) a szkript töltelék-promptokkal éri el, a visszatételi idő szintén a naplóból jön. A gráfhasítások a `sched_reserve: graph … splits = pp / tg` sorokból (a szkript `LLAMA_FLEX_TEST_RESERVE=1`-et állít). A szkriptet a laptopon nem tudtam futtatni (nincs Python), az első futás a NAS-on lesz; a naplóformátum-illesztést valódi llama-server naplóval ellenőriztem.
+
+**MoE-nél mire számíts:** a sáv a 0..N-1. réteg; a `--fit` szerint ezek az elöl lévő, teljes rétegek, ha jutott rájuk VRAM. A hátsó rétegek szakértői CPU-n vannak, ezek nem mozognak. Részletek és korlát: DECISIONS.md 16.

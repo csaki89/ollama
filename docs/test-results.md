@@ -33,3 +33,15 @@ ROCm/HIP (az image csak a GitHub Actionsben épül), MoE modell (qwen3-coder:30b
 - A cgo-hoz GCC-kompatibilis C fordító kell Windowson (MinGW-w64 gcc vagy llvm-mingw). A gépen nincs: a PATH-on nincs `gcc`/`clang`/`cc`, a devkitPro csak ARM/PPC keresztfordítókat tartalmaz, a Visual Studio-ban csak `clang-format`/`clang-tidy` van, az MSVC `cl` nem használható cgo-hoz.
 - Telepíteni nem szabad, ezért az `ollama.exe` nem készült el, és az `ollama serve`, a Modelfile-import, valamint az `--load-mode none` indítási sor ellenőrzése az Ollama naplójában nem futott. A llama-server oldali eredmények (fent) érvényesek.
 - Hiányzó eszköz és telepítés (egyik elég): **llvm-mingw** (zip, ~100 MB letöltés, ~700 MB kicsomagolva, PATH-ra tenni), vagy **WinLibs GCC** (`winget install BrechtSanders.WinLibs.POSIX.UCRT`, ~250 MB letöltés, ~1 GB telepítve), vagy MSYS2 `pacman -S mingw-w64-ucrt-x86_64-gcc` (~250 MB). Utána: `set CC=gcc` (vagy clang), `set CGO_ENABLED=1`, `go build -o build\ollama.exe .`, indítás a repó gyökeréből (a `dist\lib\ollama` a munkakönyvtárból megtalálható), `OLLAMA_DEBUG=1`.
+
+## Rugalmas sáv a b11351-es patch-ben: futási próba a laptopon (Vulkan)
+`dist\lib\ollama\llama-server.exe` (az Ollama fordítási útja, a 003-as patch az 410eb0e8d tartalmával), Qwen2.5-1.5B Q4_K_M, `-ngl 14`, `--load-mode none`, 2 kérés (a másodikat mértük), 40 token, `temperature=0`.
+
+| eset | prompt tok/s | gen tok/s | kimenet |
+|---|---|---|---|
+| alap | 305,5 | 18,6 | azonos |
+| `LLAMA_ARG_FLEX_LAYERS=2`, nincs mozgatás | 309,5 | 19,7 | azonos |
+| `--flex-layers 2`, `LLAMA_FLEX_TEST=1:take,1:take,100:put,100:put` | 306,7 | 19,8 | azonos |
+| `LLAMA_ARG_DUAL_BUFFER=1` | 313,7 | 19,3 | azonos |
+
+A napló: `flex layers 15-16: 24 weights with a CPU copy (53,72 MiB), 12 with a host copy (42,61 MiB)`; a 15. és 16. réteg súlya és K/V-je a CPU-ra ment (0,9 / 0,0 ms súly, 0,4 ms K/V), majd visszatérve a Vulkan0-ra (3,9–6,1 ms súly, 0,6–1,1 ms K/V). A RAM-védelem sora a sávra is kiírja a becslést (`flex: free RAM … flex copies 107 MiB`). Ez a mérés a portolás helyességét igazolja (a mozgatás működik, a kimenet azonos), nem teljesítménymérés. A NAS-os mérés: `tools/dualbuf/nas-flex-bench.py` (SUMMARY.md).
