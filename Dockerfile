@@ -130,6 +130,10 @@ FROM scratch AS publish-llama-server-cuda_v13
 COPY --from=llama-server-cuda_v13 dist/lib/ollama /lib/ollama/
 
 FROM rocm-7-deps AS llama-server-rocm_v7_2
+# Optional extra CMake args (e.g. -DAMDGPU_TARGETS=gfx1030) and the GPU arch whose rocBLAS/hipBLASLt
+# kernels are kept in the image (empty = keep everything). Used by the dual-buffer fork image.
+ARG LLAMA_SERVER_ROCM_CMAKE_ARGS=
+ARG ROCM_KEEP_ARCH=
 ENV CC=clang CXX=clang++ CXXFLAGS=--gcc-toolchain=/opt/rh/gcc-toolset-13/root/usr
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
@@ -137,10 +141,15 @@ COPY llama/compat llama/compat
 COPY llama/clef llama/clef
 COPY cmake cmake
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset rocm_v7_2_linux \
+    cmake -S llama/server --preset rocm_v7_2_linux ${LLAMA_SERVER_ROCM_CMAKE_ARGS} \
         && cmake --build build/llama-server-rocm_v7_2 -- -l $(nproc) \
         && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 RUN rm -f dist/lib/ollama/rocm_v7_2/rocblas/library/*gfx90[06]*
+RUN if [ -n "$ROCM_KEEP_ARCH" ]; then \
+        for d in dist/lib/ollama/rocm_v7_2/rocblas/library dist/lib/ollama/rocm_v7_2/hipblaslt/library; do \
+            if [ -d "$d" ]; then find "$d" -type f -name "*gfx*" ! -name "*${ROCM_KEEP_ARCH}*" -delete; fi; \
+        done; \
+    fi
 
 FROM scratch AS publish-llama-server-rocm_v7_2
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama/

@@ -1,0 +1,48 @@
+# TrueNAS SCALE: Apps -> Discover Apps -> Install via YAML (custom app).
+# Test instance of the dual-buffer Ollama, next to the running ollama/ollama:0.40.2-rocm
+# (that one stays on port 30068). Test API: http://<nas>:30069
+#
+# Before the first start:
+#  1. Replace the image tag with the one the "dualbuf-image" workflow printed
+#     (0.40.2-dualbuf-<7 char commit>). Do not use :latest, a restart could pull a different build.
+#  2. If the ghcr.io package is private, log in on the NAS first (see docs/SUMMARY.md).
+#
+# Shared model directory: this instance reads the SAME blobs/manifests as the running one.
+#  - Do not `ollama pull` or delete models through this test instance while the other one is
+#    running, and OLLAMA_NOPRUNE=1 keeps this instance from deleting blobs at startup.
+#  - Per-model variants (Modelfile `FROM <model>` + `PARAMETER use_mmap false`) only add a small
+#    manifest, the blobs are shared. See docs/SUMMARY.md.
+services:
+  ollama-dualbuf:
+    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-REPLACE_WITH_COMMIT
+    container_name: ollama-dualbuf
+    restart: unless-stopped
+    ports:
+      - "30069:11434"
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri/renderD129:/dev/dri/renderD129
+    group_add:
+      - video
+      - render
+    ulimits:
+      memlock: -1
+    environment:
+      # RX 6700 is gfx1031, the image only contains gfx1030 code
+      HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+      # the llama.cpp dual-buffer feature (repacked CPU weights also kept in ROCm_Host for prompt op offload)
+      LLAMA_ARG_DUAL_BUFFER: "1"
+      # dual-buffer needs mmap off. Ollama only passes --load-mode none when a request/Modelfile sets
+      # use_mmap=false, otherwise llama-server reads this variable. Safe default for every model.
+      LLAMA_ARG_LOAD_MODE: "none"
+      # same settings as the running instance
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      # shared model dir: do not prune blobs at startup
+      OLLAMA_NOPRUNE: "1"
+      OLLAMA_MODELS: /models
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - /mnt/nvme/ollama/models:/models

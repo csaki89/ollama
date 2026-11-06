@@ -1,0 +1,90 @@
+# Builds the ROCm (gfx1030 only) Ollama image with the llama.cpp dual-buffer patch
+# (llama/compat/003-dual-buffer.patch) and pushes it to ghcr.io/<owner>/ollama-dualbuf.
+#
+# Fork-only file: the upstream workflows (release.yaml, test*.yaml, latest.yaml) only react to
+# v* tags, pull requests and releases, so a push to the dual-buffer branch never starts them.
+name: dualbuf-image
+
+on:
+  push:
+    branches: [dual-buffer]
+  workflow_dispatch:
+
+concurrency:
+  group: dualbuf-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ollama-dualbuf
+  GPU_ARCH: gfx1030
+
+jobs:
+  image:
+    if: github.repository_owner != 'ollama'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute tags
+        id: meta
+        run: |
+          ver="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
+          ver="${ver#v}"
+          sha="$(git rev-parse --short=7 HEAD)"
+          image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=$ver-dualbuf-$sha" >> "$GITHUB_OUTPUT"
+          echo "Image tag: $ver-dualbuf-$sha"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            FLAVOR=rocm
+            LLAMA_SERVER_ROCM_CMAKE_ARGS=-DAMDGPU_TARGETS=${{ env.GPU_ARCH }}
+            ROCM_KEEP_ARCH=${{ env.GPU_ARCH }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.description=Ollama ${{ steps.meta.outputs.version }} ROCm (${{ env.GPU_ARCH }}) with llama.cpp dual-buffer
+
+      - name: Smoke test
+        run: |
+          img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker pull "$img"
+          docker image inspect "$img" --format 'size: {{.Size}} bytes'
+          docker run --rm --entrypoint /bin/ollama "$img" --version
+          docker run --rm --entrypoint /bin/sh "$img" -c 'ls /usr/lib/ollama /usr/lib/ollama/rocm_v7_2 | head -40; du -sh /usr/lib/ollama'
