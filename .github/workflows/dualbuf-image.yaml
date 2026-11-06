@@ -50,6 +50,8 @@ jobs:
           image="$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')"
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
+          # same GOFLAGS as the upstream release workflow (binary version and release mode)
+          echo GOFLAGS="'-ldflags=-w -s \"-X=github.com/ollama/ollama/version.Version=$ver\" \"-X=github.com/ollama/ollama/server.mode=release\"'" >> "$GITHUB_OUTPUT"
           echo "tag=$ver-dualbuf-$sha" >> "$GITHUB_OUTPUT"
           echo "Image tag: $ver-dualbuf-$sha"
 
@@ -70,6 +72,7 @@ jobs:
           provenance: false
           build-args: |
             FLAVOR=rocm
+            GOFLAGS=${{ steps.meta.outputs.GOFLAGS }}
             LLAMA_SERVER_ROCM_CMAKE_ARGS=-DAMDGPU_TARGETS=${{ env.GPU_ARCH }}
             ROCM_KEEP_ARCH=${{ env.GPU_ARCH }}
           tags: |
@@ -87,4 +90,21 @@ jobs:
           docker pull "$img"
           docker image inspect "$img" --format 'size: {{.Size}} bytes'
           docker run --rm --entrypoint /bin/ollama "$img" --version
-          docker run --rm --entrypoint /bin/sh "$img" -c 'ls /usr/lib/ollama /usr/lib/ollama/rocm_v7_2 | head -40; du -sh /usr/lib/ollama'
+          docker run --rm --entrypoint /bin/sh "$img" -c '
+            echo "== /usr/lib/ollama (sizes)"; du -sh /usr/lib/ollama /usr/lib/ollama/*/
+            for d in /usr/lib/ollama/rocm*; do
+              echo "== $d"; ls -la "$d"
+              echo "== sizes in $d"; du -sh "$d"/* 2>/dev/null
+              for lib in rocblas hipblaslt; do
+                L="$d/$lib/library"
+                if [ -d "$L" ]; then
+                  echo "== $lib kernels per gfx target ($L)"
+                  ls "$L" | grep -o "gfx[0-9a-z]*" | sort | uniq -c
+                  echo "files without gfx in name: $(ls "$L" | grep -vc gfx)"
+                  du -sh "$L"
+                else
+                  echo "== no $lib/library in $d"
+                fi
+              done
+            done
+          '
