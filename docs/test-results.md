@@ -26,3 +26,10 @@ Qwen2.5-1.5B Q4_K_M (`../llama-dualbuf/models`), Intel Iris Xe iGPU (Vulkan0), 4
 
 ## Nem tesztelt
 ROCm/HIP (az image csak a GitHub Actionsben épül), MoE modell (qwen3-coder:30b), Ollama-compat blobok (qwen3-vl:8b), az `ollama` bináris és a Modelfile-útvonal, a `--fit` automatikus placement (`-ngl` nélkül).
+
+## Az `ollama serve`-es próba: akadály (Go telepítve, de nincs C fordító)
+- Go 1.26.10 telepítve (`go version go1.26.10 windows/amd64`).
+- `go build .` (CGO_ENABLED=0, az alapértelmezés itt) hibával áll le: `mlx\nn.go: undefined: Array` stb. Az `mlx` csomag `Array` típusa cgo-s fájlban van (`// #include "generated.h"`), CGO nélkül kimarad; az Ollama build-útvonala (`cmake/local.cmake`) is `CGO_ENABLED=1`-gyel épít.
+- A cgo-hoz GCC-kompatibilis C fordító kell Windowson (MinGW-w64 gcc vagy llvm-mingw). A gépen nincs: a PATH-on nincs `gcc`/`clang`/`cc`, a devkitPro csak ARM/PPC keresztfordítókat tartalmaz, a Visual Studio-ban csak `clang-format`/`clang-tidy` van, az MSVC `cl` nem használható cgo-hoz.
+- Telepíteni nem szabad, ezért az `ollama.exe` nem készült el, és az `ollama serve`, a Modelfile-import, valamint az `--load-mode none` indítási sor ellenőrzése az Ollama naplójában nem futott. A llama-server oldali eredmények (fent) érvényesek.
+- Hiányzó eszköz és telepítés (egyik elég): **llvm-mingw** (zip, ~100 MB letöltés, ~700 MB kicsomagolva, PATH-ra tenni), vagy **WinLibs GCC** (`winget install BrechtSanders.WinLibs.POSIX.UCRT`, ~250 MB letöltés, ~1 GB telepítve), vagy MSYS2 `pacman -S mingw-w64-ucrt-x86_64-gcc` (~250 MB). Utána: `set CC=gcc` (vagy clang), `set CGO_ENABLED=1`, `go build -o build\ollama.exe .`, indítás a repó gyökeréből (a `dist\lib\ollama` a munkakönyvtárból megtalálható), `OLLAMA_DEBUG=1`.
