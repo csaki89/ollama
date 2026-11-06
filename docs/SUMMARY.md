@@ -10,7 +10,7 @@
 
 ## Ami nincs kész
 - **Az `ollama` binárissal végzett laptopos próba.** A laptopon nincs Go, a telepítés tiltott, a Go 1.26.10 MSI letöltve és hash-ellenőrizve a scratchpadben (`...\scratchpad\go-dl\go1.26.10.windows-amd64.msi`). Telepítés után: `cmake -B build . -DOLLAMA_LLAMA_BACKENDS=vulkan` (Developer PowerShell, `VULKAN_SDK` beállítva) és `cmake --build build`, majd a Modelfile (`FROM` a GGUF, `PARAMETER num_gpu 14`, `PARAMETER use_mmap false`) importja; ugyanezt a naplósort kell látni.
-- **A workflow nem futott**, az image nincs lebuildelve (push az origin-re csak kérésre; a workflow és a Dockerfile-változás megtekinthető a `git diff v0.40.2..dual-buffer -- Dockerfile .github docker-compose.yaml` kimenetében). Az első build ideje és az image mérete ismeretlen. A `docker-compose.yaml` image-címkéjében a commit helye (`REPLACE_WITH_COMMIT`) az első sikeres build után tölthető ki.
+- **Az image lebuildelve** (workflow run `42208817209`, sikeres, kb. 34 perc): `ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-1f1fe41` (és `latest`), 1,76 GB, `ollama --version`: 0.40.2, a rocBLAS kernelek csak gfx1030-ra. A ROCm backend **futását** (modell betöltése a GPU-n) még senki nem próbálta. A `docker-compose.yaml` a fenti rögzített címkét használja.
 - **ROCm/HIP, a NAS, MoE (qwen3-coder:30b), a compat-blobok (qwen3-vl:8b)**: nem futottak, a mérés a NAS-on lesz.
 - **Automatikus RAM-keret:** nincs. Az Ollama nem becsli a gazda-RAM-ot, a `--fit` sem számol a host-ikerrel.
 
@@ -23,14 +23,14 @@
 
 ## Hogyan húzza le a NAS a ghcr.io image-et
 Az Actionsből, `GITHUB_TOKEN`-nel feltöltött csomag **alapból privát**.
-- **Nyilvánossá tétel (ajánlott):** GitHub → a fiók „Packages” → `ollama-dualbuf` → „Package settings” → „Change visibility” → Public. Utána a NAS bejelentkezés nélkül húzza: `docker pull ghcr.io/csaki89/ollama-dualbuf:<címke>`, a TrueNAS is tudja. Az image nem tartalmaz titkot (Ollama és llama.cpp, mindkettő MIT), a hátránya csak az, hogy bárki letöltheti.
+- **Nyilvánossá tétel (ajánlott, a GitHub felületén kell megtenni):** GitHub → Packages → `ollama-dualbuf` → Package settings → Change visibility → Public. Utána a NAS bejelentkezés nélkül húzza: `docker pull ghcr.io/csaki89/ollama-dualbuf:<címke>`, a TrueNAS is tudja. Az image nem tartalmaz titkot (Ollama és llama.cpp, mindkettő MIT), a hátránya csak az, hogy bárki letöltheti.
 - **Privát marad:** a NAS shellben (root) `docker login ghcr.io -u csaki89`, jelszónak egy személyes hozzáférési token (classic, `read:packages` jogosultság). A token a NAS-on a Docker konfigurációs fájljában (`config.json`) tárolódik, lejárhat (akkor a frissítés/újratelepítés elhasal), és a TrueNAS rendszerfrissítése a bejelentkezést elveszítheti. Előny: az image nem nyilvános.
 A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; privátnál van token-kezelés. A compose-ban a címke rögzített, ne `latest` legyen.
 
 ## Hogyan kell a NAS-on elindítani
 1. Push az origin-re (kifejezett kérésre), az Actions lefut; a `Compute tags` lépés kiírja a címkét (`0.40.2-dualbuf-<commit>`).
 2. Láthatóság beállítása vagy `docker login` (lásd fent).
-3. A `docker-compose.yaml`-ban a `REPLACE_WITH_COMMIT` helyére a címke commit-része.
+3. A `docker-compose.yaml` már a rögzített címkét tartalmazza (`0.40.2-dualbuf-1f1fe41`); újabb build esetén írd át a `Compute tags` lépés által kiírt címkére.
 4. TrueNAS: Apps → Discover Apps → „Install via YAML” → a fájl tartalma, az app neve pl. `ollama-dualbuf`. A teszt a **30069**-es porton fut a mostani (30068) mellett, ugyanazt a `/mnt/nvme/ollama/models` mappát használja.
 5. Ellenőrzés: `docker logs ollama-dualbuf` (az `OLLAMA_DEBUG=1`-gyel bővebb) → `using llama-server for model`, `load_tensors: dual-buffer: N weights also stored in ROCm_Host (X MiB)`, `ROCm0 model buffer`, `CPU_REPACK model buffer`, `ROCm_Host model buffer`, és a `load_mode = none`. Ha `dual-buffer ... disabling it` figyelmeztetést látsz, az ok a sorban van (mmap, `--no-repack` vagy nincs host-puffer).
 
@@ -72,3 +72,11 @@ done
 - Naplóból ellenőrizd mérésenként a puffereket (`CPU_REPACK`, `ROCm_Host`), a `load_mode`-ot és az `offloaded N/M layers` sort.
 - Várt: C-ben a prompt-sebesség a host-puffer (`--no-repack` nélküli, dual-buffer nélküli alapmód) szintjén (a ../llama-dualbuf mérése szerint +23% / +59% / +64% 30/18/6 réteggel a repackhez képest), a generálás a repack szintjén (28,7-29,5 / 18,8-20,0 / 14,0-14,5 tok/s).
 - A RAM-többlet mérése: `free -m` a betöltés előtt és után (B vs C), várt különbség ≈ a naplóbeli `ROCm_Host` iker mérete.
+
+## Ellenőrzés a NAS-on: image lehúzása, ROCm-könyvtár és rocBLAS gfx-kernelek
+A GitHub Actions smoke testje ugyanezt futtatja; a NAS-on így nézhető meg (a csomagnak publikusnak kell lennie, vagy előtte `docker login ghcr.io`):
+```
+IMG=ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-1f1fe41
+docker pull $IMG && docker run --rm --entrypoint /bin/sh $IMG -c 'ollama --version 2>&1 | tail -1; du -sh /usr/lib/ollama/*/; ls -la /usr/lib/ollama/rocm_v7_2; echo "rocBLAS gfx targets:"; ls /usr/lib/ollama/rocm_v7_2/rocblas/library | grep -o "gfx[0-9a-z]*" | sort | uniq -c'
+```
+Várt: `0.40.2`, a rocBLAS-nél csak `gfx1030`. A tényleges ROCm-futást a teszt-instance indítása után a naplóban kell nézni (`docker logs ollama-dualbuf`: `ROCm0` eszköz, `HSA_OVERRIDE_GFX_VERSION`).
