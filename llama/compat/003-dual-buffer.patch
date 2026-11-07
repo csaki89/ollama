@@ -1,19 +1,23 @@
-dual-buffer and flex layers for the llama.cpp pin (b11351)
+dual-buffer, flex layers and auto zones for the llama.cpp pin (b11351)
 
 --dual-buffer / LLAMA_ARG_DUAL_BUFFER (and --dual-buffer-pattern, --dual-buffer-limit):
 repacked CPU weights are also kept in the host buffer (original format), with an automatic
 RAM guard (cgroup aware, placement based estimate).
 --flex-layers N / LLAMA_ARG_FLEX_LAYERS: the first N GPU layers can move between GPU and CPU
-at runtime (debug trigger: LLAMA_FLEX_TEST).
-Ported from csaki89/llama.cpp (dual-buffer branch, 410eb0e8d, based on e14a77971) to the
+at runtime (zone 2: repacked copy + host copy; debug trigger: LLAMA_FLEX_TEST).
+--auto-zones / LLAMA_ARG_AUTO_ZONES (and --zones-ctx-init / LLAMA_ARG_ZONES_CTX_INIT):
+three-zone placement from two --fit runs (dense and MoE), a KV cache that grows with the use
+(growable VMM buffers on CUDA/HIP, copy fallback elsewhere; LLAMA_KV_NO_VMM=1 turns VMM off),
+and flex layers that go off when the KV needs device memory and come back when it shrinks.
+Ported from csaki89/llama.cpp (dual-buffer branch, e86f222a5, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 3f01b0259..2b8ce47b1 100644
+index 3f01b0259..85c579554 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2433,6 +2433,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2433,6 +2433,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.no_host = true;
          }
      ).set_env("LLAMA_ARG_NO_HOST"));
@@ -40,6 +44,20 @@ index 3f01b0259..2b8ce47b1 100644
 +        }
 +    ).set_env("LLAMA_ARG_FLEX_LAYERS"));
 +    add_opt(common_arg(
++        {"--auto-zones"},
++        "three-zone placement without manual settings: the flex band comes from --fit at the max and a small context, the KV grows with the use, and flex layers move to the CPU when the KV needs the device memory (default: off, requires --load-mode none and --fit on)",
++        [](common_params & params) {
++            params.auto_zones = true;
++        }
++    ).set_env("LLAMA_ARG_AUTO_ZONES"));
++    add_opt(common_arg(
++        {"--zones-ctx-init"}, "N",
++        string_format("with --auto-zones: the small context for zone 1 + 2 and the initial KV size (default: %d)", params.zones_ctx_init),
++        [](common_params & params, int value) {
++            params.zones_ctx_init = value;
++        }
++    ).set_env("LLAMA_ARG_ZONES_CTX_INIT"));
++    add_opt(common_arg(
 +        {"--dual-buffer-limit"}, "MiB",
 +        "with --dual-buffer: max extra host memory for the copies, in tensor order (default: 0 = no limit)",
 +        [](common_params & params, int value) {
@@ -50,10 +68,113 @@ index 3f01b0259..2b8ce47b1 100644
          {"-ctk", "--cache-type-k"}, "TYPE",
          string_format(
 diff --git a/common/common.cpp b/common/common.cpp
-index 695a1bfff..72be3ff9c 100644
+index 695a1bfff..33210b1a4 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1628,6 +1628,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1204,6 +1204,77 @@ common_decision_type common_get_decision_type(const llama_model * model) {
+     return std::strcmp(value, "clef") == 0 ? COMMON_DECISION_TYPE_CLEF : COMMON_DECISION_TYPE_UNKNOWN;
+ }
+ 
++static size_t count_overrides(const llama_model_tensor_buft_override * o) {
++    size_t n = 0;
++    for (; o && o->pattern; ++o) {
++        n++;
++    }
++    return n;
++}
++
++// auto zones (DESIGN-3zone.md 6.1 in csaki89/llama.cpp dual-buffer): zone 1 from the max-context fit, zone 1 + 2 from a second fit with a small context
++static void common_auto_zones(common_params & params, const llama_model_params & mparams_orig, const llama_context_params & cparams_orig,
++        const std::vector<llama_model_tensor_buft_override> & ovr_user,
++        llama_model_params & mparams, llama_context_params & cparams, const common_fit_extra_model * extra) {
++    const uint32_t n_ctx_max  = cparams.n_ctx;
++    const uint32_t n_ctx_init = std::min<uint32_t>(params.zones_ctx_init, n_ctx_max);
++    cparams.zone_vram_margin  = params.fit_params_target.empty() ? 0 : params.fit_params_target[0];
++    if (n_ctx_init < n_ctx_max) {
++        cparams.n_ctx_init = n_ctx_init; // dynamic KV
++    }
++    if (mparams_orig.n_gpu_layers != llama_model_default_params().n_gpu_layers) {
++        COM_INF("%s: auto zones: -ngl is set, no automatic flex band (dynamic KV only)\n", __func__);
++        return;
++    }
++    const size_t n_ovr_user = count_overrides(ovr_user.data());
++    const size_t n_ovr_full = count_overrides(mparams.tensor_buft_overrides);
++    if (mparams.n_gpu_layers < 0 && n_ovr_full == n_ovr_user) {
++        COM_INF("%s: auto zones: everything fits with the max context (%u), the flex band is empty\n", __func__, n_ctx_max);
++        return;
++    }
++    if (n_ctx_init >= n_ctx_max) {
++        return;
++    }
++
++    // zone 1: keep the placement of the max-context fit (layers and tensor overrides, e.g. MoE experts on the CPU)
++    params.zones_ovr_full.assign(mparams.tensor_buft_overrides, mparams.tensor_buft_overrides + n_ovr_full + 1);
++
++    // fit again with the small context, from the user's settings, on scratch buffers
++    llama_model_params   mparams_small = mparams_orig;
++    llama_context_params cparams_small = cparams_orig;
++    cparams_small.n_ctx = n_ctx_init;
++    std::vector<float> split_small(params.tensor_split, params.tensor_split + 128);
++    std::vector<llama_model_tensor_buft_override> ovr_small(ovr_user);
++    ovr_small.resize(std::max(ovr_small.size(), llama_max_tensor_buft_overrides()), { nullptr, nullptr });
++    mparams_small.tensor_split          = split_small.data();
++    mparams_small.tensor_buft_overrides = n_ovr_user > 0 ? ovr_small.data() : nullptr;
++
++    const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams_small, &cparams_small,
++        split_small.data(), ovr_small.data(), params.fit_params_target.data(), n_ctx_init, extra,
++        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
++        COM_INF("%s: auto zones: the small-context fit failed, no automatic flex band (dynamic KV only)\n", __func__);
++        params.zones_ovr_full.clear();
++        return;
++    }
++
++    // zone 1 + 2: load with the small-context placement; the loader puts its GPU tensors that zone 1 has on the CPU in the flex band
++    const int32_t ngl_full  = mparams.n_gpu_layers;
++    const int32_t ngl_small = mparams_small.n_gpu_layers; // -1 = all layers
++    const size_t  n_ovr_small = count_overrides(mparams_small.tensor_buft_overrides);
++    std::copy(split_small.begin(), split_small.end(), params.tensor_split);
++    params.tensor_buft_overrides.assign(ovr_small.begin(), ovr_small.begin() + n_ovr_small);
++    params.tensor_buft_overrides.push_back({ nullptr, nullptr });
++    params.tensor_buft_overrides.resize(std::max(params.tensor_buft_overrides.size(), llama_max_tensor_buft_overrides()), { nullptr, nullptr });
++    mparams.tensor_split          = params.tensor_split;
++    mparams.tensor_buft_overrides = n_ovr_small > 0 ? params.tensor_buft_overrides.data() : nullptr;
++    mparams.n_gpu_layers          = ngl_small;
++    mparams.flex_ngl_full         = ngl_full < 0 ? ngl_small : ngl_full;
++    mparams.flex_ovr_full         = n_ovr_full > n_ovr_user ? params.zones_ovr_full.data() : nullptr;
++    COM_INF("%s: auto zones: n_ctx %u -> %d GPU layers, %zu tensor overrides (zone 1); n_ctx %u -> %d GPU layers, %zu tensor overrides (zone 1 + 2); KV starts at %u cells\n",
++        __func__, n_ctx_max, ngl_full, n_ovr_full, n_ctx_init, ngl_small, n_ovr_small, cparams.n_ctx_init);
++}
++
+ common_init_result::common_init_result(common_params & params, bool model_only) :
+     pimpl(new impl{}) {
+     auto mparams = common_model_params_to_llama(params);
+@@ -1234,13 +1305,23 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+         };
+ 
+-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
++        // auto zones: the fit below is the max context (zone 1), a second fit with a small context gives zone 1 + 2
++        // the fit writes its tensor overrides into params.tensor_buft_overrides, keep the user's ones for the second fit
++        const llama_model_params   mparams_orig = mparams;
++        const llama_context_params cparams_orig = cparams;
++        const std::vector<llama_model_tensor_buft_override> ovr_user = params.tensor_buft_overrides;
++
++        const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+             params.tensor_split,
+             params.tensor_buft_overrides.data(),
+             params.fit_params_target.data(),
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++
++        if (params.auto_zones && status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
++            common_auto_zones(params, mparams_orig, cparams_orig, ovr_user, mparams, cparams, has_draft || spec_mtp ? &extra : nullptr);
++        }
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+@@ -1628,6 +1709,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
      mparams.no_host         = params.no_host;
@@ -65,17 +186,20 @@ index 695a1bfff..72be3ff9c 100644
      if (params.kv_overrides.empty()) {
          mparams.kv_overrides = NULL;
 diff --git a/common/common.h b/common/common.h
-index 641f2dc6f..dc6f2b143 100644
+index 641f2dc6f..bfac42691 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -583,6 +583,10 @@ struct common_params {
+@@ -583,6 +583,13 @@ struct common_params {
      bool no_op_offload     = false; // globally disable offload host tensor operations to device
      bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
      bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 +    bool dual_buffer       = false; // keep repacked CPU weights also in the host buffer (original format) for op offload
 +    std::string dual_buffer_pattern;      // regex on tensor names to duplicate with --dual-buffer (empty = all)
 +    int32_t     dual_buffer_limit_mib = 0; // max extra host memory for --dual-buffer in MiB (0 = no limit)
-+    int32_t     flex_layers           = 0; // last N GPU layers can move to the CPU at runtime (0 = off)
++    int32_t     flex_layers           = 0; // first N GPU layers can move to the CPU at runtime (0 = off, or automatic with auto_zones)
++    bool        auto_zones            = false; // three-zone placement: flex band from two fits, dynamic KV, zone switching (DESIGN-3zone.md 6)
++    int32_t     zones_ctx_init        = 4096;  // auto zones: small context for zone 1 + 2, and the initial KV size
++    std::vector<llama_model_tensor_buft_override> zones_ovr_full; // auto zones: the tensor overrides of the max-context fit (zone 1)
  
      bool single_turn       = false; // single turn chat conversation
  
@@ -161,11 +285,176 @@ index 5bdade6de..7ab00d9a8 100644
  ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 043511b72..8f4b7faab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
+         name(GGML_CUDA_NAME + std::to_string(device)) {
+     }
+ 
+-    ~ggml_backend_cuda_buffer_context() {
++    virtual ~ggml_backend_cuda_buffer_context() {
+         CUDA_CHECK(cudaFree(dev_ptr));
+     }
+ };
+@@ -894,6 +894,136 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+ }
+ 
++// growable device buffer (llama.cpp dynamic KV): a reserved virtual address range, physical memory mapped in chunks at its end,
++// so the tensors keep their address when it grows; the VRAM goes back when the buffer (and its address range) is freed
++// HIP has the VMM functions in the runtime, CUDA needs the driver API (GGML_USE_VMM)
++#if defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
++#define GGML_CUDA_GROWABLE_BUFFER
++#if defined(GGML_USE_HIP)
++#define GGML_CUDA_VMM_OK(x) ((x) == hipSuccess)
++#else
++#define GGML_CUDA_VMM_OK(x) ((x) == CUDA_SUCCESS)
++#endif
++
++struct ggml_backend_cuda_growable_buffer_context : ggml_backend_cuda_buffer_context {
++    CUdeviceptr base = 0;
++    size_t reserved = 0;
++    size_t mapped   = 0;
++    size_t granularity = 0;
++    int    physical_device = 0;
++    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
++
++    ggml_backend_cuda_growable_buffer_context(int device, CUdeviceptr base, size_t reserved, size_t granularity, int physical_device) :
++        ggml_backend_cuda_buffer_context(device, (void *) base), base(base), reserved(reserved), granularity(granularity), physical_device(physical_device) {
++    }
++
++    ~ggml_backend_cuda_growable_buffer_context() override {
++        // each mapping on its own (ROCR-Runtime issue 285), then the address range, which gives the memory back
++        for (auto & m : mappings) {
++            (void) cuMemUnmap(m.first, m.second);
++        }
++        (void) cuMemAddressFree(base, reserved);
++        dev_ptr = nullptr; // not from cudaMalloc
++    }
++
++    // map physical memory up to size, in chunks of at most 64 MiB (a single 1 GiB chunk is unreliable on ROCm)
++    bool map_to(size_t size) {
++        const size_t chunk_max = granularity * std::max<size_t>(1, (64ull << 20) / granularity);
++        while (mapped < size) {
++            size_t chunk = std::min(chunk_max, size - mapped);
++            chunk = granularity * ((chunk + granularity - 1) / granularity);
++            if (mapped + chunk > reserved) {
++                return false;
++            }
++            CUmemAllocationProp prop = {};
++            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++            prop.location.id   = physical_device;
++            CUmemGenericAllocationHandle handle;
++            if (!GGML_CUDA_VMM_OK(cuMemCreate(&handle, chunk, &prop, 0))) {
++                return false;
++            }
++            const CUdeviceptr ptr = (CUdeviceptr) ((char *) base + mapped);
++            if (!GGML_CUDA_VMM_OK(cuMemMap(ptr, chunk, 0, handle, 0))) {
++                (void) cuMemRelease(handle);
++                return false;
++            }
++            (void) cuMemRelease(handle); // the mapping keeps the memory
++            CUmemAccessDesc access = {};
++            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++            access.location.id   = physical_device;
++            access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++            if (!GGML_CUDA_VMM_OK(cuMemSetAccess(ptr, chunk, &access, 1))) {
++                (void) cuMemUnmap(ptr, chunk);
++                return false;
++            }
++            mappings.push_back({ ptr, chunk });
++            mapped += chunk;
++        }
++        return true;
++    }
++};
++
++// size: mapped now, max_size: the reserved address range; NULL if the device has no VMM (the caller falls back)
++static ggml_backend_buffer_t ggml_backend_cuda_buffer_alloc_growable(ggml_backend_buffer_type_t buft, size_t size, size_t max_size) {
++    if (buft->iface.get_name != ggml_backend_cuda_buffer_type_get_name) {
++        return nullptr;
++    }
++    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
++    const int device   = buft_ctx->device;
++    const int physical = ggml_cuda_get_physical_device(device);
++    ggml_cuda_set_device(device);
++
++    CUdevice cu_dev;
++    int vmm = 0;
++    if (!GGML_CUDA_VMM_OK(cuDeviceGet(&cu_dev, physical)) ||
++        !GGML_CUDA_VMM_OK(cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu_dev)) || !vmm) {
++        return nullptr;
++    }
++    CUmemAllocationProp prop = {};
++    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id   = physical;
++    size_t granularity = 0;
++    if (!GGML_CUDA_VMM_OK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)) || granularity == 0) {
++        return nullptr;
++    }
++    const size_t reserved = granularity * ((std::max(size, max_size) + granularity - 1) / granularity);
++    CUdeviceptr base = 0;
++    if (!GGML_CUDA_VMM_OK(cuMemAddressReserve(&base, reserved, 0, 0, 0))) {
++        return nullptr;
++    }
++    auto * ctx = new ggml_backend_cuda_growable_buffer_context(device, base, reserved, granularity, physical);
++    if (!ctx->map_to(std::max<size_t>(size, 1))) {
++        delete ctx;
++        (void) cudaGetLastError();
++        return nullptr;
++    }
++    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
++}
++
++// map more memory at the end of a growable buffer; false if it is not one, or the memory is not available
++static bool ggml_backend_cuda_buffer_grow(ggml_backend_buffer_t buffer, size_t size) {
++    if (!ggml_backend_buffer_is_cuda(buffer)) {
++        return false;
++    }
++    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
++    if (!ctx) {
++        return false;
++    }
++    if (size <= buffer->size) {
++        return true;
++    }
++    ggml_cuda_set_device(ctx->device);
++    if (!ctx->map_to(size)) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    buffer->size = size;
++    return true;
++}
++#endif // defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
++
+ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+     return 128;
+ 
+@@ -5811,6 +5941,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++#if defined(GGML_CUDA_GROWABLE_BUFFER)
++    if (strcmp(name, "ggml_backend_buffer_alloc_growable") == 0) {
++        return (void *)ggml_backend_cuda_buffer_alloc_growable;
++    }
++    if (strcmp(name, "ggml_backend_buffer_grow") == 0) {
++        return (void *)ggml_backend_cuda_buffer_grow;
++    }
++#endif
+     return nullptr;
+ }
+ 
 diff --git a/include/llama.h b/include/llama.h
-index 720b45140..5f83ee338 100644
+index 720b45140..54baa1bf9 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -347,11 +347,19 @@ extern "C" {
+@@ -347,11 +347,27 @@ extern "C" {
          // override key-value pairs of the model meta data
          const struct llama_model_kv_override * kv_overrides;
  
@@ -176,6 +465,14 @@ index 720b45140..5f83ee338 100644
 +        // flex layers: the last N GPU layers get a per-layer buffer and a repacked CPU twin, so they can move to the CPU at runtime (0 = off)
 +        uint32_t     flex_layers;
 +
++        // auto zones: the number of GPU layers that fit with the max context (-1 = unset); with flex_layers == 0 the
++        // flex band is the GPU layers beyond it (n_gpu_layers - flex_ngl_full)
++        int32_t      flex_ngl_full;
++
++        // auto zones: the tensor overrides of the max-context fit (NULL-terminated, NULL = none); a GPU tensor of the
++        // loaded placement that one of them puts on the CPU is in the flex band too (MoE experts)
++        const struct llama_model_tensor_buft_override * flex_ovr_full;
++
          // Keep the booleans together to avoid misalignment during copy-by-value.
          bool vocab_only;      // only load the vocabulary, no weights
          bool check_tensors;   // validate model tensor data
@@ -185,8 +482,20 @@ index 720b45140..5f83ee338 100644
          bool no_alloc;        // only load metadata and simulate memory allocations
          bool load_mtp;        // whether to load MTP layers
      };
+@@ -396,6 +412,11 @@ extern "C" {
+         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+ 
++        // dynamic KV (auto zones): the KV cache starts with n_ctx_init cells and grows with the use up to n_ctx (0 = allocate n_ctx at once)
++        // the flex layers move to the CPU when the KV needs device memory, keeping zone_vram_margin bytes free on the device
++        uint32_t n_ctx_init;
++        size_t   zone_vram_margin;
++
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+         // currently works only with CPU execution
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fa115ffe4..8c728c49d 100644
+index fa115ffe4..e8362ea57 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,7 +9,7 @@
@@ -237,10 +546,193 @@ index fa115ffe4..8c728c49d 100644
      const auto & hparams = model.hparams;
  
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
-@@ -613,6 +645,15 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -395,7 +427,25 @@ llama_context::llama_context(
+             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+         };
+ 
+-        memory.reset(model.create_memory(params_mem, cparams));
++        // dynamic KV (DESIGN-3zone.md 6.2): start with n_ctx_init cells, grow up to n_ctx_seq
++        const uint32_t n_init = GGML_PAD(params.n_ctx_init, 256);
++        const bool     dyn    = params.n_ctx_init > 0 && n_init < cparams.n_ctx_seq && !model.hparams.no_alloc;
++        if (dyn) {
++            llama_cparams cparams_mem = cparams;
++            cparams_mem.n_ctx_seq = n_init;
++            memory.reset(model.create_memory(params_mem, cparams_mem));
++            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
++            if (kv && kv->set_dynamic(cparams.n_ctx_seq, (size_t) 64*1024*1024)) {
++                zones_kv_init = n_init;
++            } else {
++                LLAMA_LOG_WARN("%s: dynamic KV is not supported for this memory (or with a transposed V cache), allocating %u cells\n", __func__, cparams.n_ctx_seq);
++                memory.reset();
++                memory.reset(model.create_memory(params_mem, cparams));
++            }
++        } else {
++            memory.reset(model.create_memory(params_mem, cparams));
++        }
++        zones_vram_margin = params.zone_vram_margin;
+     }
+ 
+     // init backends
+@@ -613,6 +663,171 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
++
++void llama_context::zones_step(uint32_t n_tokens) {
++    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
++    if (!kv || !kv->is_dynamic()) {
++        return;
++    }
++    // the previous batch must be done before buffers change; not synchronize(), that would account the queued batch in the perf stats
++    auto sync = [&]() {
++        if (sched) {
++            ggml_backend_sched_synchronize(sched.get());
++        }
++    };
++
++    // the flash attention probe has run by now: the dynamic KV needs a non-transposed V cache, not flash attention itself
++    if (!zones_fa_logged) {
++        zones_fa_logged = true;
++        if (cparams.flash_attn) {
++            LLAMA_LOG_INFO("%s: zones: flash attention on, dynamic KV on\n", __func__);
++        } else {
++            LLAMA_LOG_WARN("%s: zones: flash attention is not available on this device (auto resolved it to off): the dynamic KV stays on "
++                "(the V cache was created non-transposed), the attention runs without flash attention\n", __func__);
++        }
++    }
++
++    // zone rule (DESIGN-3zone.md 6.3): device memory budget, booked from the first step on
++    const bool rule = !model.flex_layers().empty();
++    if (rule && !zones_headroom_set) {
++        zones_headroom_set = true;
++        size_t dev_free = 0, dev_total = 0;
++        ggml_backend_dev_memory(model.flex_gpu_dev(model.flex_layers().front()), &dev_free, &dev_total);
++        zones_headroom = (int64_t) dev_free - (int64_t) zones_vram_margin;
++        if (const char * env = getenv("LLAMA_ZONES_HEADROOM_MIB")) { // test aid
++            zones_headroom = (int64_t) atoll(env) * 1024 * 1024;
++        }
++        LLAMA_LOG_INFO("%s: zones: device memory budget %.0f MiB (free %.0f MiB, margin %.0f MiB)\n", __func__,
++            zones_headroom / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
++    }
++
++    // a resize outside this step (state load) is booked too; over the budget, flex layers go off first
++    if (rule && zones_kv_size != 0 && kv->get_size() != zones_kv_size) {
++        zones_headroom -= ((int64_t) kv->get_size() - (int64_t) zones_kv_size)*(int64_t) kv->cell_bytes(true);
++    }
++    while (rule && zones_headroom < 0) {
++        const int il = model.flex_next(false);
++        if (il < 0) {
++            break;
++        }
++        const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
++        if (!flex_move_layer(il, false)) {
++            break;
++        }
++        zones_headroom += freed;
++    }
++
++    const uint32_t size = kv->get_size();
++    const uint32_t used = kv->used_cells();
++    bool shrunk = false;
++
++    // shrink when the KV is empty or mostly unused (new conversation, removed sequences)
++    if (size > zones_kv_init && (used == 0 || used < size/4)) {
++        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(used + n_tokens));
++        if (n < size) {
++            sync();
++            const size_t per_cell = kv->cell_bytes(true);
++            if (kv->resize(n)) {
++                zones_headroom += (int64_t) ((size - n)*per_cell);
++                shrunk = true;
++            }
++        }
++    }
++
++    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size)
++    if (rule && (shrunk || used == 0)) {
++        for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
++            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
++            if (cost > zones_headroom) {
++                break;
++            }
++            if (!flex_move_layer(il, true)) {
++                break;
++            }
++            zones_headroom -= cost;
++        }
++    }
++
++    // grow in chunks when the next batch does not fit; take flex layers off (closest to the CPU first) to make room
++    if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
++        sync();
++        const uint32_t n = kv->dyn_round(used + n_tokens);
++        // the copy path also needs the old and the new K/V of a layer at the same time (resize_peak), the VMM path does not
++        auto need = [&]() { return (int64_t) ((n - kv->get_size())*kv->cell_bytes(true) + kv->resize_peak(n)); };
++        int64_t delta = need();
++        while (rule && delta > zones_headroom) {
++            const int il = model.flex_next(false);
++            if (il < 0) {
++                break;
++            }
++            const int64_t freed = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
++            if (!flex_move_layer(il, false)) {
++                break;
++            }
++            zones_headroom += freed;
++            delta = need();
++        }
++        if (rule && delta > zones_headroom) {
++            LLAMA_LOG_WARN("%s: zones: the KV grows beyond the device memory budget (%.0f MiB over), no flex layer left\n", __func__,
++                (delta - zones_headroom) / 1048576.0);
++        }
++        // the budget books the final growth (the transient peak is gone after the resize)
++        const int64_t growth = (int64_t) ((n - kv->get_size())*kv->cell_bytes(true));
++        if (kv->resize(n)) {
++            zones_headroom -= growth;
++        }
++    }
++    zones_kv_size = kv->get_size();
++
++    // the K/V tensors were reallocated (here or in a state load): new graph and scheduler reservation
++    if (kv->generation() != zones_kv_gen) {
++        zones_kv_gen       = kv->generation();
++        gf_res_prev_active = nullptr;
++        sched_need_reserve = true;
++    }
++}
++
++bool llama_context::flex_move_layer(int il, bool to_gpu) {
++    // the previous batch must be done; not synchronize(), that would account the queued batch in the perf stats
++    if (sched) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++    // the GPU backend of the layer, for asynchronous (DMA) copies
++    ggml_backend_t backend_gpu = nullptr;
++    if (!flex_test_copy_legacy) {
++        for (auto & b : backends) {
++            if (ggml_backend_get_device(b.get()) == model.flex_gpu_dev(il)) {
++                backend_gpu = b.get();
++            }
++        }
++    }
++    if (!model.flex_move(il, to_gpu, flex_test_file)) {
++        return false;
++    }
++    if (sched) {
++        flex_set_alts(il);
++    }
++    // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
++    if (flex_test_kv && model.flex_whole(il)) {
++        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
++            kv->flex_move(il, to_gpu, backend_gpu, flex_test_copy_legacy);
++        } else {
++            LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
++        }
++    }
++    // the weight placement changed: build the next graph again
++    gf_res_prev_active = nullptr;
++    return true;
++}
 +
 +void llama_context::flex_set_alts(int il) {
 +    // a flex layer that is off uses its host copies for op offload, like a dual-buffer CPU layer
@@ -253,7 +745,7 @@ index fa115ffe4..8c728c49d 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -639,7 +680,18 @@ void llama_context::sched_reserve() {
+@@ -639,7 +854,18 @@ void llama_context::sched_reserve() {
      gf_res_reserve.reset(new llm_graph_result(max_nodes));
      gf_res_prev_active = nullptr;
  
@@ -272,7 +764,7 @@ index fa115ffe4..8c728c49d 100644
  
      llama_memory_context_ptr mctx;
      if (memory) {
-@@ -679,6 +731,7 @@ void llama_context::sched_reserve() {
+@@ -679,6 +905,7 @@ void llama_context::sched_reserve() {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                  cparams.pipeline_parallel = false;
                  sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -280,58 +772,54 @@ index fa115ffe4..8c728c49d 100644
                  gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
              }
              if (!gf) {
-@@ -1802,6 +1855,46 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
-     output_swaps.clear();
-     embd_batch_idxs.clear();
+@@ -1794,6 +2021,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     }
+     embd_seq.clear();
  
++    // batch boundary: the zone rule and the debug moves run before this batch is queued (and accounted in the perf stats)
++    zones_step(n_tokens_all);
++
 +    for (auto & s : flex_test) {
 +        if (!s.done && flex_test_tokens >= s.at) {
 +            s.done = true;
-+            const int64_t t_sync = ggml_time_us();
-+            synchronize();
-+            LLAMA_LOG_INFO("%s: flex: synchronize before the move %.1f ms\n", __func__, (ggml_time_us() - t_sync) / 1000.0);
 +            if (s.layer < 0) {
 +                s.layer = model.flex_next(s.to_gpu);
 +            }
-+            // the GPU backend of the layer, for asynchronous (DMA) copies
-+            ggml_backend_t backend_gpu = nullptr;
-+            if (s.layer >= 0 && !flex_test_copy_legacy) {
-+                for (auto & b : backends) {
-+                    if (ggml_backend_get_device(b.get()) == model.flex_gpu_dev(s.layer)) {
-+                        backend_gpu = b.get();
-+                    }
-+                }
-+            }
-+            if (s.layer >= 0 && model.flex_move(s.layer, s.to_gpu, flex_test_file)) {
-+                if (sched) {
-+                    flex_set_alts(s.layer);
-+                }
-+                // the layer's K/V follows the weights (LLAMA_FLEX_TEST_KV=0 keeps it in place, for comparison)
-+                if (flex_test_kv) {
-+                    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
-+                        kv->flex_move(s.layer, s.to_gpu, backend_gpu, flex_test_copy_legacy);
-+                    } else {
-+                        LLAMA_LOG_WARN("%s: flex: this memory type does not support moving the K/V, it stays in place\n", __func__);
-+                    }
-+                }
-+                // the weight placement changed: build the next graph again
-+                gf_res_prev_active = nullptr;
-+                if (flex_test_reserve) {
-+                    sched_need_reserve = true;
-+                }
++            if (s.layer >= 0 && flex_move_layer(s.layer, s.to_gpu) && flex_test_reserve) {
++                sched_need_reserve = true;
 +            }
 +        }
 +    }
 +    flex_test_tokens += n_tokens_all;
 +
-     sched_reserve();
++    sched_reserve();
++
+     if (t_compute_start_us == 0) {
+         t_compute_start_us = ggml_time_us();
+     }
+@@ -1802,8 +2047,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     output_swaps.clear();
+     embd_batch_idxs.clear();
  
+-    sched_reserve();
+-
      bool did_optimize = false;
+ 
+     // handle any pending shifts/copies
+@@ -3780,6 +4023,8 @@ llama_context_params llama_context_default_params() {
+         /*.cb_eval_user_data           =*/ nullptr,
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
++        /*.n_ctx_init                  =*/ 0,
++        /*.zone_vram_margin            =*/ 0,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 95b722628..26207cd7d 100644
+index 95b722628..c1305ac9f 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -356,6 +356,24 @@ private:
+@@ -356,6 +356,37 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -353,11 +841,24 @@ index 95b722628..26207cd7d 100644
 +    // register (layer off) or remove (layer on the GPU) the host copies of a flex layer with the scheduler
 +    void flex_set_alts(int il);
 +
++    // move a flex layer (weights, host copies in the scheduler, K/V) at a batch boundary
++    bool flex_move_layer(int il, bool to_gpu);
++
++    // auto zones (DESIGN-3zone.md 6): dynamic KV and the zone switching rule, at a batch boundary before the next batch
++    void     zones_step(uint32_t n_tokens);
++    uint32_t zones_kv_init     = 0; // initial (and minimum) KV cells, 0 = no dynamic KV
++    uint64_t zones_kv_gen      = 0; // the KV generation the graph was built for
++    size_t   zones_vram_margin = 0;
++    int64_t  zones_headroom    = 0;     // device memory budget left, booked with the moves and resizes
++    bool     zones_headroom_set = false;
++    uint32_t zones_kv_size     = 0;     // the KV size booked in the budget
++    bool     zones_fa_logged   = false;
++
      ggml_backend_t backend_cpu = nullptr;
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..bbfd3a4a3 100644
+index 1d0554fa1..6ba4aa925 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -376,7 +877,7 @@ index 1d0554fa1..bbfd3a4a3 100644
  
 -        ggml_context * ctx = ctx_for_buft(buft);
 +        // flex layers: own context (and buffer) per layer, so the K/V can move with the layer
-+        const bool flex = offload && model.flex_has_layer(il);
++        const bool flex = offload && model.flex_whole(il);
 +        if (flex) {
 +            ggml_init_params params = {
 +                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
@@ -419,7 +920,22 @@ index 1d0554fa1..bbfd3a4a3 100644
  
      {
          const size_t memory_size_k = size_k_bytes();
-@@ -2780,6 +2816,127 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2186,6 +2222,14 @@ const slot_info_vec_t *   sinfos_in) {
+ 
+         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+ 
++        // dynamic KV: make room for the restored cells first
++        if (is_dynamic()) {
++            const uint32_t need = (seq_id == -1 ? 0 : used_cells()) + cell_count;
++            if (need > get_size() && !resize(dyn_round(need))) {
++                throw std::runtime_error("failed to restore kv cache: the dynamic KV cannot grow to the restored cells");
++            }
++        }
++
+         slot_info sinfo;
+ 
+         bool res = true;
+@@ -2780,6 +2824,478 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -465,7 +981,15 @@ index 1d0554fa1..bbfd3a4a3 100644
 +    for (ggml_tensor * t : tensors) {
 +        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
 +    }
-+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
++    // reuse the host buffer kept from the last time the layer was off (the allocation of pinned memory is the slow part)
++    ggml_backend_buffer_t buf = nullptr;
++    const bool reused = !to_gpu && fk.spare && ggml_backend_buffer_get_type(fk.spare.get()) == buft && ggml_backend_buffer_get_size(fk.spare.get()) >= size;
++    if (reused) {
++        buf = fk.spare.release();
++    } else {
++        fk.spare.reset();
++        buf = ggml_backend_buft_alloc_buffer(buft, size);
++    }
 +    if (!buf) {
 +        LLAMA_LOG_ERROR("%s: layer %d: failed to allocate %zu bytes in %s\n", __func__, il, size, ggml_backend_buft_name(buft));
 +        return false;
@@ -533,14 +1057,357 @@ index 1d0554fa1..bbfd3a4a3 100644
 +        }
 +    }
 +
-+    // frees the old buffer
++    // frees the old buffer; a host buffer is kept for the next time the layer goes off (not in legacy mode)
++    ggml_backend_buffer_ptr old(ctxs_bufs[fk.buf_idx].second.release());
 +    ctxs_bufs[fk.buf_idx].second.reset(buf);
++    if (to_gpu && !legacy && old && ggml_backend_buffer_is_host(old.get())) {
++        fk.spare = std::move(old);
++    }
++    old.reset();
 +    fk.on_gpu = to_gpu;
 +    const int64_t t4 = ggml_time_us();
 +
-+    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
++    LLAMA_LOG_INFO("%s: layer %d K/V moved to %s (%.2f MiB, %u cells, %.2f MiB copied, %.1f ms: alloc %.1f%s, clear %.1f, copy+sync %.1f, free %.1f%s)\n",
 +        __func__, il, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0, n_used, n_copied / 1024.0 / 1024.0, (t4 - t0) / 1000.0,
-+        (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
++        (t1 - t0) / 1000.0, reused ? " (reused)" : "", (t2 - t1) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0, legacy ? ", legacy" : "");
++    return true;
++}
++
++bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
++    // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
++    if (v_trans) {
++        LLAMA_LOG_WARN("%s: dynamic KV disabled: the V cache is transposed because flash attention is off (-fa off, OLLAMA_FLASH_ATTENTION=0)\n", __func__);
++        return false;
++    }
++    if (other || hparams.no_alloc || swa_type != LLAMA_SWA_TYPE_NONE || map_layer_ids.size() != layers.size() || max_size <= get_size()) {
++        return false;
++    }
++    const size_t per_cell = cell_bytes(false);
++    if (per_cell == 0) {
++        return false;
++    }
++    dyn_max   = max_size;
++    dyn_chunk = GGML_PAD(std::max<size_t>(1, chunk_bytes / per_cell), 256);
++    const char * env = getenv("LLAMA_KV_NO_VMM");
++    dyn_vmm_off = env && atoi(env) != 0;
++    dyn_vmm.assign(layers.size(), 0);
++
++    // one buffer per layer from now on; on a device with virtual memory the K and V get growable buffers
++    if (!relayout(get_size(), true)) {
++        dyn_max = 0;
++        return false;
++    }
++    size_t n_vmm = 0, n_dev = 0;
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        n_vmm += dyn_vmm[ikv];
++        n_dev += layers[ikv].k->buffer && !ggml_backend_buffer_is_host(layers[ikv].k->buffer);
++    }
++    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
++        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0, n_vmm, n_dev, n_dev - n_vmm,
++        dyn_vmm_off ? " (LLAMA_KV_NO_VMM)" : (n_vmm < n_dev ? " (no VMM on this backend/device, or flex layers)" : ""));
++    return true;
++}
++
++// growable device buffers (ggml-cuda/HIP VMM), looked up through the backend registry; NULL if the backend has none
++typedef ggml_backend_buffer_t (*ggml_backend_buffer_alloc_growable_t)(ggml_backend_buffer_type_t buft, size_t size, size_t max_size);
++typedef bool (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
++
++// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the max size, to test the in-place path without VMM
++static ggml_backend_buffer_t kv_sim_alloc_growable(ggml_backend_buffer_type_t buft, size_t size, size_t max_size) {
++    return ggml_backend_buft_alloc_buffer(buft, std::max(size, max_size));
++}
++static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
++    return size <= ggml_backend_buffer_get_size(buffer);
++}
++
++static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name) {
++    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++    if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++        return nullptr;
++    }
++    static const bool sim = getenv("LLAMA_KV_VMM_SIM") && atoi(getenv("LLAMA_KV_VMM_SIM")) != 0;
++    if (sim) {
++        return strcmp(name, "ggml_backend_buffer_grow") == 0 ? (void *) kv_sim_grow : (void *) kv_sim_alloc_growable;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
++}
++
++size_t llama_kv_cache::resize_peak(uint32_t n) const {
++    // the copy path allocates a layer's new K/V before it frees the old one: the largest old device layer is the transient extra
++    size_t res = 0;
++    if (n <= get_size()) {
++        return 0;
++    }
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        const auto & layer = layers[ikv];
++        const bool dev = layer.k->buffer && !ggml_backend_buffer_is_host(layer.k->buffer);
++        if (dev && (dyn_vmm.size() <= ikv || !dyn_vmm[ikv])) {
++            res = std::max(res, ggml_nbytes(layer.k) + (layer.v ? ggml_nbytes(layer.v) : 0));
++        }
++    }
++    return res;
++}
++
++uint32_t llama_kv_cache::dyn_round(uint32_t n) const {
++    if (dyn_chunk == 0) {
++        return n;
++    }
++    return std::min<uint32_t>(dyn_max, ((n + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
++}
++
++uint32_t llama_kv_cache::used_cells() const {
++    uint32_t n = 0;
++    for (const auto & cells : v_cells) {
++        n = std::max(n, cells.used_max_p1());
++    }
++    return n;
++}
++
++size_t llama_kv_cache::cell_bytes(bool device_only) const {
++    size_t res = 0;
++    for (const auto & layer : layers) {
++        for (const ggml_tensor * t : { layer.k, layer.v }) {
++            if (t && (!device_only || (t->buffer && !ggml_backend_buffer_is_host(t->buffer)))) {
++                res += t->nb[1]*t->ne[2];
++            }
++        }
++    }
++    return res;
++}
++
++size_t llama_kv_cache::layer_bytes(int32_t il) const {
++    auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return 0;
++    }
++    const auto & layer = layers[it->second];
++    return (layer.k ? ggml_nbytes(layer.k) : 0) + (layer.v ? ggml_nbytes(layer.v) : 0);
++}
++
++bool llama_kv_cache::resize(uint32_t n) {
++    return relayout(n, false);
++}
++
++bool llama_kv_cache::relayout(uint32_t n, bool force) {
++    const uint32_t n_old  = get_size();
++    const uint32_t n_used = used_cells();
++    if (n == n_old && !force) {
++        return true;
++    }
++    if (n < n_used || layers.empty()) {
++        return false;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    int64_t t_alloc = 0, t_copy = 0, t_free = 0;
++    size_t n_grow = 0, n_vmm_new = 0, n_copy = 0;
++
++    // the buffers of each layer (K and V are separate in a growable layout); a buffer shared by several layers is freed at the end
++    std::vector<size_t> owner(ctxs_bufs.size(), SIZE_MAX);
++    std::vector<size_t> n_owners(ctxs_bufs.size(), 0);
++    for (size_t ib = 0; ib < ctxs_bufs.size(); ++ib) {
++        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++            const auto * b = ctxs_bufs[ib].second.get();
++            if (b && (layers[ikv].k->buffer == b || (layers[ikv].v && layers[ikv].v->buffer == b))) {
++                owner[ib] = ikv;
++                n_owners[ib]++;
++            }
++        }
++    }
++    if (dyn_vmm.size() != layers.size()) {
++        dyn_vmm.assign(layers.size(), 0);
++    }
++
++    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
++    bufs_new.reserve(2*layers.size());
++    size_t n_copied = 0;
++    const uint32_t n_rows = std::min(n_used, n);
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        auto & layer = layers[ikv];
++        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
++        const bool on_dev  = !ggml_backend_buffer_is_host(layer.k->buffer);
++        const bool is_flex = flex_kv_layers.count(layer.il) > 0;
++
++        // growable K/V: map more memory at the end, the tensors keep their address and content (no transient copy)
++        if (dyn_vmm[ikv] && n > n_old && !force) {
++            auto grow = (ggml_backend_buffer_grow_t) kv_growable_fn(buft, "ggml_backend_buffer_grow");
++            bool ok = grow != nullptr;
++            const int64_t t1 = ggml_time_us();
++            for (ggml_tensor * t : { layer.k, layer.v }) {
++                if (ok && t) {
++                    ok = grow(t->buffer, t->nb[1]*n*t->ne[2]);
++                }
++            }
++            if (ok) {
++                for (ggml_tensor * t : { layer.k, layer.v }) {
++                    if (!t) {
++                        continue;
++                    }
++                    const size_t old_bytes = ggml_nbytes(t);
++                    t->ne[1] = n;
++                    t->nb[2] = t->nb[1]*n;
++                    t->nb[3] = t->nb[2]*t->ne[2];
++                    ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
++                }
++                for (auto * views : { &layer.k_stream, &layer.v_stream }) {
++                    for (ggml_tensor * v : *views) {
++                        if (v) {
++                            v->ne[1] = n;
++                            v->nb[2] = v->nb[1]*n;
++                            v->nb[3] = v->nb[2];
++                        }
++                    }
++                }
++                t_alloc += ggml_time_us() - t1;
++                for (size_t ib = 0; ib < ctxs_bufs.size(); ++ib) {
++                    if (owner[ib] == ikv && n_owners[ib] == 1) {
++                        bufs_new.emplace_back(std::move(ctxs_bufs[ib].first), std::move(ctxs_bufs[ib].second));
++                    }
++                }
++                n_grow++;
++                continue;
++            }
++            LLAMA_LOG_WARN("%s: layer %u: growing the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
++            dyn_vmm[ikv] = 0;
++        }
++
++        const int64_t t1 = ggml_time_us();
++        ggml_init_params params = {
++            /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        ggml_context_ptr ctx(ggml_init(params));
++        if (!ctx) {
++            return false;
++        }
++        kv_layer nl = layer;
++        nl.k_stream.clear();
++        nl.v_stream.clear();
++        for (ggml_tensor ** pt : { &nl.k, &nl.v }) {
++            ggml_tensor * t = *pt;
++            if (!t) {
++                continue;
++            }
++            *pt = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], n, t->ne[2]);
++            ggml_set_name(*pt, t->name);
++        }
++        for (uint32_t s = 0; s < n_stream; ++s) {
++            nl.k_stream.push_back(nl.k ? ggml_view_2d(ctx.get(), nl.k, nl.k->ne[0], n, nl.k->nb[1], s*nl.k->nb[2]) : nullptr);
++            nl.v_stream.push_back(nl.v ? ggml_view_2d(ctx.get(), nl.v, nl.v->ne[0], n, nl.v->nb[1], s*nl.v->nb[2]) : nullptr);
++        }
++
++        // on a device with growable buffers: K and V in their own, with the address range for the max context
++        std::vector<ggml_backend_buffer_ptr> bufs_layer;
++        auto alloc_growable = (ggml_backend_buffer_alloc_growable_t) kv_growable_fn(buft, "ggml_backend_buffer_alloc_growable");
++        if (alloc_growable && !dyn_vmm_off && on_dev && !is_flex && n_stream == 1 && dyn_max > 0) {
++            for (ggml_tensor * t : { nl.k, nl.v }) {
++                if (!t) {
++                    continue;
++                }
++                ggml_backend_buffer_ptr b(alloc_growable(buft, ggml_nbytes(t), t->nb[1]*dyn_max*t->ne[2]));
++                if (!b || ggml_backend_tensor_alloc(b.get(), t, ggml_backend_buffer_get_base(b.get())) != GGML_STATUS_SUCCESS) {
++                    bufs_layer.clear();
++                    break;
++                }
++                ggml_backend_buffer_clear(b.get(), 0);
++                bufs_layer.push_back(std::move(b));
++            }
++            if (bufs_layer.empty()) {
++                // a failed growable allocation leaves the tensors unallocated
++                for (ggml_tensor * t : { nl.k, nl.v }) {
++                    if (t) {
++                        t->buffer = nullptr;
++                        t->data   = nullptr;
++                    }
++                }
++                LLAMA_LOG_WARN("%s: layer %u: no growable (VMM) buffer on %s, the K/V grows by copy\n", __func__, layer.il, ggml_backend_buft_name(buft));
++            } else {
++                for (uint32_t s = 0; s < n_stream; ++s) {
++                    ggml_backend_view_init(nl.k_stream[s]);
++                    if (nl.v_stream[s]) {
++                        ggml_backend_view_init(nl.v_stream[s]);
++                    }
++                }
++            }
++        }
++        dyn_vmm[ikv] = !bufs_layer.empty();
++        if (bufs_layer.empty()) {
++            ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++            if (!b) {
++                LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
++                return false;
++            }
++            ggml_backend_buffer_clear(b.get(), 0);
++            bufs_layer.push_back(std::move(b));
++            n_copy++;
++        } else {
++            n_vmm_new++;
++        }
++        t_alloc += ggml_time_us() - t1;
++
++        // the used rows of each stream, through the backend (device-internal copy on the same GPU, memcpy on the host)
++        const int64_t t2 = ggml_time_us();
++        for (int i = 0; i < 2 && n_rows > 0; ++i) {
++            ggml_tensor * src = i == 0 ? layer.k : layer.v;
++            ggml_tensor * dst = i == 0 ? nl.k : nl.v;
++            if (!src) {
++                continue;
++            }
++            for (uint32_t s = 0; s < n_stream; ++s) {
++                ggml_tensor vs = *src;
++                ggml_tensor vd = *dst;
++                for (ggml_tensor * v : { &vs, &vd }) {
++                    v->ne[1] = n_rows;
++                    v->ne[2] = 1;
++                    v->nb[2] = v->nb[1]*n_rows;
++                    v->nb[3] = v->nb[2];
++                    v->view_src  = nullptr;
++                    v->view_offs = 0;
++                }
++                vs.data = (char *) src->data + s*src->nb[2];
++                vd.data = (char *) dst->data + s*dst->nb[2];
++                ggml_backend_tensor_copy(&vs, &vd);
++                n_copied += ggml_nbytes(&vs);
++            }
++        }
++        t_copy += ggml_time_us() - t2;
++
++        const int64_t t3 = ggml_time_us();
++        for (size_t ib = 0; ib < ctxs_bufs.size(); ++ib) {
++            if (owner[ib] == ikv && n_owners[ib] == 1) {
++                ctxs_bufs[ib].second.reset();
++            }
++        }
++        t_free += ggml_time_us() - t3;
++
++        layer = nl;
++        auto itf = flex_kv_layers.find(layer.il);
++        if (itf != flex_kv_layers.end()) {
++            itf->second.buf_idx = bufs_new.size();
++        }
++        bufs_new.emplace_back(std::move(ctx), std::move(bufs_layer[0]));
++        for (size_t i = 1; i < bufs_layer.size(); ++i) {
++            bufs_new.emplace_back(nullptr, std::move(bufs_layer[i]));
++        }
++    }
++
++    const int64_t t4 = ggml_time_us();
++    ctxs_bufs = std::move(bufs_new); // frees the shared buffers and the old contexts
++    t_free += ggml_time_us() - t4;
++
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        v_cells[s].resize_keep(n);
++        if (v_heads[s] >= n) {
++            v_heads[s] = 0;
++        }
++    }
++    n_resize++;
++
++    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu grown in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
++        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
++        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
 +    return true;
 +}
 +
@@ -548,7 +1415,7 @@ index 1d0554fa1..bbfd3a4a3 100644
  // llama_kv_cache_context
  //
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 52cc8cd32..c3a853e2b 100644
+index 52cc8cd32..26c8c3342 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -5,6 +5,7 @@
@@ -559,7 +1426,7 @@ index 52cc8cd32..c3a853e2b 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -250,7 +251,20 @@ public:
+@@ -250,7 +251,48 @@ public:
      // note: used by n-gram input embeddings
      void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
  
@@ -568,20 +1435,73 @@ index 52cc8cd32..c3a853e2b 100644
 +    // legacy (test): CPU buffer and a full synchronous copy, the first implementation
 +    bool flex_move(int32_t il, bool to_gpu, ggml_backend_t backend = nullptr, bool legacy = false);
 +
++    // dynamic KV (DESIGN-3zone.md 6.2): the cache grows in chunks up to max_size; false if this cache cannot (shared layers, transposed V, ...)
++    bool set_dynamic(uint32_t max_size, size_t chunk_bytes);
++    bool     is_dynamic()   const { return dyn_max > 0; }
++    uint32_t dyn_max_size() const { return dyn_max; }
++    uint32_t dyn_round(uint32_t n) const; // n rounded up to the next chunk, at most max_size
++    uint32_t used_cells()   const;        // max used_max_p1() over the streams
++    uint64_t generation()   const { return n_resize; } // changes when the K/V tensors are reallocated
++
++    // resize every layer's K/V to n cells, keeping the used cells (they must fit); each layer stays on its buffer type
++    // growable (VMM) device buffers grow in place, the others get a new buffer and a copy of the used rows
++    bool resize(uint32_t n);
++
++    // device bytes that a resize to n needs on top of the new size for a moment (the copy path holds the old and the new layer)
++    size_t resize_peak(uint32_t n) const;
++
++    // bytes of one cell over the layers (only those whose K/V is in device memory if device_only), and of one layer at the current size
++    size_t cell_bytes(bool device_only) const;
++    size_t layer_bytes(int32_t il) const;
++
  private:
++    uint32_t dyn_max   = 0;
++    uint32_t dyn_chunk = 0;
++    uint64_t n_resize  = 0;
++    bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
++    std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers
++
++    bool relayout(uint32_t n, bool force); // force: rebuild the buffers even at the same size (one per layer, growable where possible)
++
 +    // flex layers: the K/V of the layer has its own buffer (index into ctxs_bufs)
 +    struct flex_kv {
 +        size_t buf_idx;
 +        ggml_backend_buffer_type_t buft_gpu;
 +        bool   on_gpu;
++        ggml_backend_buffer_ptr spare = nullptr; // host buffer kept after the layer went back, reused when it goes off again
 +    };
 +    std::map<int32_t, flex_kv> flex_kv_layers;
 +
      const llama_model & model;
      const llama_hparams & hparams;
  
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 9c0d51e4e..4d5e1d3e4 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -75,6 +75,20 @@ public:
+         reset();
+     }
+ 
++    // change the number of cells and keep their state; the used cells must be below n
++    void resize_keep(uint32_t n) {
++        assert(used_max_p1() <= n);
++        const uint32_t n_old = pos.size();
++        pos.resize(n, -1);
++        ext.resize(n);
++        shift.resize(n, 0);
++        seq.resize(n);
++        for (uint32_t i = n_old; i < n; ++i) {
++            ext[i].reset();
++            seq[i].reset();
++        }
++    }
++
+     bool is_empty(uint32_t i) const {
+         assert(i < pos.size());
+         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 175de8c96..726729d4a 100644
+index 175de8c96..dbecd7f30 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1129,8 +1129,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -609,7 +1529,7 @@ index 175de8c96..726729d4a 100644
      auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
          if (!t_meta) {
              if (flags & TENSOR_NOT_REQUIRED) {
-@@ -1296,6 +1303,42 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1296,6 +1303,52 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              n_tensors_moved++;
          }
  
@@ -628,7 +1548,17 @@ index 175de8c96..726729d4a 100644
 +        }
 +
 +        // flex layers: a GPU weight in the range also gets a CPU twin (repacked if possible), so the layer can move to the CPU at runtime
-+        if (flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
++        bool flex_tensor = flex_lo >= 0 && tn.bid >= flex_lo && tn.bid <= flex_hi;
++        if (!flex_tensor && tn.bid >= 0 && !flex_ovr.empty()) {
++            const std::string name = tn.str();
++            for (const auto & r : flex_ovr) {
++                if (std::regex_search(name, r)) {
++                    flex_tensor = true;
++                    break;
++                }
++            }
++        }
++        if (flex_tensor && !(flags & TENSOR_DUPLICATED) && !files.empty() && !use_mmap) {
 +            auto * dev_w = ggml_backend_buft_get_device(buft);
 +            if (dev_w && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_type(dev_w) != GGML_BACKEND_DEVICE_TYPE_ACCEL &&
 +                    !ggml_backend_buft_is_host(buft) && strstr(ggml_backend_buft_name(buft), "Split") == nullptr) {
@@ -652,7 +1582,7 @@ index 175de8c96..726729d4a 100644
          return buft;
      };
  
-@@ -1375,7 +1418,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1375,7 +1428,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return nullptr;
      }
  
@@ -661,7 +1591,7 @@ index 175de8c96..726729d4a 100644
  
      // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
      if (flags & TENSOR_DUPLICATED) {
-@@ -1396,6 +1439,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1396,6 +1449,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          n_created++;
      }
  
@@ -691,10 +1621,18 @@ index 175de8c96..726729d4a 100644
  }
  
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 9e51d0ce7..362edec75 100644
+index 9e51d0ce7..b5d78a086 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
-@@ -151,6 +151,7 @@ struct llama_model_loader {
+@@ -12,6 +12,7 @@
+ #include <cstddef>
+ #include <cstring>
+ #include <map>
++#include <regex>
+ #include <set>
+ #include <stdexcept>
+ #include <unordered_map>
+@@ -151,6 +152,7 @@ struct llama_model_loader {
      struct ctx_key {
          ggml_backend_buffer_type_t buft;
          bool lazy;
@@ -702,7 +1640,7 @@ index 9e51d0ce7..362edec75 100644
      };
  
      struct ctx_key_comparator {
-@@ -158,12 +159,38 @@ struct llama_model_loader {
+@@ -158,12 +160,39 @@ struct llama_model_loader {
              if (lhs.lazy != rhs.lazy) {
                  return lhs.lazy < rhs.lazy;
              }
@@ -736,13 +1674,14 @@ index 9e51d0ce7..362edec75 100644
 +    int flex_lo = -1;
 +    int flex_hi = -1;
 +    bool flex_no_host = false; // RAM guard: no host copies (the layers go back from the model file)
++    std::vector<std::regex> flex_ovr; // partial flex layers: GPU tensors matching these (zone 1 puts them on the CPU, e.g. MoE experts)
 +    std::vector<flex_pair> flex_pairs;
 +
      // track tensors that had to be moved for debugging:
      size_t n_tensors_moved = 0;
      std::string first_tensor_moved_name;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 742bcd5d5..474260c17 100644
+index 742bcd5d5..c9398416b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -31,6 +31,7 @@
@@ -863,7 +1802,7 @@ index 742bcd5d5..474260c17 100644
      // add the CPU buffer type
      for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
          ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-@@ -1210,6 +1288,15 @@ struct llama_model::impl {
+@@ -1210,6 +1288,16 @@ struct llama_model::impl {
      buft_list_t cpu_buft_list;
      std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
  
@@ -871,6 +1810,7 @@ index 742bcd5d5..474260c17 100644
 +    struct flex_layer {
 +        size_t buf_idx = SIZE_MAX;
 +        bool   on_gpu  = true;
++        bool   whole   = false; // the whole layer is in the band (its device and K/V move), else only some tensors (e.g. MoE experts)
 +        std::vector<llama_model_loader::flex_pair> pairs;
 +    };
 +    std::map<int, flex_layer> flex;
@@ -879,14 +1819,43 @@ index 742bcd5d5..474260c17 100644
      struct layer_dev {
          ggml_backend_dev_t dev;
          buft_list_t * buft_list;
-@@ -1539,8 +1626,131 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1539,8 +1627,160 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
          __func__, load_mode_name);
  
++    // flex band size: --flex-layers, else the GPU layers beyond the ones that fit with the max context (auto zones, DESIGN-3zone.md 6.1)
++    int n_flex = (int) params.flex_layers;
++    if (n_flex == 0 && params.flex_ngl_full >= 0) {
++        n_flex = std::max(0, (int) this->n_gpu_layers() - params.flex_ngl_full);
++        LLAMA_LOG_INFO("%s: auto zones: %u GPU layers, %d fit with the max context, flex band %d whole layers\n", __func__,
++            this->n_gpu_layers(), params.flex_ngl_full, n_flex);
++    }
++    // auto zones, partial flex layers: the max-context fit puts these tensors on the CPU (MoE experts), the loaded placement on the GPU
++    std::vector<std::regex> flex_ovr;
++    if (params.flex_layers == 0) {
++        for (auto * o = params.flex_ovr_full; o && o->pattern; ++o) {
++            if (o->buft == ggml_backend_cpu_buffer_type() || (o->buft && ggml_backend_buft_is_host(o->buft))) {
++                flex_ovr.emplace_back(o->pattern);
++            }
++        }
++        if (!flex_ovr.empty()) {
++            LLAMA_LOG_INFO("%s: auto zones: %zu tensor patterns of the max-context fit go to the CPU: their GPU tensors are partial flex layers\n",
++                __func__, flex_ovr.size());
++        }
++    }
++    auto flex_ovr_match = [&](const std::string & name) {
++        for (const auto & r : flex_ovr) {
++            if (std::regex_search(name, r)) {
++                return true;
++            }
++        }
++        return false;
++    };
++
 +    // RAM guard (DECISIONS.md 12-14, 17): free RAM, the RAM-resident part of the model, and the zone 2 copies of the flex layers
 +    size_t ram_free = 0, ram_total = 0, ram_cpu_part = 0, ram_flex = 0, ram_reserve = 0;
 +    const char * ram_src = "system";
-+    bool flex_off = params.flex_layers == 0 || ml.use_mmap;
++    bool flex_off = (n_flex == 0 && flex_ovr.empty()) || ml.use_mmap;
 +    if ((params.dual_buffer && params.dual_buffer_limit_mib == 0) || !flex_off) {
 +        size_t cg_free = 0, cg_limit = 0;
 +        ggml_backend_dev_t ram_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -910,7 +1879,7 @@ index 742bcd5d5..474260c17 100644
 +        // unknown placement counts as CPU, which gives a smaller budget
 +        const int n_gpu = (int) std::min(this->n_gpu_layers(), (uint32_t) hparams.n_layer_all + 1);
 +        const int i_gpu_start_est = std::max((int) hparams.n_layer_all + 1 - n_gpu, 0);
-+        const int flex_end_est = flex_off ? i_gpu_start_est : std::min(i_gpu_start_est + (int) params.flex_layers, (int) hparams.n_layer_all);
++        const int flex_end_est = flex_off ? i_gpu_start_est : std::min(i_gpu_start_est + n_flex, (int) hparams.n_layer_all);
 +        std::vector<std::pair<std::regex, bool>> ovr; // (pattern, stays in RAM)
 +        for (auto * o = params.tensor_buft_overrides; o && o->pattern; ++o) {
 +            auto * od = o->buft ? ggml_backend_buft_get_device(o->buft) : nullptr;
@@ -938,7 +1907,7 @@ index 742bcd5d5..474260c17 100644
 +            }
 +            if (in_ram) {
 +                ram_cpu_part += ggml_nbytes(it.second.tensor);
-+            } else if (is_layer && il >= i_gpu_start_est && il < flex_end_est) {
++            } else if (is_layer && ((il >= i_gpu_start_est && il < flex_end_est) || flex_ovr_match(name))) {
 +                ram_flex += 2*ggml_nbytes(it.second.tensor); // zone 2: repacked copy + host copy
 +            }
 +        }
@@ -1012,28 +1981,31 @@ index 742bcd5d5..474260c17 100644
      for (const auto & dev : devices) {
          buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
          // add CPU buffer types as a fallback
-@@ -1588,6 +1798,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1588,6 +1828,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
      const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
 +
 +    // flex layers: the first N GPU layers (next to the CPU layers) can move to the CPU at runtime (DESIGN-3zone.md)
-+    if (params.flex_layers > 0) {
++    if (n_flex > 0 || !flex_ovr.empty()) {
 +        if (ml.use_mmap) {
-+            LLAMA_LOG_WARN("%s: --flex-layers requires --load-mode none, disabling it\n", __func__);
++            LLAMA_LOG_WARN("%s: --flex-layers / --auto-zones flex band requires --load-mode none, disabling it\n", __func__);
 +        } else if (!flex_off) {
-+            ml.flex_lo = i_gpu_start;
-+            ml.flex_hi = std::min(i_gpu_start + (int) params.flex_layers, n_layer_all) - 1;
-+            if (ml.flex_lo > ml.flex_hi) {
-+                ml.flex_lo = ml.flex_hi = -1;
++            if (n_flex > 0) {
++                ml.flex_lo = i_gpu_start;
++                ml.flex_hi = std::min(i_gpu_start + n_flex, n_layer_all) - 1;
++                if (ml.flex_lo > ml.flex_hi) {
++                    ml.flex_lo = ml.flex_hi = -1;
++                }
 +            }
++            ml.flex_ovr = std::move(flex_ovr);
 +        }
 +    }
 +
      auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
          const bool is_swa = il < n_layer_all && hparams.is_swa(il);
          if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
-@@ -1799,10 +2023,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1799,10 +2056,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              strcmp(output->name, tok_embd->name) == 0 &&
              output->type == GGML_TYPE_NVFP4 &&
              (output_s || output_in_s)));
@@ -1050,6 +2022,7 @@ index 742bcd5d5..474260c17 100644
 +            dual_copies.insert(p.host);
 +        }
 +        pimpl->flex[p.layer].pairs.push_back(p);
++        pimpl->flex[p.layer].whole = p.layer >= ml.flex_lo && p.layer <= ml.flex_hi;
 +    }
 +    dual_weights = ml.dual_pairs;
 +    if (ml.dual_host_buft) {
@@ -1067,7 +2040,7 @@ index 742bcd5d5..474260c17 100644
          }
      }
  
-@@ -1903,6 +2149,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1903,6 +2183,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
          }
  
@@ -1077,7 +2050,7 @@ index 742bcd5d5..474260c17 100644
          pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
  
          ctx_buf_maps.emplace_back(ctx, buf_map);
-@@ -1957,6 +2206,179 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1957,6 +2240,207 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -1109,21 +2082,38 @@ index 742bcd5d5..474260c17 100644
 +}
 +
 +int llama_model::flex_next(bool to_gpu) const {
-+    // take: the GPU flex layer closest to the CPU layers; put: the last one taken (reverse order)
++    // take order: the partial layers (only some tensors, e.g. MoE experts) from the last one down, they end the zone 1 run of
++    // full layers; then the whole layers from the CPU boundary up. Put back: the reverse.
++    std::vector<int> order;
++    for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
++        if (!it->second.whole && it->second.buf_idx != SIZE_MAX) {
++            order.push_back(it->first);
++        }
++    }
++    for (const auto & [il, fl] : pimpl->flex) {
++        if (fl.whole && fl.buf_idx != SIZE_MAX) {
++            order.push_back(il);
++        }
++    }
 +    if (to_gpu) {
-+        for (auto it = pimpl->flex.rbegin(); it != pimpl->flex.rend(); ++it) {
-+            if (!it->second.on_gpu) {
-+                return it->first;
++        for (auto it = order.rbegin(); it != order.rend(); ++it) {
++            if (!pimpl->flex.at(*it).on_gpu) {
++                return *it;
 +            }
 +        }
 +    } else {
-+        for (const auto & [il, fl] : pimpl->flex) {
-+            if (fl.on_gpu) {
++        for (int il : order) {
++            if (pimpl->flex.at(il).on_gpu) {
 +                return il;
 +            }
 +        }
 +    }
 +    return -1;
++}
++
++bool llama_model::flex_whole(int il) const {
++    auto it = pimpl->flex.find(il);
++    return it != pimpl->flex.end() && it->second.whole && it->second.buf_idx != SIZE_MAX;
 +}
 +
 +bool llama_model::flex_has_layer(int il) const {
@@ -1144,6 +2134,17 @@ index 742bcd5d5..474260c17 100644
 +            if (p.host) {
 +                res.emplace_back(p.gpu, p.host);
 +            }
++        }
++    }
++    return res;
++}
++
++size_t llama_model::flex_layer_bytes(int il) const {
++    size_t res = 0;
++    auto it = pimpl->flex.find(il);
++    if (it != pimpl->flex.end()) {
++        for (const auto & p : it->second.pairs) {
++            res += ggml_nbytes(p.gpu);
 +        }
 +    }
 +    return res;
@@ -1257,13 +2258,13 @@ index 742bcd5d5..474260c17 100644
      return true;
  }
  
-@@ -2253,6 +2675,15 @@ void llama_model::print_info() const {
+@@ -2253,6 +2737,15 @@ void llama_model::print_info() const {
  }
  
  ggml_backend_dev_t llama_model::dev_layer(int il) const {
-+    // a flex layer that was taken off the GPU runs on the CPU, like a CPU layer
++    // a whole flex layer that was taken off the GPU runs on the CPU, like a CPU layer (a partial one stays a GPU layer)
 +    auto it = pimpl->flex.find(il);
-+    if (it != pimpl->flex.end() && !it->second.on_gpu) {
++    if (it != pimpl->flex.end() && !it->second.on_gpu && it->second.whole) {
 +        return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 +    }
 +    return pimpl->dev_layer.at(il).dev;
@@ -1273,13 +2274,15 @@ index 742bcd5d5..474260c17 100644
      return pimpl->dev_layer.at(il).dev;
  }
  
-@@ -2928,10 +3359,14 @@ llama_model_params llama_model_default_params() {
+@@ -2928,10 +3421,16 @@ llama_model_params llama_model_default_params() {
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
 +        /*.dual_buffer_pattern         =*/ nullptr,
 +        /*.dual_buffer_limit_mib       =*/ 0,
 +        /*.flex_layers                 =*/ 0,
++        /*.flex_ngl_full               =*/ -1,
++        /*.flex_ovr_full               =*/ nullptr,
          /*.vocab_only                  =*/ false,
          /*.check_tensors               =*/ false,
          /*.use_extra_bufts             =*/ true,
@@ -1289,7 +2292,7 @@ index 742bcd5d5..474260c17 100644
          /*.load_mtp                    =*/ false,
      };
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 25e514869..40d06682b 100644
+index 25e514869..05ce41895 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -736,6 +736,9 @@ struct llama_model {
@@ -1302,7 +2305,7 @@ index 25e514869..40d06682b 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -764,6 +767,16 @@ struct llama_model {
+@@ -764,6 +767,18 @@ struct llama_model {
      const float * tensor_split() const;
  
      uint32_t n_gpu_layers() const;
@@ -1310,8 +2313,10 @@ index 25e514869..40d06682b 100644
 +    // flex layers: move a layer's weights between its GPU buffer and the CPU copy (the caller must synchronize first)
 +    bool flex_move(int il, bool to_gpu, bool from_file = false) const;
 +    bool flex_has_layer(int il) const;
++    bool flex_whole(int il) const; // the whole layer moves (device and K/V), not only some tensors (MoE experts)
 +    bool flex_on_gpu(int il) const;
 +    std::vector<int> flex_layers() const;
++    size_t flex_layer_bytes(int il) const; // the layer's weights in its GPU buffer
 +    // (model tensor, original-format host copy) of a flex layer, registered with the scheduler while the layer is off
 +    std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> flex_host_copies(int il) const;
 +    int  flex_next(bool to_gpu) const; // next layer to take (to_gpu = false) or put back, -1 if none
