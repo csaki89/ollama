@@ -107,3 +107,10 @@ sudo python3 tools/dualbuf/nas-flex-bench.py --image ghcr.io/csaki89/ollama-dual
 
 ## Automatikus háromzónás működés (`LLAMA_ARG_AUTO_ZONES=1`)
 A llama-server a `--fit`-ből maga számolja a zónákat (dense és MoE), a KV a használattal nő (ROCm-en VMM-mel, helyben, átmeneti dupla foglalás nélkül), és a rugalmas sáv rétegei a KV-vel együtt mozognak. Bekapcsolás a compose-ban: `LLAMA_ARG_AUTO_ZONES: "1"` (mellette a meglévő `LLAMA_ARG_LOAD_MODE: "none"`). A napló ellenőrzendő pontjai: a csaki89/llama.cpp `docs/SUMMARY.md` 8. pontja (a zónák mérete, `zones: flash attention ...`, `set_dynamic: ... X/Y layers in place (VMM)`, `relayout: KV ...`, `flex_move: layer ... moved to ...` egy hosszú és egy új rövid beszélgetésnél, a HIP-gráfok `GGML_CUDA_DISABLE_GRAPHS=1`-es összevetéssel). Kikapcsolás: a változó törlése (a VMM külön: `LLAMA_KV_NO_VMM=1`).
+
+### VMM reprodukáló teszt a NAS-on
+Ebből a checkoutból (vagy a csaki89/llama.cpp dual-buffer branchből), egyetlen paranccsal (a négy eset külön folyamatban fut, a végén összesítés):
+```
+docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-repro.sh
+```
+Esetek: (a) a régi minta (96 címtartomány, 4 MiB-os darab, aszinkron nullázás saját adatfolyamon), (b) az új (egy címtartomány, szakaszok, 2 MiB-ra igazított darabok, szinkron nullázás, növelés), (c) a régi szinkron nullázással, (d) a régi `max(ajánlott, 2 MiB)` igazítással. Az esetenkénti napló: `/tmp/vmm-repro-<eset>.log` a konténerben (a kimenet a terminálon is látszik).
