@@ -3,7 +3,7 @@
 # (that one stays on port 30068). Test API: http://<nas>:30069
 #
 # Before the first start:
-#  1. The image tag is pinned to the build of commit c14ecac (workflow run 42392542500). For a newer build use the tag the "dualbuf-image" workflow printed
+#  1. The image tag is pinned to the build of commit 316263f (workflow run 42403109653). For a newer build use the tag the "dualbuf-image" workflow printed
 #     (0.40.2-dualbuf-<7 char commit>). Do not use :latest, a restart could pull a different build.
 #  2. If the ghcr.io package is private, log in on the NAS first (see docs/SUMMARY.md).
 #
@@ -14,7 +14,7 @@
 #    manifest, the blobs are shared. See docs/SUMMARY.md.
 services:
   ollama-dualbuf:
-    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-c14ecac
+    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-316263f
     container_name: ollama-dualbuf
     restart: unless-stopped
     ports:
@@ -59,6 +59,9 @@ services:
       # and flash attention auto/on (the Ollama default on ROCm). Remove to turn it off; LLAMA_KV_NO_VMM: "1" turns
       # only the VMM growth off (copy fallback).
       LLAMA_ARG_AUTO_ZONES: "1"
+      # debug for the VMM path of the growing KV (every mapping, access setting, growth, release in the log);
+      # remove once the VMM path is confirmed on the NAS
+      GGML_CUDA_VMM_DEBUG: "1"
       # same settings as the running instance
       OLLAMA_CONTEXT_LENGTH: "32768"
       OLLAMA_NUM_PARALLEL: "1"
