@@ -3,7 +3,7 @@
 # (that one stays on port 30068). Test API: http://<nas>:30069
 #
 # Before the first start:
-#  1. The image tag is pinned to the build of commit 81388ee (workflow run 42316903360). For a newer build use the tag the "dualbuf-image" workflow printed
+#  1. The image tag is pinned to the build of commit c14ecac (workflow run 42392542500). For a newer build use the tag the "dualbuf-image" workflow printed
 #     (0.40.2-dualbuf-<7 char commit>). Do not use :latest, a restart could pull a different build.
 #  2. If the ghcr.io package is private, log in on the NAS first (see docs/SUMMARY.md).
 #
@@ -14,7 +14,7 @@
 #    manifest, the blobs are shared. See docs/SUMMARY.md.
 services:
   ollama-dualbuf:
-    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-81388ee
+    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-c14ecac
     container_name: ollama-dualbuf
     restart: unless-stopped
     ports:
@@ -53,6 +53,12 @@ services:
       # dual-buffer needs mmap off. Ollama only passes --load-mode none when a request/Modelfile sets
       # use_mmap=false, otherwise llama-server reads this variable. Safe default for every model.
       LLAMA_ARG_LOAD_MODE: "none"
+      # three-zone placement without manual settings: the flex band comes from two --fit runs (max and initial
+      # context, dense and MoE), the KV starts small and grows with the use (in place with VMM on ROCm), and the
+      # flex layers go to the CPU when the KV needs VRAM and come back in a new conversation. Needs mmap off (above)
+      # and flash attention auto/on (the Ollama default on ROCm). Remove to turn it off; LLAMA_KV_NO_VMM: "1" turns
+      # only the VMM growth off (copy fallback).
+      LLAMA_ARG_AUTO_ZONES: "1"
       # same settings as the running instance
       OLLAMA_CONTEXT_LENGTH: "32768"
       OLLAMA_NUM_PARALLEL: "1"
