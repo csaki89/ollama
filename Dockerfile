@@ -144,6 +144,17 @@ RUN --mount=type=cache,target=/root/.ccache \
     cmake -S llama/server --preset rocm_v7_2_linux ${LLAMA_SERVER_ROCM_CMAKE_ARGS} \
         && cmake --build build/llama-server-rocm_v7_2 -- -l $(nproc) \
         && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
+# VMM stress tests of the dual-buffer fork, runnable from the image: /usr/lib/ollama/dualbuf-test/vmm-stress.sh (a failed compile fails the build)
+COPY tools/dualbuf/vmm-stress.cpp tools/dualbuf/vmm-stress-impl.cpp tools/dualbuf/vmm-stress.sh tools/dualbuf/
+RUN set -e; \
+    T=dist/lib/ollama/dualbuf-test; B=build/llama-server-rocm_v7_2; mkdir -p "$T"; \
+    INC=$(dirname "$(find "$B" -path '*/ggml/include/ggml-backend.h' | head -1)"); \
+    GGML=$(dirname "$(find "$B" -name libggml.so | head -1)"); \
+    BASE=$(dirname "$(find "$B" -name libggml-base.so | head -1)"); \
+    test -f "$INC/ggml-backend.h"; test -f "$GGML/libggml.so"; test -f "$BASE/libggml-base.so"; \
+    hipcc -O2 $CXXFLAGS --offload-arch="${ROCM_KEEP_ARCH:-gfx1030}" -o "$T/vmm-stress" tools/dualbuf/vmm-stress.cpp; \
+    clang++ -std=c++17 -O2 $CXXFLAGS -I"$INC" -o "$T/vmm-stress-impl" tools/dualbuf/vmm-stress-impl.cpp -L"$GGML" -L"$BASE" -lggml -lggml-base; \
+    cp tools/dualbuf/vmm-stress.sh "$T/"; chmod +x "$T/vmm-stress.sh"
 RUN rm -f dist/lib/ollama/rocm_v7_2/rocblas/library/*gfx90[06]*
 RUN if [ -n "$ROCM_KEEP_ARCH" ]; then \
         for d in dist/lib/ollama/rocm_v7_2/rocblas/library dist/lib/ollama/rocm_v7_2/hipblaslt/library; do \

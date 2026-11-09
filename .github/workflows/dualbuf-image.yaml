@@ -108,3 +108,17 @@ jobs:
               done
             done
           '
+          # the VMM tests must be in the image and find all their libraries
+          docker run --rm --entrypoint /bin/bash "$img" -c '
+            set -e
+            T=/usr/lib/ollama/dualbuf-test
+            export LD_LIBRARY_PATH=/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama
+            ls -la "$T"
+            for b in "$T/vmm-stress" "$T/vmm-stress-impl"; do
+              ldd "$b" | tee /tmp/ldd.txt
+              if grep -q "not found" /tmp/ldd.txt; then echo "missing library for $b"; exit 1; fi
+            done
+            bash -n "$T/vmm-stress.sh"
+            rc=0; "$T/vmm-stress-impl" || rc=$?
+            test "$rc" -eq 2
+          '
