@@ -114,3 +114,10 @@ Ebből a checkoutból (vagy a csaki89/llama.cpp dual-buffer branchből), egyetle
 docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-repro.sh
 ```
 Esetek: (a) a régi minta (96 címtartomány, 4 MiB-os darab, aszinkron nullázás saját adatfolyamon), (b) az új (egy címtartomány, szakaszok, 2 MiB-ra igazított darabok, szinkron nullázás, növelés), (c) a régi szinkron nullázással, (d) a régi `max(ajánlott, 2 MiB)` igazítással. Az esetenkénti napló: `/tmp/vmm-repro-<eset>.log` a konténerben (a kimenet a terminálon is látszik).
+
+### VMM stresszteszt a NAS-on
+Ebből a checkoutból, egy paranccsal (minden futás külön folyamat, a végén összesítés; a naplók a konténer `/tmp`-jében):
+```
+docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
+```
+Szűkítés: `-e SYNCS="barrier both" -e CASES="a c" -e RUNS=5 -e WAIT_MS=1`.
