@@ -328,7 +328,7 @@ int main(int argc, char ** argv) {
 
     const size_t free0 = dev_free();
     if (free0 > (1ull << 30)) {
-        target = std::min(target, free0 - (1ull << 30));
+        target = std::min<size_t>(target, free0 - (1ull << 30));
     }
     size_t per_section = target/n_secs;
     per_section -= per_section % chunk;

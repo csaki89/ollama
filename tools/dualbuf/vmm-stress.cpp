@@ -198,7 +198,7 @@ int main(int argc, char ** argv) {
 
     size_t free_b = 0, total_b = 0;
     CHECK(hipMemGetInfo(&free_b, &total_b));
-    target = std::min(target, free_b > (1ull << 30) ? free_b - (1ull << 30) : free_b/2);
+    target = std::min<size_t>(target, free_b > (1ull << 30) ? free_b - (1ull << 30) : free_b/2);
     target -= target % chunk_size;
     printf("case %c: sync %s, wait %d ms, barrier %zu MiB, chunk %zu MiB, batch %d, target %zu MiB (granularity %zu)\n",
         cs, sync_mode.c_str(), wait_ms, barrier_size/MiB, chunk_mib, batch, target/MiB, gran_rec);
