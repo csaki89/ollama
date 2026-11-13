@@ -7,7 +7,7 @@
 #   docker exec -e QUICK=1 ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh   (one run per case)
 # From a checkout (pattern only, compiled here):
 #   docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
-# Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), CASES ("a b c d"),
+# Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), IMPL_CASES ("a b c d e"), CASES (pattern, "a b c d"),
 #      WAIT_MS (5), CHUNK_MIB (64), TARGET_GIB (6), ARCH (gfx1030, only for compiling the pattern)
 set -u
 cd "$(dirname "$0")"
@@ -16,7 +16,7 @@ export LD_LIBRARY_PATH="/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama:${LD_LIBRARY_P
 unset GGML_CUDA_VMM_DEBUG GGML_CUDA_VMM_SYNC GGML_CUDA_VMM_WAIT_MS  # logging would delay the first access; the mode is set per run
 RUNS=${RUNS:-3}; [ "${QUICK:-0}" = 1 ] && RUNS=1
 WAIT_MS=${WAIT_MS:-5}; CHUNK_MIB=${CHUNK_MIB:-64}; TARGET_GIB=${TARGET_GIB:-6}
-SYNCS=${SYNCS:-none wait barrier both}; CASES=${CASES:-a b c d}; TESTS=${TESTS:-impl pattern}
+SYNCS=${SYNCS:-none wait barrier both}; CASES=${CASES:-a b c d}; IMPL_CASES=${IMPL_CASES:-a b c d e}; TESTS=${TESTS:-impl pattern}
 SUM=/tmp/vmm-stress-summary.txt; : > "$SUM"
 
 PATTERN=$HERE/vmm-stress
@@ -29,9 +29,12 @@ if [[ " $TESTS " == *" impl "* ]] && [ ! -x "$HERE/vmm-stress-impl" ]; then
   echo "vmm-stress-impl is not here (it is built in the ROCm image), skipping impl"; TESTS=${TESTS//impl/}
 fi
 
-n_tests=$(echo $TESTS | wc -w); n_syncs=$(echo $SYNCS | wc -w); n_cases=$(echo $CASES | wc -w)
-total=$((n_tests*n_syncs*n_cases*RUNS))
-echo "=== $total runs ($TESTS; modes: $SYNCS; cases: $CASES; $RUNS each), estimated $((total*3/60 + 1)) min at ~3 s per run"
+n_syncs=$(echo $SYNCS | wc -w); total=0
+for t in $TESTS; do
+  if [ "$t" = impl ]; then cs=$IMPL_CASES; else cs=$CASES; fi
+  total=$((total + n_syncs*$(echo $cs | wc -w)*RUNS))
+done
+echo "=== $total runs ($TESTS; modes: $SYNCS; cases: impl $IMPL_CASES, pattern $CASES; $RUNS each), estimated $((total*3/60 + 1)) min at ~3 s per run"
 [ "$RUNS" -gt 1 ] && echo "    (QUICK=1: one run per case, about $((total/RUNS*3/60 + 1)) min)"
 T0=$(date +%s); done_runs=0
 
@@ -64,7 +67,8 @@ run() {
 : > /tmp/vmm-stress-counts.txt
 for t in $TESTS; do
   for s in $SYNCS; do
-    for c in $CASES; do run "$t" "$c" "$s"; done
+    if [ "$t" = impl ]; then cs=$IMPL_CASES; else cs=$CASES; fi
+    for c in $cs; do run "$t" "$c" "$s"; done
   done
 done
 
@@ -72,7 +76,7 @@ echo
 echo "=== summary ($(( $(date +%s) - T0 )) s): test, case, sync mode, successful runs, VRAM return / run time or the failure; gap: mapping end -> first access"
 cat "$SUM"
 for t in $TESTS; do
-  if grep -q "^$t [a-d] none " /tmp/vmm-stress-counts.txt; then
+  if grep -q "^$t [a-e] none " /tmp/vmm-stress-counts.txt; then
     if awk -v t="$t" '$1 == t && $3 == "none" && $4 != $5 { f = 1 } END { exit f ? 1 : 0 }' /tmp/vmm-stress-counts.txt; then
       echo "WARNING ($t): the none mode had no failure, so the test is not sensitive enough here: the success of the other modes proves nothing"
     else

@@ -1,6 +1,6 @@
 // VMM stress test of the real implementation: the arena and the growable buffers of ggml-cuda/HIP, through the same backend
 // registry functions the llama.cpp KV cache uses. A GPU page fault kills the process, so every run is a separate process (vmm-stress.sh).
-//   vmm-stress-impl <a|b|c|d> [--chunk-mib N] [--target-gib N] [--sections N]
+//   vmm-stress-impl <a|b|c|d|e> [--chunk-mib N] [--target-gib N] [--sections N]
 // The mode is the one of the implementation: GGML_CUDA_VMM_SYNC, GGML_CUDA_VMM_WAIT_MS (GGML_CUDA_VMM_DEBUG must be off: logging delays).
 // Every growth step: all sections grow by one chunk (mapping only), one commit (sync, then its zeroing is the first access, only of
 // the new chunks), then one word per 4 KiB page of the new chunks is written, and one word per page of the whole sections (old
@@ -11,6 +11,8 @@
 //      mapped again on the same addresses of the same arena, and grown again
 //   c  the VRAM almost filled with ordinary buffers first, then growth
 //   d  8 arenas one after the other
+//   e  the KV pattern: 96 sections of 32 MiB, 4 MiB each at the start, growing by 768 KiB steps (not on chunk boundaries) to
+//      13 MiB, shrunk in place to 4 MiB (ggml_backend_buffer_shrink: the top chunks unmapped, the content below kept), grown again
 // At the end: no arena and no mapped byte may be left (backend counters), and the VRAM must come back (sysfs, polled for 3 s).
 // Env: VMM_BACKEND (path of the backend library, default /usr/lib/ollama/rocm_v7_2/libggml-hip.so if it exists),
 //      VMM_IMPL_SIM=1 (simulated growable buffers, to test this program on a backend without VMM)
@@ -41,6 +43,7 @@ typedef bool                  (*arena_commit_t)(void * arena);
 typedef bool                  (*buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
 typedef bool                  (*buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
 typedef void                  (*vmm_stats_t)(int64_t * stats);
+typedef bool                  (*buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
 
 static arena_new_t          arena_new;
 static arena_alignment_t    arena_alignment;
@@ -50,6 +53,7 @@ static arena_commit_t       arena_commit;
 static buffer_grow_t        buffer_grow;
 static buffer_grow_commit_t buffer_grow_commit;
 static vmm_stats_t          vmm_stats;
+static buffer_shrink_t      buffer_shrink;
 
 // simulated growable buffers: a buffer of the section size
 static ggml_backend_buffer_type_t sim_buft;
@@ -61,6 +65,7 @@ static bool sim_arena_commit(void *) { return true; }
 static bool sim_buffer_grow(ggml_backend_buffer_t b, size_t size) { return size <= ggml_backend_buffer_get_size(b); }
 static bool sim_buffer_grow_commit(ggml_backend_buffer_t) { return true; }
 static void sim_vmm_stats(int64_t * stats) { memset(stats, 0, 4*sizeof(int64_t)); }
+static bool sim_buffer_shrink(ggml_backend_buffer_t, size_t) { return true; }
 
 [[noreturn]] static void fail(const std::string & msg) {
     printf("FAIL: %s\n", msg.c_str());
@@ -282,8 +287,8 @@ static void remap_same(arena & a, std::vector<section> & secs, size_t size) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 2 || strlen(argv[1]) != 1 || argv[1][0] < 'a' || argv[1][0] > 'd') {
-        printf("usage: %s <a|b|c|d> [--chunk-mib N] [--target-gib N] [--sections N]\n", argv[0]);
+    if (argc < 2 || strlen(argv[1]) != 1 || argv[1][0] < 'a' || argv[1][0] > 'e') {
+        printf("usage: %s <a|b|c|d|e> [--chunk-mib N] [--target-gib N] [--sections N]\n", argv[0]);
         return 2;
     }
     const char cs = argv[1][0];
@@ -298,6 +303,9 @@ int main(int argc, char ** argv) {
         else { printf("unknown option %s\n", a.c_str()); return 2; }
     }
 
+    if (cs == 'e') {
+        n_secs = 96; // the KV pattern (case e)
+    }
     std::string path = getenv("VMM_BACKEND") ? getenv("VMM_BACKEND") : "";
     if (path.empty() && std::ifstream("/usr/lib/ollama/rocm_v7_2/libggml-hip.so").good()) {
         path = "/usr/lib/ollama/rocm_v7_2/libggml-hip.so";
@@ -332,6 +340,7 @@ int main(int argc, char ** argv) {
     if (g_sim) {
         arena_new = sim_arena_new; arena_alignment = sim_arena_alignment; arena_buffer = sim_arena_buffer; arena_free = sim_arena_free;
         arena_commit = sim_arena_commit; buffer_grow = sim_buffer_grow; buffer_grow_commit = sim_buffer_grow_commit; vmm_stats = sim_vmm_stats;
+        buffer_shrink = sim_buffer_shrink;
     } else {
         arena_new          = (arena_new_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_arena_new");
         arena_alignment    = (arena_alignment_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_arena_alignment");
@@ -341,7 +350,8 @@ int main(int argc, char ** argv) {
         buffer_grow        = (buffer_grow_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_grow");
         buffer_grow_commit = (buffer_grow_commit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_grow_commit");
         vmm_stats          = (vmm_stats_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_stats");
-        if (!arena_new || !arena_alignment || !arena_buffer || !arena_free || !arena_commit || !buffer_grow || !buffer_grow_commit || !vmm_stats) {
+        buffer_shrink      = (buffer_shrink_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_shrink");
+        if (!arena_new || !arena_alignment || !arena_buffer || !arena_free || !arena_commit || !buffer_grow || !buffer_grow_commit || !vmm_stats || !buffer_shrink) {
             fail("the backend does not provide the growable buffer functions");
         }
     }
@@ -353,7 +363,9 @@ int main(int argc, char ** argv) {
     // one cpy of a section stays below 2 GiB
     size_t per_section = std::min<size_t>(target/n_secs, 1536*MiB);
     per_section = std::max(per_section - per_section % chunk, chunk);
-    const size_t max_size = per_section + chunk;
+    // case e: the KV pattern
+    const size_t e_max = 32*MiB, e_start = 4*MiB, e_step = 768*1024, e_top = 13*MiB;
+    const size_t max_size = cs == 'e' ? e_max : per_section + chunk;
     g_max_pages = max_size/PAGE;
     g_scratch = ggml_backend_buft_alloc_buffer(g_buft, (1 + n_secs)*g_max_pages*sizeof(float) + 4096);
     if (!g_scratch) {
@@ -455,6 +467,43 @@ int main(int argc, char ** argv) {
         for (auto * b : filler) {
             ggml_backend_buffer_free(b);
         }
+    } else if (cs == 'e') {
+        printf("  KV pattern: %d sections of %zu MiB, from %zu MiB by %zu KiB to %zu MiB, shrink to %zu MiB, grow again\n",
+            n_secs, e_max/MiB, e_start/MiB, e_step/1024, e_top/MiB, e_start/MiB);
+        arena a = new_arena((size_t) n_secs*e_max + 64*MiB);
+        auto secs = start_sections(a, n_secs, e_start, e_max);
+        grow_to(secs, e_step, e_top);
+        report_vram("grown");
+        int64_t st0[4];
+        vmm_stats(st0);
+        const size_t vram_grown = vram_used();
+        const size_t size_top = secs[0].size;
+        for (auto & s : secs) {
+            if (!buffer_shrink(s.buf, e_start)) {
+                fail("buffer_shrink failed");
+            }
+            s.size = e_start;
+        }
+        int64_t st1[4];
+        vmm_stats(st1);
+        mark_and_check(secs, std::vector<size_t>(secs.size(), e_start)); // the content below the shrink point
+        printf("  shrink %zu -> %zu KiB per section: mapped %lld -> %lld MiB in the backend\n", size_top/1024, e_start/1024,
+            (long long) (st0[1] >> 20), (long long) (st1[1] >> 20));
+        if (!g_sim && st1[1] >= st0[1]) {
+            fail("the shrink unmapped nothing");
+        }
+        const size_t unmapped = (size_t) (st0[1] - st1[1]);
+        const int ms = vram0 && unmapped ? wait_vram_below(vram_grown - unmapped/2) : 0;
+        if (ms < 0) {
+            printf("  WARNING: the VRAM of the unmapped chunks did not come back within 3 s\n");
+        } else {
+            printf("  the VRAM of the unmapped chunks came back in %d ms\n", ms);
+        }
+        report_vram("shrunk in place");
+        grow_to(secs, e_step, e_start + 6*e_step);
+        report_vram("grown again");
+        free_all(secs);
+        arena_free(a.ptr);
     } else {
         // the 8 arenas together stay within the target
         size_t per = std::min<size_t>(target/(8*n_secs), 256*MiB);

@@ -9,11 +9,11 @@ at runtime (zone 2: repacked copy + host copy; debug trigger: LLAMA_FLEX_TEST).
 three-zone placement from two --fit runs (dense and MoE), a KV cache that grows with the use
 (growable VMM buffers on CUDA/HIP, copy fallback elsewhere; LLAMA_KV_NO_VMM=1 turns VMM off),
 and flex layers that go off when the KV needs device memory and come back when it shrinks.
-VMM layout: one address range per device, a section per K/V, 2 MiB aligned chunks (<= 256 MiB),
+VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, 1 MiB), shrunk in place,
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
 zeroing; live arena and mapping counters (ggml_backend_vmm_stats). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, fc93ee808, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, 6480a45c6, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,7 +290,7 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..4a946bd9c 100644
+index 043511b72..a05b82a0e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
@@ -302,7 +302,7 @@ index 043511b72..4a946bd9c 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -894,6 +894,340 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -894,6 +894,400 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -362,8 +362,11 @@ index 043511b72..4a946bd9c 100644
 +    return mode;
 +}
 +
-+static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20;   // 2 MiB
-+static constexpr size_t GGML_CUDA_VMM_MAX_CHUNK = 256ull << 20; // 256 MiB (a single 1 GiB chunk is unreliable on ROCm)
++static constexpr size_t GGML_CUDA_VMM_MIN_ALIGN = 2ull << 20; // 2 MiB: section alignment
++
++// Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
++// first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
++// GGML_CUDA_VMM_CHUNK_KIB (default 1024), rounded to the minimum granularity, a divisor of the section alignment.
 +
 +struct ggml_cuda_vmm_arena {
 +    ggml_backend_buffer_type_t buft;
@@ -375,6 +378,7 @@ index 043511b72..4a946bd9c 100644
 +    int         refs     = 1; // the creator and every buffer in it
 +    std::vector<std::pair<CUdeviceptr, size_t>> pending; // mapped chunks not committed yet (not to be accessed)
 +    int64_t     t_mapped = 0; // end of the last mapping (us)
++    size_t      chunk    = 0; // size of every mapping
 +};
 +
 +// counters: live arenas, mapped bytes; of the last commit: mapping end -> first access (us), of which the sync (us)
@@ -430,15 +434,15 @@ index 043511b72..4a946bd9c 100644
 +        dev_ptr = nullptr; // not from cudaMalloc
 +    }
 +
-+    // map physical memory up to size into the section; it must not be accessed before ggml_cuda_vmm_commit
++    // map whole chunks after the mapped ones until size is covered; they must not be accessed before ggml_cuda_vmm_commit
 +    bool map_to(size_t size) {
-+        const size_t align = arena->align;
-+        const size_t need  = align * ((size + align - 1) / align);
++        const size_t chunk = arena->chunk;
++        const size_t need  = chunk * ((size + chunk - 1) / chunk);
 +        if (need > section) {
++            GGML_LOG_ERROR("%s: %zu bytes do not fit the section (%zu)\n", __func__, size, section);
 +            return false;
 +        }
 +        while (mapped < need) {
-+            const size_t chunk = std::min(GGML_CUDA_VMM_MAX_CHUNK - GGML_CUDA_VMM_MAX_CHUNK % align, need - mapped);
 +            CUmemAllocationProp prop = {};
 +            prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
 +            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -447,6 +451,7 @@ index 043511b72..4a946bd9c 100644
 +            const auto r_create = cuMemCreate(&handle, chunk, &prop, 0);
 +            GGML_CUDA_VMM_LOG("%s: create %zu bytes on device %d: %d\n", __func__, chunk, arena->physical_device, (int) r_create);
 +            if (!GGML_CUDA_VMM_OK(r_create)) {
++                GGML_LOG_ERROR("%s: create %zu bytes failed (%d)\n", __func__, chunk, (int) r_create);
 +                return false;
 +            }
 +            const CUdeviceptr ptr = (CUdeviceptr) ((char *) base + mapped);
@@ -454,6 +459,7 @@ index 043511b72..4a946bd9c 100644
 +            GGML_CUDA_VMM_LOG("%s: map %p + %zu (section offset %zu of %zu, arena offset %zu of %zu): %d\n", __func__, (void *) ptr, chunk,
 +                mapped, section, (size_t) ((char *) ptr - (char *) arena->base), arena->reserved, (int) r_map);
 +            if (!GGML_CUDA_VMM_OK(r_map)) {
++                GGML_LOG_ERROR("%s: map %p + %zu failed (%d)\n", __func__, (void *) ptr, chunk, (int) r_map);
 +                (void) cuMemRelease(handle);
 +                return false;
 +            }
@@ -464,6 +470,7 @@ index 043511b72..4a946bd9c 100644
 +            const auto r_access = cuMemSetAccess(ptr, chunk, &access, 1);
 +            GGML_CUDA_VMM_LOG("%s: set access %p + %zu read/write for device %d: %d\n", __func__, (void *) ptr, chunk, arena->physical_device, (int) r_access);
 +            if (!GGML_CUDA_VMM_OK(r_access)) {
++                GGML_LOG_ERROR("%s: set access %p + %zu failed (%d)\n", __func__, (void *) ptr, chunk, (int) r_access);
 +                (void) cuMemUnmap(ptr, chunk);
 +                (void) cuMemRelease(handle);
 +                return false;
@@ -568,9 +575,21 @@ index 043511b72..4a946bd9c 100644
 +    if (!GGML_CUDA_VMM_OK(r_reserve)) {
 +        return nullptr;
 +    }
++    // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
++    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
++    size_t chunk = (env_chunk ? (size_t) atoll(env_chunk) : 1024) << 10;
++    if (gran_min > 0) {
++        chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
++    }
++    if (chunk == 0 || chunk > align || align % chunk != 0) {
++        chunk = align;
++    }
++    GGML_CUDA_VMM_LOG("%s: chunk %zu bytes\n", __func__, chunk);
 +    (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
 +    ++ggml_cuda_vmm_stat[0];
-+    return new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
++    auto * arena = new ggml_cuda_vmm_arena { buft, device, physical, base, reserved, align, 1 };
++    arena->chunk = chunk;
++    return arena;
 +}
 +
 +// stats[4]: live arenas, mapped bytes, last commit: mapping end -> first access (us), of which the sync (us)
@@ -638,12 +657,53 @@ index 043511b72..4a946bd9c 100644
 +    GGML_CUDA_VMM_LOG("%s: buffer %p: %zu -> %zu bytes (mapped %zu of %zu)\n", __func__, (void *) ctx->base, size_old, size, ctx->mapped, ctx->section);
 +    return true;
 +}
++
++// shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
++// below stays); false if it is not one or an unmap fails
++static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
++    if (!ggml_backend_buffer_is_cuda(buffer)) {
++        return false;
++    }
++    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
++    if (!ctx) {
++        return false;
++    }
++    if (size >= buffer->size) {
++        return true;
++    }
++    ggml_cuda_set_device(ctx->device);
++    (void) cudaDeviceSynchronize(); // no stream may use a chunk when it is unmapped
++    const size_t chunk      = ctx->arena->chunk;
++    const size_t keep       = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
++    const size_t size_old   = buffer->size;
++    const size_t mapped_old = ctx->mapped;
++    auto & pending = ctx->arena->pending;
++    while (!ctx->mappings.empty() && ctx->mapped - ctx->mappings.back().size >= keep) {
++        const auto m = ctx->mappings.back();
++        const auto r_unmap = cuMemUnmap(m.ptr, m.size);
++        if (!GGML_CUDA_VMM_OK(r_unmap)) {
++            GGML_LOG_ERROR("%s: buffer %p: unmap %p + %zu failed (%d)\n", __func__, (void *) ctx->base, (void *) m.ptr, m.size, (int) r_unmap);
++            (void) cudaGetLastError();
++            return false;
++        }
++        const auto r_release = cuMemRelease(m.handle);
++        pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
++        ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
++        ctx->mapped -= m.size;
++        ctx->mappings.pop_back();
++        GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
++    }
++    buffer->size = size;
++    GGML_CUDA_VMM_LOG("%s: buffer %p: %zu -> %zu bytes (mapped %zu -> %zu of %zu)\n", __func__, (void *) ctx->base, size_old, size,
++        mapped_old, ctx->mapped, ctx->section);
++    return true;
++}
 +#endif // defined(GGML_USE_VMM) || defined(GGML_USE_HIP)
 +
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -5811,6 +6145,32 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5811,6 +6205,35 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -662,6 +722,9 @@ index 043511b72..4a946bd9c 100644
 +    }
 +    if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
 +        return (void *)ggml_backend_cuda_buffer_grow_commit;
++    }
++    if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
++        return (void *)ggml_backend_cuda_buffer_shrink;
 +    }
 +    if (strcmp(name, "ggml_backend_vmm_stats") == 0) {
 +        return (void *)ggml_backend_cuda_vmm_stats;
@@ -1084,7 +1147,7 @@ index 95b722628..c1305ac9f 100644
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..285ce63a0 100644
+index 1d0554fa1..54dc6cd33 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -1161,7 +1224,7 @@ index 1d0554fa1..285ce63a0 100644
          slot_info sinfo;
  
          bool res = true;
-@@ -2780,6 +2824,641 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2780,6 +2824,681 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -1314,6 +1377,7 @@ index 1d0554fa1..285ce63a0 100644
 +    }
 +    dyn_max   = max_size;
 +    dyn_chunk = GGML_PAD(std::max<size_t>(1, chunk_bytes / per_cell), 256);
++    dyn_base  = get_size();
 +    const char * env = getenv("LLAMA_KV_NO_VMM");
 +    dyn_vmm_off = env && atoi(env) != 0;
 +    dyn_vmm.assign(layers.size(), 0);
@@ -1341,6 +1405,8 @@ index 1d0554fa1..285ce63a0 100644
 +typedef ggml_backend_buffer_t (*ggml_backend_vmm_arena_buffer_t)(void * arena, size_t offset, size_t size, size_t max_size);
 +typedef void                  (*ggml_backend_vmm_arena_free_t)(void * arena);
 +typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
++// unmaps the whole chunks above size (the content below stays)
++typedef bool                  (*ggml_backend_buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
 +// new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 +typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 +typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
@@ -1372,6 +1438,11 @@ index 1d0554fa1..285ce63a0 100644
 +static bool kv_sim_grow(ggml_backend_buffer_t buffer, size_t size) {
 +    return size <= ggml_backend_buffer_get_size(buffer);
 +}
++static bool kv_sim_shrink(ggml_backend_buffer_t buffer, size_t size) {
++    GGML_UNUSED(buffer);
++    GGML_UNUSED(size);
++    return true;
++}
 +
 +static bool kv_sim_arena_commit(void * arena) {
 +    GGML_UNUSED(arena);
@@ -1393,6 +1464,7 @@ index 1d0554fa1..285ce63a0 100644
 +        if (strcmp(name, "ggml_backend_vmm_arena_buffer")    == 0) { return (void *) kv_sim_arena_buffer; }
 +        if (strcmp(name, "ggml_backend_vmm_arena_free")      == 0) { return (void *) kv_sim_arena_free; }
 +        if (strcmp(name, "ggml_backend_buffer_grow")         == 0) { return (void *) kv_sim_grow; }
++        if (strcmp(name, "ggml_backend_buffer_shrink")       == 0) { return (void *) kv_sim_shrink; }
 +        if (strcmp(name, "ggml_backend_vmm_arena_commit")    == 0) { return (void *) kv_sim_arena_commit; }
 +        if (strcmp(name, "ggml_backend_buffer_grow_commit")  == 0) { return (void *) kv_sim_grow_commit; }
 +        return nullptr;
@@ -1421,7 +1493,11 @@ index 1d0554fa1..285ce63a0 100644
 +    if (dyn_chunk == 0) {
 +        return n;
 +    }
-+    return std::min<uint32_t>(dyn_max, ((n + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
++    // steps of dyn_chunk from the starting size (rounding to multiples of the chunk made 4096 -> 4608 with a 768 cell chunk)
++    if (n <= dyn_base) {
++        return dyn_base;
++    }
++    return std::min<uint32_t>(dyn_max, dyn_base + ((n - dyn_base + dyn_chunk - 1)/dyn_chunk)*dyn_chunk);
 +}
 +
 +uint32_t llama_kv_cache::used_cells() const {
@@ -1530,6 +1606,31 @@ index 1d0554fa1..285ce63a0 100644
 +        t_alloc += ggml_time_us() - t1;
 +    }
 +
++    // growable K/V shrinking: the used cells are below n, only the whole free chunks at the top are unmapped (no allocation, no copy)
++    if (n < n_old && !force) {
++        const int64_t t1 = ggml_time_us();
++        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++            if (!dyn_vmm[ikv]) {
++                continue;
++            }
++            auto & layer = layers[ikv];
++            auto shrink = (ggml_backend_buffer_shrink_t) kv_growable_fn(ggml_backend_buffer_get_type(layer.k->buffer), "ggml_backend_buffer_shrink");
++            bool ok = shrink != nullptr;
++            for (ggml_tensor * t : { layer.k, layer.v }) {
++                if (ok && t) {
++                    ok = shrink(t->buffer, t->nb[1]*n*t->ne[2]);
++                }
++            }
++            if (ok) {
++                grown[ikv] = 1;
++            } else {
++                LLAMA_LOG_WARN("%s: layer %u: shrinking the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
++                dyn_vmm[ikv] = 0;
++            }
++        }
++        t_free += ggml_time_us() - t1;
++    }
++
 +    // growable layout: one arena per device for the K and V of the layers that get a new buffer here (the tested VMM pattern);
 +    // the address space is virtual, so it is reserved with room for any chunk alignment (64 MiB per section)
 +    struct vmm_arena {
@@ -1626,7 +1727,7 @@ index 1d0554fa1..285ce63a0 100644
 +        auto & layer = layers[ikv];
 +        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
 +
-+        // grown in place above: the tensors keep their address and content (no transient copy), only their shape changes
++        // grown or shrunk in place above: the tensors keep their address and content (no transient copy), only their shape changes
 +        if (grown[ikv]) {
 +            const int64_t t1 = ggml_time_us();
 +            {
@@ -1638,7 +1739,9 @@ index 1d0554fa1..285ce63a0 100644
 +                    t->ne[1] = n;
 +                    t->nb[2] = t->nb[1]*n;
 +                    t->nb[3] = t->nb[2]*t->ne[2];
-+                    ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
++                    if (ggml_nbytes(t) > old_bytes) {
++                        ggml_backend_tensor_memset(t, 0, old_bytes, ggml_nbytes(t) - old_bytes);
++                    }
 +                }
 +                for (auto * views : { &layer.k_stream, &layer.v_stream }) {
 +                    for (ggml_tensor * v : *views) {
@@ -1794,8 +1897,8 @@ index 1d0554fa1..285ce63a0 100644
 +    }
 +    n_resize++;
 +
-+    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu grown in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
-+        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
++    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
++        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
 +        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
 +    return true;
 +}
@@ -1804,7 +1907,7 @@ index 1d0554fa1..285ce63a0 100644
  // llama_kv_cache_context
  //
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 52cc8cd32..26c8c3342 100644
+index 52cc8cd32..869989219 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -5,6 +5,7 @@
@@ -1815,7 +1918,7 @@ index 52cc8cd32..26c8c3342 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -250,7 +251,48 @@ public:
+@@ -250,7 +251,49 @@ public:
      // note: used by n-gram input embeddings
      void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
  
@@ -1846,6 +1949,7 @@ index 52cc8cd32..26c8c3342 100644
  private:
 +    uint32_t dyn_max   = 0;
 +    uint32_t dyn_chunk = 0;
++    uint32_t dyn_base  = 0; // size when it became dynamic: the sizes are dyn_base + k * dyn_chunk
 +    uint64_t n_resize  = 0;
 +    bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
 +    std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers
