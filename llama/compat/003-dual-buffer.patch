@@ -13,7 +13,7 @@ VMM layout: one address range per device, a section per K/V, 2 MiB aligned chunk
 after mapping a KFD barrier + wait (GGML_CUDA_VMM_SYNC, GGML_CUDA_VMM_WAIT_MS), then synchronous
 zeroing; live arena and mapping counters (ggml_backend_vmm_stats). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, 7c9d3591f, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, 648065fbc, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,7 +290,7 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..7d1921998 100644
+index 043511b72..d1c49ead5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
@@ -388,7 +388,7 @@ index 043511b72..7d1921998 100644
 +    (void) cudaDeviceSynchronize();
 +    const auto r_free = cuMemAddressFree(arena->base, arena->reserved);
 +    const int64_t left = --ggml_cuda_vmm_stat[0];
-+    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left %lld, mapped %lld bytes)\n", __func__, (void *) arena->base, arena->reserved,
++    GGML_CUDA_VMM_LOG("%s: address free %p, %zu bytes: %d (arenas left: %lld, mapped bytes left: %lld)\n", __func__, (void *) arena->base, arena->reserved,
 +        (int) r_free, (long long) left, (long long) ggml_cuda_vmm_stat[1].load());
 +    delete arena;
 +}
