@@ -1,81 +1,82 @@
 #!/usr/bin/env bash
 # VMM stress matrix, every run in its own process (a GPU page fault kills the process).
 #   impl:    vmm-stress-impl, the real ggml-cuda arena and growable buffers through the ggml backend API, per GGML_CUDA_VMM_SYNC mode
-#   pattern: vmm-stress, the bare HIP pattern without our code
-# On the NAS from the image (the binaries are in it, nothing to clone or build):
-#   docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 --entrypoint /bin/bash <image> /usr/lib/ollama/dualbuf-test/vmm-stress.sh
+#   pattern: vmm-stress, the bare HIP pattern without our code (same cases, same steps)
+# In the running app container (unload the models first, the test fills the free VRAM):
+#   docker exec ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh
+#   docker exec -e QUICK=1 ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh   (one run per case)
 # From a checkout (pattern only, compiled here):
 #   docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
-# Env: TESTS ("impl pattern"), RUNS (3), WAIT_MS (5), TARGET_GIB (6)
-#      impl: IMPL_SYNCS ("auto none wait barrier both"), IMPL_CASES ("a b c d"), IMPL_CHUNK (64)
-#      pattern: ARCH (gfx1030), SYNCS ("none wait barrier both"), CASES ("a b c d"), CHUNKS ("2 64 256 1024")
+# Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), CASES ("a b c d"),
+#      WAIT_MS (5), CHUNK_MIB (64), TARGET_GIB (6), ARCH (gfx1030, only for compiling the pattern)
 set -u
 cd "$(dirname "$0")"
 HERE=$PWD
 export LD_LIBRARY_PATH="/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama:${LD_LIBRARY_PATH:-}"
-RUNS=${RUNS:-3}; WAIT_MS=${WAIT_MS:-5}; TARGET_GIB=${TARGET_GIB:-6}
+unset GGML_CUDA_VMM_DEBUG GGML_CUDA_VMM_SYNC GGML_CUDA_VMM_WAIT_MS  # logging would delay the first access; the mode is set per run
+RUNS=${RUNS:-3}; [ "${QUICK:-0}" = 1 ] && RUNS=1
+WAIT_MS=${WAIT_MS:-5}; CHUNK_MIB=${CHUNK_MIB:-64}; TARGET_GIB=${TARGET_GIB:-6}
+SYNCS=${SYNCS:-none wait barrier both}; CASES=${CASES:-a b c d}; TESTS=${TESTS:-impl pattern}
 SUM=/tmp/vmm-stress-summary.txt; : > "$SUM"
 
-# impl_run <case> <sync>
-impl_run() {
-  local c=$1 s=$2 ok=0 r log rc info="" env_sync=()
-  [ "$s" != auto ] && env_sync=("GGML_CUDA_VMM_SYNC=$s")
-  for r in $(seq 1 "$RUNS"); do
-    log="/tmp/vmm-impl-$c-$s-$r.log"
-    env "${env_sync[@]}" GGML_CUDA_VMM_WAIT_MS="$WAIT_MS" "$HERE/vmm-stress-impl" "$c" --chunk-mib "${IMPL_CHUNK:-64}" --target-gib "$TARGET_GIB" > "$log" 2>&1
-    rc=$?
-    [ "$rc" -eq 0 ] && ok=$((ok + 1))
-    if [ "$r" -eq 1 ]; then grep -E 'impl case|VRAM|filler|section at|FAIL|Memory access fault|ggml_cuda_vmm_sync' "$log"; fi
-    [ "$rc" -ne 0 ] && info="last failure: exit $rc, $(grep -m1 -E 'FAIL|Memory access fault' "$log" | cut -c1-90)"
-  done
-  printf 'impl    %-5s %-8s %d/%d  %s\n' "$c" "$s" "$ok" "$RUNS" "$info" >> "$SUM"
-}
+PATTERN=$HERE/vmm-stress
+if [[ " $TESTS " == *" pattern "* ]] && [ ! -x "$PATTERN" ]; then
+  HIPCC=/opt/rocm/bin/hipcc; [ -x "$HIPCC" ] || HIPCC=hipcc
+  PATTERN=/tmp/vmm-stress
+  "$HIPCC" -O2 --offload-arch="${ARCH:-gfx1030}" -o "$PATTERN" vmm-stress.cpp || { echo "build failed"; exit 1; }
+fi
+if [[ " $TESTS " == *" impl "* ]] && [ ! -x "$HERE/vmm-stress-impl" ]; then
+  echo "vmm-stress-impl is not here (it is built in the ROCm image), skipping impl"; TESTS=${TESTS//impl/}
+fi
 
-# pattern_run <case> <sync> <chunk_mib> <batch>
-pattern_run() {
-  local c=$1 s=$2 ch=$3 b=$4 ok=0 r log rc info=""
-  for r in $(seq 1 "$RUNS"); do
-    log="/tmp/vmm-stress-$c-$s-$ch-$b-$r.log"
-    "$PATTERN" "$c" --sync "$s" --wait-ms "$WAIT_MS" --chunk-mib "$ch" --batch "$b" --target-gib "$TARGET_GIB" > "$log" 2>&1
-    rc=$?
-    [ "$rc" -eq 0 ] && ok=$((ok + 1))
-    if [ "$r" -eq 1 ]; then cat "$log"; fi
-    [ "$rc" -ne 0 ] && info="last failure: exit $rc, $(grep -m1 -E 'FAIL|Memory access fault' "$log" | cut -c1-90)"
-  done
-  local peak; peak=$(grep -E 'VRAM (grown|grown again)' "/tmp/vmm-stress-$c-$s-$ch-$b-1.log" | sed -E 's/.*used\(sysfs\) *([0-9]+) MiB.*/\1/' | sort -n | tail -1)
-  printf 'pattern %-5s %-8s %6s %6s  %d/%d  peak VRAM %6s MiB  %s\n' "$c" "$s" "$ch" "$b" "$ok" "$RUNS" "${peak:-?}" "$info" >> "$SUM"
-}
+n_tests=$(echo $TESTS | wc -w); n_syncs=$(echo $SYNCS | wc -w); n_cases=$(echo $CASES | wc -w)
+total=$((n_tests*n_syncs*n_cases*RUNS))
+echo "=== $total runs ($TESTS; modes: $SYNCS; cases: $CASES; $RUNS each), estimated $((total*3/60 + 1)) min at ~3 s per run"
+[ "$RUNS" -gt 1 ] && echo "    (QUICK=1: one run per case, about $((total/RUNS*3/60 + 1)) min)"
+T0=$(date +%s); done_runs=0
 
-for t in ${TESTS:-impl pattern}; do
-  if [ "$t" = impl ]; then
-    if [ ! -x "$HERE/vmm-stress-impl" ]; then echo "vmm-stress-impl is not here (it is built in the ROCm image), skipping impl"; continue; fi
-    for s in ${IMPL_SYNCS:-auto none wait barrier both}; do
-      for c in ${IMPL_CASES:-a b c d}; do impl_run "$c" "$s"; done
-    done
-  else
-    PATTERN=$HERE/vmm-stress
-    if [ ! -x "$PATTERN" ]; then
-      HIPCC=/opt/rocm/bin/hipcc; [ -x "$HIPCC" ] || HIPCC=hipcc
-      PATTERN=/tmp/vmm-stress
-      "$HIPCC" -O2 --offload-arch="${ARCH:-gfx1030}" -o "$PATTERN" vmm-stress.cpp || { echo "build failed"; exit 1; }
+# run <test> <case> <sync>
+run() {
+  local t=$1 c=$2 s=$3 ok=0 r log rc info="" gap="" back=""
+  for r in $(seq 1 "$RUNS"); do
+    log="/tmp/vmm-$t-$c-$s-$r.log"
+    if [ "$t" = impl ]; then
+      GGML_CUDA_VMM_SYNC=$s GGML_CUDA_VMM_WAIT_MS=$WAIT_MS "$HERE/vmm-stress-impl" "$c" --chunk-mib "$CHUNK_MIB" --target-gib "$TARGET_GIB" > "$log" 2>&1
+    else
+      "$PATTERN" "$c" --sync "$s" --wait-ms "$WAIT_MS" --chunk-mib "$CHUNK_MIB" --batch 4 --target-gib "$TARGET_GIB" > "$log" 2>&1
     fi
-    for s in ${SYNCS:-none wait barrier both}; do
-      for c in ${CASES:-a b c d}; do
-        case $c in
-          a) for ch in ${CHUNKS:-2 64 256 1024}; do
-               [ "$ch" -eq 2 ] && [ "$TARGET_GIB" -gt 1 ] && { TARGET_SAVE=$TARGET_GIB; TARGET_GIB=1; pattern_run a "$s" "$ch" 1; TARGET_GIB=$TARGET_SAVE; continue; }
-               pattern_run a "$s" "$ch" 1
-             done
-             pattern_run a "$s" 64 8 ;;
-          b) pattern_run b "$s" 64 1; pattern_run b "$s" 256 1 ;;
-          c) pattern_run c "$s" 64 1 ;;
-          d) pattern_run d "$s" 4 1; pattern_run d "$s" 4 8 ;;
-        esac
-      done
-    done
-  fi
+    rc=$?
+    done_runs=$((done_runs + 1))
+    if [ "$rc" -eq 0 ]; then
+      ok=$((ok + 1))
+      gap=$(grep -m1 'mapping end -> first access' "$log" | sed -E 's/.*access: //')
+      back=$(grep -m1 -E 'came back in [0-9]+ ms; run time' "$log" | sed -E 's/.*came back in ([0-9]+) ms; run time (.*)/VRAM back \1 ms, \2/')
+    else
+      info="last failure: exit $rc, $(grep -m1 -E 'FAIL|Memory access fault|Aborted' "$log" | cut -c1-100)"
+    fi
+  done
+  printf '%-7s %-1s %-8s %d/%d  %s\n' "$t" "$c" "$s" "$ok" "$RUNS" "${info:-$back}" | tee -a "$SUM"
+  [ -n "$gap" ] && printf '                     gap: %s\n' "$gap" | tee -a "$SUM"
+  printf '%s %s %s %d %d\n' "$t" "$c" "$s" "$ok" "$RUNS" >> /tmp/vmm-stress-counts.txt
+  echo "    ($done_runs/$total runs, $(( $(date +%s) - T0 )) s)"
+}
+
+: > /tmp/vmm-stress-counts.txt
+for t in $TESTS; do
+  for s in $SYNCS; do
+    for c in $CASES; do run "$t" "$c" "$s"; done
+  done
 done
 
 echo
-echo "=== summary: impl: case, sync, successful runs; pattern: case, sync, chunk MiB, batch, successful runs, peak VRAM (a 2 MiB chunk run is limited to 1 GiB)"
+echo "=== summary ($(( $(date +%s) - T0 )) s): test, case, sync mode, successful runs, VRAM return / run time or the failure; gap: mapping end -> first access"
 cat "$SUM"
+for t in $TESTS; do
+  if grep -q "^$t [a-d] none " /tmp/vmm-stress-counts.txt; then
+    if awk -v t="$t" '$1 == t && $3 == "none" && $4 != $5 { f = 1 } END { exit f ? 1 : 0 }' /tmp/vmm-stress-counts.txt; then
+      echo "WARNING ($t): the none mode had no failure, so the test is not sensitive enough here: the success of the other modes proves nothing"
+    else
+      echo "($t: the none mode failed, the test is sensitive; the other modes decide)"
+    fi
+  fi
+done
