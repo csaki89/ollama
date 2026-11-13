@@ -11,9 +11,9 @@ three-zone placement from two --fit runs (dense and MoE), a KV cache that grows 
 and flex layers that go off when the KV needs device memory and come back when it shrinks.
 VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, 1 MiB), shrunk in place,
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
-zeroing; live arena and mapping counters (ggml_backend_vmm_stats). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
+zeroing; growth steps of one chunk per section; llama_memory_reserve grows the KV for a whole prompt in one step (called by llama-server). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, 6480a45c6, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, 66280c35a, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,7 +290,7 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..a05b82a0e 100644
+index 043511b72..1fefb9b30 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
@@ -302,7 +302,7 @@ index 043511b72..a05b82a0e 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -894,6 +894,400 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -894,6 +894,409 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -658,6 +658,15 @@ index 043511b72..a05b82a0e 100644
 +    return true;
 +}
 +
++// the chunk size of a growable buffer (every mapping of its arena); 0 if it is not one
++static size_t ggml_backend_cuda_buffer_vmm_chunk(ggml_backend_buffer_t buffer) {
++    if (!ggml_backend_buffer_is_cuda(buffer)) {
++        return 0;
++    }
++    auto * ctx = dynamic_cast<ggml_backend_cuda_growable_buffer_context *>((ggml_backend_cuda_buffer_context *) buffer->context);
++    return ctx ? ctx->arena->chunk : 0;
++}
++
 +// shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
 +// below stays); false if it is not one or an unmap fails
 +static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
@@ -703,7 +712,7 @@ index 043511b72..a05b82a0e 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -5811,6 +6205,35 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5811,6 +6214,38 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -723,6 +732,9 @@ index 043511b72..a05b82a0e 100644
 +    if (strcmp(name, "ggml_backend_buffer_grow_commit") == 0) {
 +        return (void *)ggml_backend_cuda_buffer_grow_commit;
 +    }
++    if (strcmp(name, "ggml_backend_buffer_vmm_chunk") == 0) {
++        return (void *)ggml_backend_cuda_buffer_vmm_chunk;
++    }
 +    if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
 +        return (void *)ggml_backend_cuda_buffer_shrink;
 +    }
@@ -740,7 +752,7 @@ index 043511b72..a05b82a0e 100644
  }
  
 diff --git a/include/llama.h b/include/llama.h
-index 720b45140..54baa1bf9 100644
+index 720b45140..ebbd81517 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -347,11 +347,27 @@ extern "C" {
@@ -783,8 +795,20 @@ index 720b45140..54baa1bf9 100644
          // Abort callback
          // if it returns true, execution of llama_decode() will be aborted
          // currently works only with CPU execution
+@@ -818,6 +839,11 @@ extern "C" {
+     // Check if the memory supports shifting
+     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+ 
++    // Dynamic KV (--auto-zones, --zones-ctx-init): make room for n_tokens new tokens after the cells in use in one step (rounded
++    // to the growth steps, with the zone rule's layer moves), e.g. for a whole prompt before its first batch; the shrink does not go
++    // below it while the prompt fills it. Without a dynamic KV it does nothing and returns true; false if the KV could not grow enough.
++    LLAMA_API bool llama_memory_reserve(struct llama_context * ctx, uint32_t n_tokens);
++
+     //
+     // State / sessions
+     //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fa115ffe4..e8362ea57 100644
+index fa115ffe4..33f532a16 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,7 +9,7 @@
@@ -862,10 +886,28 @@ index fa115ffe4..e8362ea57 100644
      }
  
      // init backends
-@@ -613,6 +663,171 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -613,6 +663,194 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
++
++bool llama_context::zones_reserve(uint32_t n_tokens) {
++    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
++    if (!kv || !kv->is_dynamic()) {
++        return true;
++    }
++    // the zone step with the whole remaining prompt: the shrink or growth and the flex moves happen once, here
++    const uint32_t used = kv->used_cells();
++    const uint32_t size = kv->get_size();
++    zones_reserved = 0;
++    zones_step(n_tokens);
++    zones_reserved      = used + n_tokens;
++    zones_reserved_from = used;
++    const bool ok = kv->get_size() >= std::min(used + n_tokens, kv->dyn_max_size());
++    LLAMA_LOG_INFO("%s: KV reserved for %u + %u tokens: %u -> %u cells%s\n", __func__, used, n_tokens, size, kv->get_size(),
++        ok ? "" : " (not enough, it grows by steps)");
++    return ok;
++}
 +
 +void llama_context::zones_step(uint32_t n_tokens) {
 +    auto * kv = zones_kv_init > 0 ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
@@ -924,9 +966,14 @@ index fa115ffe4..e8362ea57 100644
 +    const uint32_t used = kv->used_cells();
 +    bool shrunk = false;
 +
-+    // shrink when the KV is empty or mostly unused (new conversation, removed sequences)
++    // a reservation holds while the prompt fills it; it ends when reached, or when cells were removed (a new conversation)
++    if (zones_reserved > 0 && (used >= zones_reserved || used < zones_reserved_from)) {
++        zones_reserved = 0;
++    }
++
++    // shrink when the KV is empty or mostly unused (new conversation, removed sequences); not below a reservation
 +    if (size > zones_kv_init && (used == 0 || used < size/4)) {
-+        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(used + n_tokens));
++        const uint32_t n = std::max(zones_kv_init, kv->dyn_round(std::max(used + n_tokens, zones_reserved)));
 +        if (n < size) {
 +            sync();
 +            const size_t per_cell = kv->cell_bytes(true);
@@ -1034,7 +1081,7 @@ index fa115ffe4..e8362ea57 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -639,7 +854,18 @@ void llama_context::sched_reserve() {
+@@ -639,7 +877,18 @@ void llama_context::sched_reserve() {
      gf_res_reserve.reset(new llm_graph_result(max_nodes));
      gf_res_prev_active = nullptr;
  
@@ -1053,7 +1100,7 @@ index fa115ffe4..e8362ea57 100644
  
      llama_memory_context_ptr mctx;
      if (memory) {
-@@ -679,6 +905,7 @@ void llama_context::sched_reserve() {
+@@ -679,6 +928,7 @@ void llama_context::sched_reserve() {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                  cparams.pipeline_parallel = false;
                  sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -1061,7 +1108,7 @@ index fa115ffe4..e8362ea57 100644
                  gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
              }
              if (!gf) {
-@@ -1794,6 +2021,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1794,6 +2044,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -1086,7 +1133,7 @@ index fa115ffe4..e8362ea57 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -1802,8 +2047,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1802,8 +2070,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -1095,7 +1142,7 @@ index fa115ffe4..e8362ea57 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -3780,6 +4023,8 @@ llama_context_params llama_context_default_params() {
+@@ -3780,6 +4046,8 @@ llama_context_params llama_context_default_params() {
          /*.cb_eval_user_data           =*/ nullptr,
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
@@ -1104,11 +1151,22 @@ index fa115ffe4..e8362ea57 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
+@@ -4257,6 +4525,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+     return mem->get_can_shift();
+ }
+ 
++bool llama_memory_reserve(llama_context * ctx, uint32_t n_tokens) {
++    return ctx ? ctx->zones_reserve(n_tokens) : false;
++}
++
+ // llama state API
+ 
+ // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 95b722628..c1305ac9f 100644
+index 95b722628..537ced610 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -356,6 +356,37 @@ private:
+@@ -356,6 +356,44 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -1133,8 +1191,15 @@ index 95b722628..c1305ac9f 100644
 +    // move a flex layer (weights, host copies in the scheduler, K/V) at a batch boundary
 +    bool flex_move_layer(int il, bool to_gpu);
 +
++public:
++    // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)
++    bool     zones_reserve(uint32_t n_tokens);
++
++private:
 +    // auto zones (DESIGN-3zone.md 6): dynamic KV and the zone switching rule, at a batch boundary before the next batch
 +    void     zones_step(uint32_t n_tokens);
++    uint32_t zones_reserved      = 0; // cells reserved by zones_reserve (0 = none): the shrink does not go below them
++    uint32_t zones_reserved_from = 0; // the cells in use then: fewer (cells removed) or reaching zones_reserved ends it
 +    uint32_t zones_kv_init     = 0; // initial (and minimum) KV cells, 0 = no dynamic KV
 +    uint64_t zones_kv_gen      = 0; // the KV generation the graph was built for
 +    size_t   zones_vram_margin = 0;
@@ -1147,7 +1212,7 @@ index 95b722628..c1305ac9f 100644
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..54dc6cd33 100644
+index 1d0554fa1..f726182d8 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -1224,7 +1289,7 @@ index 1d0554fa1..54dc6cd33 100644
          slot_info sinfo;
  
          bool res = true;
-@@ -2780,6 +2824,681 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2780,6 +2824,712 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -1362,6 +1427,8 @@ index 1d0554fa1..54dc6cd33 100644
 +    return true;
 +}
 +
++static size_t kv_vmm_chunk(ggml_backend_buffer_t buffer); // the VMM chunk of a growable K/V buffer, 0 otherwise (below)
++
 +bool llama_kv_cache::set_dynamic(uint32_t max_size, size_t chunk_bytes) {
 +    // every layer must own its K/V (no sharing or reuse), V not transposed (its rows depend on the size), real buffers
 +    if (v_trans) {
@@ -1392,8 +1459,25 @@ index 1d0554fa1..54dc6cd33 100644
 +        n_vmm += dyn_vmm[ikv];
 +        n_dev += layers[ikv].k->buffer && !ggml_backend_buffer_is_host(layers[ikv].k->buffer);
 +    }
-+    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
-+        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0, n_vmm, n_dev, n_dev - n_vmm,
++    // VMM: one step maps one chunk of every section: the cells of a chunk of the largest section row (K or V of a layer),
++    // a multiple of 256 cells (the KV size stays padded); the copy path keeps the steps of chunk_bytes
++    size_t vmm_chunk = 0, vmm_row = 0;
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        for (const ggml_tensor * t : { layers[ikv].k, layers[ikv].v }) {
++            if (dyn_vmm[ikv] && t) {
++                const size_t c = kv_vmm_chunk(t->buffer);
++                vmm_chunk = vmm_chunk == 0 ? c : std::min(vmm_chunk, c);
++                vmm_row   = std::max(vmm_row, (size_t) (t->nb[1]*t->ne[2]));
++            }
++        }
++    }
++    if (vmm_chunk > 0 && vmm_row > 0) {
++        const uint32_t cells = (uint32_t) std::min<size_t>(vmm_chunk / vmm_row, dyn_max);
++        dyn_chunk = std::max<uint32_t>(256, cells - cells % 256);
++    }
++    LLAMA_LOG_INFO("%s: dynamic KV: %u -> %u cells, chunk %u cells (%.2f MiB%s); growth on the device: %zu/%zu layers in place (VMM), %zu by copy%s\n",
++        __func__, get_size(), dyn_max, dyn_chunk, dyn_chunk * per_cell / 1024.0 / 1024.0,
++        vmm_chunk > 0 ? ", one VMM chunk per section" : "", n_vmm, n_dev, n_dev - n_vmm,
 +        dyn_vmm_off ? " (LLAMA_KV_NO_VMM)" : (n_vmm < n_dev ? " (no VMM on this backend/device, or flex layers)" : ""));
 +    return true;
 +}
@@ -1407,6 +1491,8 @@ index 1d0554fa1..54dc6cd33 100644
 +typedef bool                  (*ggml_backend_buffer_grow_t)(ggml_backend_buffer_t buffer, size_t size);
 +// unmaps the whole chunks above size (the content below stays)
 +typedef bool                  (*ggml_backend_buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
++// the size of every mapping of a growable buffer (0 if it is not one)
++typedef size_t                (*ggml_backend_buffer_vmm_chunk_t)(ggml_backend_buffer_t buffer);
 +// new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 +typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 +typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
@@ -1443,6 +1529,10 @@ index 1d0554fa1..54dc6cd33 100644
 +    GGML_UNUSED(size);
 +    return true;
 +}
++static size_t kv_sim_vmm_chunk(ggml_backend_buffer_t buffer) {
++    GGML_UNUSED(buffer);
++    return 1u << 20;
++}
 +
 +static bool kv_sim_arena_commit(void * arena) {
 +    GGML_UNUSED(arena);
@@ -1465,12 +1555,18 @@ index 1d0554fa1..54dc6cd33 100644
 +        if (strcmp(name, "ggml_backend_vmm_arena_free")      == 0) { return (void *) kv_sim_arena_free; }
 +        if (strcmp(name, "ggml_backend_buffer_grow")         == 0) { return (void *) kv_sim_grow; }
 +        if (strcmp(name, "ggml_backend_buffer_shrink")       == 0) { return (void *) kv_sim_shrink; }
++        if (strcmp(name, "ggml_backend_buffer_vmm_chunk")    == 0) { return (void *) kv_sim_vmm_chunk; }
 +        if (strcmp(name, "ggml_backend_vmm_arena_commit")    == 0) { return (void *) kv_sim_arena_commit; }
 +        if (strcmp(name, "ggml_backend_buffer_grow_commit")  == 0) { return (void *) kv_sim_grow_commit; }
 +        return nullptr;
 +    }
 +    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
 +    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
++}
++
++static size_t kv_vmm_chunk(ggml_backend_buffer_t buffer) {
++    auto fn = (ggml_backend_buffer_vmm_chunk_t) kv_growable_fn(ggml_backend_buffer_get_type(buffer), "ggml_backend_buffer_vmm_chunk");
++    return fn ? fn(buffer) : 0;
 +}
 +
 +size_t llama_kv_cache::resize_peak(uint32_t n) const {
@@ -2817,3 +2913,36 @@ index 25e514869..05ce41895 100644
      llama_split_mode split_mode() const;
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e2ac37eb7..8b064cf17 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -247,6 +247,7 @@ struct server_slot {
+     bool has_next_token = true;
+     bool has_new_line   = false;
+     bool truncated      = false;
++    bool kv_reserve     = false; // dynamic KV: room for the rest of the prompt before its first batch (llama_memory_reserve)
+ 
+     stop_type stop;
+ 
+@@ -3442,6 +3443,7 @@ private:
+                         metrics.add_prompt_cached(n_past);
+ 
+                         slot.prompt.tokens.keep_first(n_past);
++                        slot.kv_reserve = true;
+ 
+                         // this is to signal the client that the request has started processing
+                         if (slot.task->params.stream) {
+@@ -3473,6 +3475,12 @@ private:
+ 
+                     slot.mem.seq_rm(slot.id, p0, -1);
+ 
++                    // dynamic KV: the cells for the rest of the prompt in one step, after the reused prefix is known and the rest removed
++                    if (slot.kv_reserve) {
++                        slot.kv_reserve = false;
++                        llama_memory_reserve(slot.ctx_tgt, (uint32_t) std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens()));
++                    }
++
+                     // If using an alora, there may be uncached tokens that come
+                     // before the invocation sequence. When this happens, the
+                     // tokens before the invocation sequence need to be

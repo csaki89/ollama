@@ -81,6 +81,12 @@ static uint32_t dyn_round(uint32_t n, uint32_t base, uint32_t chunk, uint32_t ma
     return std::min<uint32_t>(max, base + ((n - base + chunk - 1)/chunk)*chunk);
 }
 
+// the VMM step of llama_kv_cache::set_dynamic: the cells of one chunk of the largest section row, a multiple of 256
+static uint32_t vmm_step(size_t chunk, size_t row, uint32_t max) {
+    const uint32_t cells = (uint32_t) std::min<size_t>(chunk / row, max);
+    return std::max<uint32_t>(256, cells - cells % 256);
+}
+
 // the chunk choice of ggml_backend_cuda_vmm_arena_new
 static size_t pick_chunk(size_t kib, size_t gran_min, size_t align) {
     size_t chunk = kib << 10;
@@ -91,9 +97,9 @@ static size_t pick_chunk(size_t kib, size_t gran_min, size_t align) {
 
 static void run(size_t chunk_kib) {
     const size_t per_cell = 1*KiB;          // qwen3-coder:30b: 4 KV heads x 128 x f16
-    const uint32_t base = 4096, max = 32768, step = 768;
     const size_t align = 2*MiB;
     arena a { align, pick_chunk(chunk_kib, 4*KiB, align), {} };
+    const uint32_t base = 4096, max = 32768, step = vmm_step(a.chunk, per_cell, max);
     const size_t sec_size = align * ((max*per_cell + align - 1) / align);
     std::vector<section> secs;
     for (int i = 0; i < 96; ++i) {
@@ -118,7 +124,7 @@ static void run(size_t chunk_kib) {
     // growth as the KV does it: the steps from the starting size, every layer K and V by the same cells
     uint32_t n = base;
     std::vector<uint32_t> sizes;
-    while (n < 13056) {
+    while (n < 13000) {
         const uint32_t n_new = dyn_round(n + 1, base, step, max);
         CHECK(n_new - n == step, "step %u -> %u is not %u", n, n_new, step);
         size_t calls0 = 0;
@@ -127,6 +133,7 @@ static void run(size_t chunk_kib) {
         size_t calls = 0;
         for (auto & s : secs) calls += s.n_map_calls;
         const size_t want_new = (a.chunk * (((size_t) n_new*per_cell + a.chunk - 1)/a.chunk) - a.chunk * (((size_t) n*per_cell + a.chunk - 1)/a.chunk)) / a.chunk;
+        CHECK(want_new <= 1 || a.chunk/per_cell < 256, "more than one chunk per section in a step");
         CHECK(calls - calls0 == want_new*secs.size(), "grow %u -> %u: %zu map calls, want %zu", n, n_new, calls - calls0, want_new*secs.size());
         sizes.push_back(n_new);
         n = n_new;
@@ -177,6 +184,10 @@ int main() {
     CHECK(pick_chunk(512, 4*KiB, 2*MiB) == 512*KiB, "512 KiB chunk");
     CHECK(pick_chunk(3000, 4*KiB, 2*MiB) == 2*MiB, "a chunk that does not divide the alignment");
     CHECK(pick_chunk(1024, 2*MiB, 2*MiB) == 2*MiB, "minimum granularity 2 MiB");
+    CHECK(vmm_step(1*MiB, 1*KiB, 32768) == 1024, "qwen3-coder:30b step");
+    CHECK(vmm_step(1*MiB, 3*KiB, 32768) == 256, "3 KiB rows: 341 cells -> 256");
+    CHECK(vmm_step(1*MiB, 8*KiB, 32768) == 256, "8 KiB rows: 128 cells -> at least 256 (two chunks a step)");
+    CHECK(vmm_step(2*MiB, 512, 32768) == 4096, "512 B rows, 2 MiB chunk");
     run(1024);
     run(512);
     run(2048);
