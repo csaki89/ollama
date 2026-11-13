@@ -1,0 +1,19 @@
+GGML_CPU_VARIANTS: build only the listed CPU variants of GGML_CPU_ALL_VARIANTS
+
+An empty list (the default) keeps every variant. The dual-buffer fork image builds only
+the variant its target loads (haswell on a Xeon E5 v4), to shorten the CI build.
+
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -439,6 +439,10 @@ function(ggml_add_backend backend)
+ endfunction()
+ 
+ function(ggml_add_cpu_backend_variant tag_name)
++    # GGML_CPU_VARIANTS: build only the listed tags of the variant list (empty: all)
++    if (GGML_CPU_VARIANTS AND NOT tag_name IN_LIST GGML_CPU_VARIANTS)
++        return()
++    endif()
+     set(GGML_CPU_TAG_NAME ${tag_name})
+     # other: OPENMP LLAMAFILE CPU_HBM
+     if (GGML_SYSTEM_ARCH STREQUAL "x86")

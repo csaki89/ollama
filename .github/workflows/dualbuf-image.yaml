@@ -9,6 +9,11 @@ on:
   push:
     branches: [dual-buffer]
   workflow_dispatch:
+    inputs:
+      cold:
+        description: "Build without the compiler and layer caches (to measure a cold build; the caches are saved afterwards)"
+        type: boolean
+        default: false
 
 concurrency:
   group: dualbuf-image-${{ github.ref }}
@@ -21,8 +26,9 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ollama-dualbuf
   GPU_ARCH: gfx1030
-  # only the CPU variant the target (Xeon E5 v4, AVX2) loads: ggml scores haswell highest there (no AVX512 / AVX_VNNI)
-  CPU_TARGETS: llama-server llama-quantize ggml-cpu-haswell
+  # only the CPU variant the target (Xeon E5 v4, AVX2) loads: ggml scores haswell highest there (no AVX512 / AVX_VNNI);
+  # GGML_CPU_VARIANTS is patch 004 (ggml builds every variant as a dependency of ggml otherwise)
+  CPU_VARIANTS: haswell
 
 jobs:
   image:
@@ -69,7 +75,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/ci-cache
           key: dualbuf-build-${{ github.run_id }}
-          restore-keys: dualbuf-build-
+          restore-keys: ${{ inputs.cold && 'cold-no-restore-' || 'dualbuf-build-' }}
 
       - name: Inject the compiler cache into BuildKit
         uses: reproducible-containers/buildkit-cache-dance@v3
@@ -99,9 +105,10 @@ jobs:
             LLAMA_SERVER_ROCM_CMAKE_ARGS=-DAMDGPU_TARGETS=${{ env.GPU_ARCH }}
             ROCM_KEEP_ARCH=${{ env.GPU_ARCH }}
             LLAMA_SERVER_ROCM_TARGETS=ggml-hip ggml
-            LLAMA_SERVER_CPU_TARGETS=${{ env.CPU_TARGETS }}
+            LLAMA_SERVER_CPU_CMAKE_ARGS=-DGGML_CPU_VARIANTS=${{ env.CPU_VARIANTS }}
+            LLAMA_SERVER_CPU_TARGETS=llama-server llama-quantize
           # layer cache (base, dependencies, Go modules) in the registry: the ROCm base does not fit the 10 GB Actions cache
-          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-from: ${{ !inputs.cold && format('type=registry,ref={0}:buildcache', steps.meta.outputs.image) || '' }}
           cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
@@ -141,6 +148,7 @@ jobs:
             set -e
             ls -la /usr/lib/ollama/libggml-cpu-*.so
             test -f /usr/lib/ollama/libggml-cpu-haswell.so
+            test "$(ls /usr/lib/ollama/libggml-cpu-*.so | wc -l)" -eq 1
             T=/usr/lib/ollama/dualbuf-test
             export LD_LIBRARY_PATH=/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama
             ls -la "$T"

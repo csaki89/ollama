@@ -90,7 +90,9 @@ ENV VULKAN_SDK=/usr/local
 #
 
 FROM cpu-deps AS llama-server-cpu
-# Optional build targets (empty = all), e.g. "llama-server llama-quantize ggml-cpu-haswell" for one CPU variant (dual-buffer fork image)
+# Optional extra CMake args (e.g. -DGGML_CPU_VARIANTS=haswell: one CPU variant, patch 004) and build targets
+# (empty = all, e.g. "llama-server llama-quantize"). Used by the dual-buffer fork image.
+ARG LLAMA_SERVER_CPU_CMAKE_ARGS=
 ARG LLAMA_SERVER_CPU_TARGETS=
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
@@ -98,7 +100,7 @@ COPY llama/compat llama/compat
 COPY llama/clef llama/clef
 COPY cmake cmake
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset cpu \
+    cmake -S llama/server --preset cpu ${LLAMA_SERVER_CPU_CMAKE_ARGS} \
         && cmake --build build/llama-server-cpu ${LLAMA_SERVER_CPU_TARGETS:+--target $LLAMA_SERVER_CPU_TARGETS} -- -l $(nproc) \
         && cmake --install build/llama-server-cpu --component llama-server --strip \
         && for lib in \
