@@ -21,6 +21,8 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ollama-dualbuf
   GPU_ARCH: gfx1030
+  # only the CPU variant the target (Xeon E5 v4, AVX2) loads: ggml scores haswell highest there (no AVX512 / AVX_VNNI)
+  CPU_TARGETS: llama-server llama-quantize ggml-cpu-haswell
 
 jobs:
   image:
@@ -57,6 +59,27 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # ccache and the Go build cache live in BuildKit cache mounts, which a fresh runner does not have: they are kept in the
+      # Actions cache and injected into / extracted from BuildKit around the build (the post steps run in reverse order)
+      - name: Prepare the compiler cache directories
+        run: mkdir -p "${{ runner.temp }}/ci-cache/ccache" "${{ runner.temp }}/ci-cache/go-build"
+
+      - name: Restore the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ci-cache
+          key: dualbuf-build-${{ github.run_id }}
+          restore-keys: dualbuf-build-
+
+      - name: Inject the compiler cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/ci-cache/ccache": "/root/.ccache",
+              "${{ runner.temp }}/ci-cache/go-build": "/root/.cache/go-build"
+            }
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -75,6 +98,11 @@ jobs:
             GOFLAGS=${{ steps.meta.outputs.GOFLAGS }}
             LLAMA_SERVER_ROCM_CMAKE_ARGS=-DAMDGPU_TARGETS=${{ env.GPU_ARCH }}
             ROCM_KEEP_ARCH=${{ env.GPU_ARCH }}
+            LLAMA_SERVER_ROCM_TARGETS=ggml-hip ggml
+            LLAMA_SERVER_CPU_TARGETS=${{ env.CPU_TARGETS }}
+          # layer cache (base, dependencies, Go modules) in the registry: the ROCm base does not fit the 10 GB Actions cache
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
@@ -111,6 +139,8 @@ jobs:
           # the VMM tests must be in the image and find all their libraries
           docker run --rm --entrypoint /bin/bash "$img" -c '
             set -e
+            ls -la /usr/lib/ollama/libggml-cpu-*.so
+            test -f /usr/lib/ollama/libggml-cpu-haswell.so
             T=/usr/lib/ollama/dualbuf-test
             export LD_LIBRARY_PATH=/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama
             ls -la "$T"
@@ -122,3 +152,20 @@ jobs:
             rc=0; "$T/vmm-stress-impl" || rc=$?
             test "$rc" -eq 2
           '
+
+      # what differs from the image pinned in docker-compose.yaml (file names; sizes of every rebuilt file differ anyway)
+      - name: Compare with the pinned image
+        continue-on-error: true
+        run: |
+          img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          ref="$(sed -n 's/^ *image: *//p' docker-compose.yaml | head -1)"
+          echo "reference: $ref"
+          docker pull -q "$ref"
+          list() {
+            docker run --rm --entrypoint /bin/sh "$1" -c 'cd /usr && find bin lib/ollama \( -type f -o -type l \) | sort'
+          }
+          list "$ref" > ref.txt
+          list "$img" > new.txt
+          echo "== only in the reference (<) / only in the new image (>)"
+          diff ref.txt new.txt || true
+          echo "== $(wc -l < ref.txt) files in the reference, $(wc -l < new.txt) in the new image"

@@ -36,6 +36,15 @@ RUN dnf install -y unzip \
     && rm /tmp/ninja.zip
 ENV CMAKE_GENERATOR=Ninja
 ENV LDFLAGS=-s
+# ccache 4 (the distro ccache 3.7 does not cache HIP sources); its directory is a cache mount, kept between CI builds
+ARG CCACHEVERSION=4.10.2
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        dnf install -y xz \
+        && curl -fsSL https://github.com/ccache/ccache/releases/download/v${CCACHEVERSION}/ccache-${CCACHEVERSION}-linux-x86_64.tar.xz | tar xJ -C /tmp \
+        && cp /tmp/ccache-${CCACHEVERSION}-linux-x86_64/ccache /usr/local/bin/ccache \
+        && rm -rf /tmp/ccache-${CCACHEVERSION}-linux-x86_64; \
+    fi
+ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=5G
 
 #
 # GPU toolchain stages — provide compilers for llama-server GPU builds
@@ -81,6 +90,8 @@ ENV VULKAN_SDK=/usr/local
 #
 
 FROM cpu-deps AS llama-server-cpu
+# Optional build targets (empty = all), e.g. "llama-server llama-quantize ggml-cpu-haswell" for one CPU variant (dual-buffer fork image)
+ARG LLAMA_SERVER_CPU_TARGETS=
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
@@ -88,7 +99,7 @@ COPY llama/clef llama/clef
 COPY cmake cmake
 RUN --mount=type=cache,target=/root/.ccache \
     cmake -S llama/server --preset cpu \
-        && cmake --build build/llama-server-cpu -- -l $(nproc) \
+        && cmake --build build/llama-server-cpu ${LLAMA_SERVER_CPU_TARGETS:+--target $LLAMA_SERVER_CPU_TARGETS} -- -l $(nproc) \
         && cmake --install build/llama-server-cpu --component llama-server --strip \
         && for lib in \
             /usr/lib64/libgomp.so* \
@@ -96,7 +107,9 @@ RUN --mount=type=cache,target=/root/.ccache \
             /opt/rh/gcc-toolset-13/root/usr/lib64/libgomp.so* \
             /opt/rh/gcc-toolset-13/root/usr/lib64/libomp.so*; do \
                 [ -e "$lib" ] && cp -a "$lib" dist/lib/ollama/ || true; \
-            done
+            done \
+        && (ccache -s || true) \
+        && rm -rf build/llama-server-cpu
 
 FROM scratch AS publish-llama-server-cpu
 COPY --from=llama-server-cpu dist/lib/ollama /lib/ollama/
@@ -134,19 +147,22 @@ FROM rocm-7-deps AS llama-server-rocm_v7_2
 # kernels are kept in the image (empty = keep everything). Used by the dual-buffer fork image.
 ARG LLAMA_SERVER_ROCM_CMAKE_ARGS=
 ARG ROCM_KEEP_ARCH=
+# Optional build targets (empty = all; only ggml-hip is installed, ggml is needed by the VMM tests)
+ARG LLAMA_SERVER_ROCM_TARGETS=
 ENV CC=clang CXX=clang++ CXXFLAGS=--gcc-toolchain=/opt/rh/gcc-toolset-13/root/usr
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
 COPY llama/clef llama/clef
 COPY cmake cmake
-RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset rocm_v7_2_linux ${LLAMA_SERVER_ROCM_CMAKE_ARGS} \
-        && cmake --build build/llama-server-rocm_v7_2 -- -l $(nproc) \
-        && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
-# VMM stress tests of the dual-buffer fork, runnable from the image: /usr/lib/ollama/dualbuf-test/vmm-stress.sh (a failed compile fails the build)
+# VMM stress tests of the dual-buffer fork, runnable from the image: /usr/lib/ollama/dualbuf-test/vmm-stress.sh (a failed compile fails the build).
+# One RUN with the build, so that the build tree is not kept in a layer.
 COPY tools/dualbuf/vmm-stress.cpp tools/dualbuf/vmm-stress-impl.cpp tools/dualbuf/vmm-stress.sh tools/dualbuf/
-RUN set -e; \
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e; \
+    cmake -S llama/server --preset rocm_v7_2_linux ${LLAMA_SERVER_ROCM_CMAKE_ARGS}; \
+    cmake --build build/llama-server-rocm_v7_2 ${LLAMA_SERVER_ROCM_TARGETS:+--target $LLAMA_SERVER_ROCM_TARGETS} -- -l $(nproc); \
+    cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip; \
     T=dist/lib/ollama/dualbuf-test; B=build/llama-server-rocm_v7_2; mkdir -p "$T"; \
     INC=$(dirname "$(find "$B" -path '*/ggml/include/ggml-backend.h' | head -1)"); \
     GGML=$(dirname "$(find "$B" -name libggml.so | head -1)"); \
@@ -154,7 +170,9 @@ RUN set -e; \
     test -f "$INC/ggml-backend.h"; test -f "$GGML/libggml.so"; test -f "$BASE/libggml-base.so"; \
     hipcc -O2 $CXXFLAGS --offload-arch="${ROCM_KEEP_ARCH:-gfx1030}" -o "$T/vmm-stress" tools/dualbuf/vmm-stress.cpp; \
     clang++ -std=c++17 -O2 $CXXFLAGS -I"$INC" -o "$T/vmm-stress-impl" tools/dualbuf/vmm-stress-impl.cpp -L"$GGML" -L"$BASE" -lggml -lggml-base; \
-    cp tools/dualbuf/vmm-stress.sh "$T/"; chmod +x "$T/vmm-stress.sh"
+    cp tools/dualbuf/vmm-stress.sh "$T/"; chmod +x "$T/vmm-stress.sh"; \
+    ccache -s || true; \
+    rm -rf "$B"
 RUN rm -f dist/lib/ollama/rocm_v7_2/rocblas/library/*gfx90[06]*
 RUN if [ -n "$ROCM_KEEP_ARCH" ]; then \
         for d in dist/lib/ollama/rocm_v7_2/rocblas/library dist/lib/ollama/rocm_v7_2/hipblaslt/library; do \
