@@ -12,7 +12,9 @@
 //   c  the VRAM almost filled with ordinary buffers first, then growth
 //   d  8 arenas one after the other
 //   e  the KV pattern: 96 sections of 32 MiB, 4 MiB each at the start, growing by 768 KiB steps (not on chunk boundaries) to
-//      13 MiB, shrunk in place to 4 MiB (ggml_backend_buffer_shrink: the top chunks unmapped, the content below kept), grown again
+//      13 MiB, shrunk in place to 4 MiB (ggml_backend_buffer_shrink: the top chunks unmapped, the content below kept; the sysfs
+//      VRAM after it, and a plain allocation of the unmapped size), grown again; then what the KV does on HIP: the content to the
+//      host, the arena freed (the VRAM must come back), a new arena at 4 MiB with the content back, grown again
 // At the end: no arena and no mapped byte may be left (backend counters), and the VRAM must come back (sysfs, polled for 3 s).
 // Env: VMM_BACKEND (path of the backend library, default /usr/lib/ollama/rocm_v7_2/libggml-hip.so if it exists),
 //      VMM_IMPL_SIM=1 (simulated growable buffers, to test this program on a backend without VMM)
@@ -494,16 +496,80 @@ int main(int argc, char ** argv) {
         }
         const size_t unmapped = (size_t) (st0[1] - st1[1]);
         const int ms = vram0 && unmapped ? wait_vram_below(vram_grown - unmapped/2) : 0;
+        const size_t back = vram_grown - std::min(vram_grown, vram_used());
         if (ms < 0) {
-            printf("  WARNING: the VRAM of the unmapped chunks did not come back within 3 s\n");
+            printf("  the VRAM of the unmapped chunks did not come back within 3 s: %zu of %zu MiB kept (sysfs)\n",
+                (unmapped - std::min(unmapped, back))/MiB, unmapped/MiB);
         } else {
             printf("  the VRAM of the unmapped chunks came back in %d ms\n", ms);
         }
         report_vram("shrunk in place");
+        // a plain device allocation (hipMalloc) of the unmapped size: does it get the kept memory?
+        if (unmapped > 0) {
+            const size_t v0 = vram_used();
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(g_buft, unmapped);
+            if (!b) {
+                printf("  plain allocation of %zu MiB after the shrink: FAILED\n", unmapped/MiB);
+            } else {
+                ggml_backend_buffer_clear(b, 0);
+                ggml_backend_synchronize(g_backend);
+                const long long d = ((long long) vram_used() - (long long) v0)/(long long) MiB;
+                printf("  plain allocation of %zu MiB after the shrink: OK, sysfs %+lld MiB (%s)\n", unmapped/MiB, d,
+                    d >= (long long) (unmapped/2/MiB) ? "new memory, the kept chunks are not used for it" : "the kept chunks are used");
+                ggml_backend_buffer_free(b);
+            }
+        }
         grow_to(secs, e_step, e_start + 6*e_step);
-        report_vram("grown again");
+        report_vram("grown again (same arena)");
+
+        // what the KV does on HIP when it shrinks: the content to the host, the sections and the arena freed (the address range
+        // with its VRAM), a new arena at the shrunk size, the content back
+        std::vector<std::vector<uint8_t>> host(secs.size(), std::vector<uint8_t>(e_start));
+        {
+            ggml_init_params params = { ggml_tensor_overhead()*secs.size(), nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            for (size_t i = 0; i < secs.size(); ++i) {
+                ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, e_start);
+                if (ggml_backend_tensor_alloc(secs[i].buf, t, ggml_backend_buffer_get_base(secs[i].buf)) != GGML_STATUS_SUCCESS) {
+                    fail("tensor_alloc (to the host)");
+                }
+                ggml_backend_tensor_get(t, host[i].data(), 0, e_start);
+            }
+            ggml_free(ctx);
+        }
+        int64_t st2[4];
+        vmm_stats(st2);
+        const size_t v_before = vram_used();
         free_all(secs);
         arena_free(a.ptr);
+        const size_t held = (size_t) st2[1] + unmapped; // mapped now + what the in-place shrink kept
+        const int ms2 = vram0 && !g_sim ? wait_vram_below(v_before - std::min(v_before, held/2)) : 0;
+        if (ms2 < 0) {
+            printf("  WARNING: freeing the arena did not give the VRAM back within 3 s\n");
+        } else {
+            printf("  arena freed: %zu MiB came back in %d ms (sysfs)\n", (v_before - std::min(v_before, vram_used()))/MiB, ms2);
+        }
+        report_vram("arena freed");
+        arena a2 = new_arena((size_t) n_secs*e_max + 64*MiB);
+        auto secs2 = start_sections(a2, n_secs, e_start, e_max, false);
+        {
+            ggml_init_params params = { ggml_tensor_overhead()*secs2.size(), nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            for (size_t i = 0; i < secs2.size(); ++i) {
+                ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, e_start);
+                if (ggml_backend_tensor_alloc(secs2[i].buf, t, ggml_backend_buffer_get_base(secs2[i].buf)) != GGML_STATUS_SUCCESS) {
+                    fail("tensor_alloc (from the host)");
+                }
+                ggml_backend_tensor_set(t, host[i].data(), 0, e_start);
+            }
+            ggml_free(ctx);
+        }
+        mark_and_check(secs2, std::vector<size_t>(secs2.size(), e_start)); // the content came back
+        report_vram("new arena at the shrunk size");
+        grow_to(secs2, e_step, e_start + 6*e_step);
+        report_vram("grown again (new arena)");
+        free_all(secs2);
+        arena_free(a2.ptr);
     } else {
         // the 8 arenas together stay within the target
         size_t per = std::min<size_t>(target/(8*n_secs), 256*MiB);

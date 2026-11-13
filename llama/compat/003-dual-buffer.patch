@@ -9,11 +9,11 @@ at runtime (zone 2: repacked copy + host copy; debug trigger: LLAMA_FLEX_TEST).
 three-zone placement from two --fit runs (dense and MoE), a KV cache that grows with the use
 (growable VMM buffers on CUDA/HIP, copy fallback elsewhere; LLAMA_KV_NO_VMM=1 turns VMM off),
 and flex layers that go off when the KV needs device memory and come back when it shrinks.
-VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, 1 MiB), shrunk in place,
+VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, 1 MiB), shrunk in place (on HIP the arena is freed via the host: unmapped chunks keep their VRAM),
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
 zeroing; growth steps of one chunk per section; llama_memory_reserve grows the KV for a whole prompt in one step (called by llama-server). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, 66280c35a, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, e3bb28d1c, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,7 +290,7 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..1fefb9b30 100644
+index 043511b72..65ed72d61 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
@@ -302,7 +302,7 @@ index 043511b72..1fefb9b30 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -894,6 +894,409 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -894,6 +894,438 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -428,6 +428,10 @@ index 043511b72..1fefb9b30 100644
 +            const auto r_unmap   = cuMemUnmap(m.ptr, m.size);
 +            const auto r_release = cuMemRelease(m.handle);
 +            ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
++            if (!GGML_CUDA_VMM_OK(r_unmap) || !GGML_CUDA_VMM_OK(r_release)) {
++                GGML_LOG_ERROR("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
++                (void) cudaGetLastError();
++            }
 +            GGML_CUDA_VMM_LOG("%s: unmap %p + %zu: %d, release: %d\n", __func__, (void *) m.ptr, m.size, (int) r_unmap, (int) r_release);
 +        }
 +        ggml_cuda_vmm_arena_unref(arena);
@@ -667,6 +671,27 @@ index 043511b72..1fefb9b30 100644
 +    return ctx ? ctx->arena->chunk : 0;
 +}
 +
++// true if unmapped chunks keep their memory until the arena's address range is freed: HIP (ROCm 7.2 measurement, ROADMAP.md:
++// unmap + release does not give the VRAM back, it is reused only by mappings in the same range), so a shrink that should give
++// the memory back must free the arena there. GGML_CUDA_VMM_SHRINK=inplace: false (in-place shrink), =free: true
++static bool ggml_backend_cuda_vmm_unmap_keeps_memory(void) {
++    static const int mode = [] {
++        const char * env = getenv("GGML_CUDA_VMM_SHRINK");
++        if (env && strcmp(env, "inplace") == 0) {
++            return 0;
++        }
++        if (env && strcmp(env, "free") == 0) {
++            return 1;
++        }
++#if defined(GGML_USE_HIP)
++        return 1;
++#else
++        return 0;
++#endif
++    }();
++    return mode != 0;
++}
++
 +// shrink a growable buffer to size: the whole chunks above it are unmapped (the section keeps its address range, the content
 +// below stays); false if it is not one or an unmap fails
 +static bool ggml_backend_cuda_buffer_shrink(ggml_backend_buffer_t buffer, size_t size) {
@@ -696,6 +721,10 @@ index 043511b72..1fefb9b30 100644
 +            return false;
 +        }
 +        const auto r_release = cuMemRelease(m.handle);
++        if (!GGML_CUDA_VMM_OK(r_release)) {
++            GGML_LOG_ERROR("%s: buffer %p: release of the chunk at %p failed (%d)\n", __func__, (void *) ctx->base, (void *) m.ptr, (int) r_release);
++            (void) cudaGetLastError();
++        }
 +        pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto & p) { return p.first == m.ptr; }), pending.end());
 +        ggml_cuda_vmm_stat[1] -= (int64_t) m.size;
 +        ctx->mapped -= m.size;
@@ -712,7 +741,7 @@ index 043511b72..1fefb9b30 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -5811,6 +6214,38 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5811,6 +6243,41 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -737,6 +766,9 @@ index 043511b72..1fefb9b30 100644
 +    }
 +    if (strcmp(name, "ggml_backend_buffer_shrink") == 0) {
 +        return (void *)ggml_backend_cuda_buffer_shrink;
++    }
++    if (strcmp(name, "ggml_backend_vmm_unmap_keeps_memory") == 0) {
++        return (void *)ggml_backend_cuda_vmm_unmap_keeps_memory;
 +    }
 +    if (strcmp(name, "ggml_backend_vmm_stats") == 0) {
 +        return (void *)ggml_backend_cuda_vmm_stats;
@@ -808,7 +840,7 @@ index 720b45140..ebbd81517 100644
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fa115ffe4..33f532a16 100644
+index fa115ffe4..d1e6955be 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,7 +9,7 @@
@@ -859,7 +891,7 @@ index fa115ffe4..33f532a16 100644
      const auto & hparams = model.hparams;
  
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
-@@ -395,7 +427,25 @@ llama_context::llama_context(
+@@ -395,7 +427,27 @@ llama_context::llama_context(
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
          };
  
@@ -874,6 +906,8 @@ index fa115ffe4..33f532a16 100644
 +            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
 +            if (kv && kv->set_dynamic(cparams.n_ctx_seq, (size_t) 64*1024*1024)) {
 +                zones_kv_init = n_init;
++                // a state load (prompt cache) that grows the KV goes through the zone rule too
++                kv->set_grow_hook([this](uint32_t n_tokens) { zones_step(n_tokens); });
 +            } else {
 +                LLAMA_LOG_WARN("%s: dynamic KV is not supported for this memory (or with a transposed V cache), allocating %u cells\n", __func__, cparams.n_ctx_seq);
 +                memory.reset();
@@ -886,7 +920,7 @@ index fa115ffe4..33f532a16 100644
      }
  
      // init backends
-@@ -613,6 +663,194 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -613,6 +665,280 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -947,6 +981,8 @@ index fa115ffe4..33f532a16 100644
 +    }
 +
 +    // a resize outside this step (state load) is booked too; over the budget, flex layers go off first
++    const uint32_t size_in = zones_kv_size != 0 ? zones_kv_size : kv->get_size();
++    int n_off = 0, n_on = 0;
 +    if (rule && zones_kv_size != 0 && kv->get_size() != zones_kv_size) {
 +        zones_headroom -= ((int64_t) kv->get_size() - (int64_t) zones_kv_size)*(int64_t) kv->cell_bytes(true);
 +    }
@@ -960,6 +996,7 @@ index fa115ffe4..33f532a16 100644
 +            break;
 +        }
 +        zones_headroom += freed;
++        n_off++;
 +    }
 +
 +    const uint32_t size = kv->get_size();
@@ -984,8 +1021,10 @@ index fa115ffe4..33f532a16 100644
 +        }
 +    }
 +
-+    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size)
-+    if (rule && (shrunk || used == 0)) {
++    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size);
++    // the budget is first cut to what the device really has free
++    if (rule && (shrunk || used == 0) && model.flex_next(true) >= 0) {
++        zones_clamp();
 +        for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
 +            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
 +            if (cost > zones_headroom) {
@@ -995,12 +1034,16 @@ index fa115ffe4..33f532a16 100644
 +                break;
 +            }
 +            zones_headroom -= cost;
++            n_on++;
 +        }
 +    }
 +
 +    // grow in chunks when the next batch does not fit; take flex layers off (closest to the CPU first) to make room
 +    if (used + n_tokens > kv->get_size() && kv->get_size() < kv->dyn_max_size()) {
 +        sync();
++        if (rule) {
++            zones_clamp();
++        }
 +        const uint32_t n = kv->dyn_round(used + n_tokens);
 +        // the copy path also needs the old and the new K/V of a layer at the same time (resize_peak), the VMM path does not
 +        auto need = [&]() { return (int64_t) ((n - kv->get_size())*kv->cell_bytes(true) + kv->resize_peak(n)); };
@@ -1015,6 +1058,7 @@ index fa115ffe4..33f532a16 100644
 +                break;
 +            }
 +            zones_headroom += freed;
++            n_off++;
 +            delta = need();
 +        }
 +        if (rule && delta > zones_headroom) {
@@ -1035,6 +1079,82 @@ index fa115ffe4..33f532a16 100644
 +        gf_res_prev_active = nullptr;
 +        sched_need_reserve = true;
 +    }
++
++    if (size_in != zones_kv_size || n_off > 0 || n_on > 0) {
++        char what[96];
++        snprintf(what, sizeof(what), "KV %u -> %u cells, %d flex layers off, %d back", size_in, zones_kv_size, n_off, n_on);
++        zones_log_state(what);
++    }
++}
++
++ggml_backend_dev_t llama_context::zones_dev() const {
++    const auto flex = model.flex_layers();
++    if (!flex.empty()) {
++        return model.flex_gpu_dev(flex.front());
++    }
++    for (const auto & b : backends) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
++        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            return dev;
++        }
++    }
++    return nullptr;
++}
++
++size_t llama_context::zones_clamp() {
++    ggml_backend_dev_t dev = zones_dev();
++    if (!dev) {
++        return 0;
++    }
++    size_t dev_free = 0, dev_total = 0;
++    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
++    const int64_t real = (int64_t) dev_free - (int64_t) zones_vram_margin;
++    if (real < zones_headroom && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
++        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB, margin %.0f MiB)\n", __func__,
++            zones_headroom / 1048576.0, real / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
++        zones_headroom = real;
++    }
++    return dev_free;
++}
++
++void llama_context::zones_log_state(const char * what) {
++    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
++    size_t w_gpu = 0;
++    for (const auto & [buft, size] : model.memory_breakdown()) {
++        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && !ggml_backend_buft_is_host(buft)) {
++            w_gpu += size;
++        }
++    }
++    const size_t w_all = std::max(model.size(), w_gpu);
++
++    // the flex layers that are off, as ranges
++    const auto flex = model.flex_layers();
++    std::string off;
++    int n_flex_on = 0;
++    for (size_t i = 0; i < flex.size(); ++i) {
++        if (model.flex_on_gpu(flex[i])) {
++            n_flex_on++;
++            continue;
++        }
++        size_t j = i;
++        while (j + 1 < flex.size() && !model.flex_on_gpu(flex[j + 1]) && flex[j + 1] == flex[j] + 1) {
++            j++;
++        }
++        off += (off.empty() ? "" : ",") + std::to_string(flex[i]) + (j > i ? "-" + std::to_string(flex[j]) : "");
++        i = j;
++    }
++
++    size_t dev_free = 0, dev_total = 0;
++    if (ggml_backend_dev_t dev = zones_dev()) {
++        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
++    }
++    LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s; "
++        "KV %u cells (%u used, %.0f MiB on the device); device free %.0f MiB (budget %.0f MiB, margin %.0f MiB)\n", __func__, what,
++        w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
++        off.empty() ? "" : ", off: ", off.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
++        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, dev_free / 1048576.0, zones_headroom / 1048576.0,
++        zones_vram_margin / 1048576.0);
 +}
 +
 +bool llama_context::flex_move_layer(int il, bool to_gpu) {
@@ -1081,7 +1201,7 @@ index fa115ffe4..33f532a16 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -639,7 +877,18 @@ void llama_context::sched_reserve() {
+@@ -639,7 +965,18 @@ void llama_context::sched_reserve() {
      gf_res_reserve.reset(new llm_graph_result(max_nodes));
      gf_res_prev_active = nullptr;
  
@@ -1100,7 +1220,7 @@ index fa115ffe4..33f532a16 100644
  
      llama_memory_context_ptr mctx;
      if (memory) {
-@@ -679,6 +928,7 @@ void llama_context::sched_reserve() {
+@@ -679,6 +1016,7 @@ void llama_context::sched_reserve() {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                  cparams.pipeline_parallel = false;
                  sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -1108,7 +1228,7 @@ index fa115ffe4..33f532a16 100644
                  gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
              }
              if (!gf) {
-@@ -1794,6 +2044,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1794,6 +2132,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -1133,7 +1253,7 @@ index fa115ffe4..33f532a16 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -1802,8 +2070,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1802,8 +2158,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -1142,7 +1262,7 @@ index fa115ffe4..33f532a16 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -3780,6 +4046,8 @@ llama_context_params llama_context_default_params() {
+@@ -3780,6 +4134,8 @@ llama_context_params llama_context_default_params() {
          /*.cb_eval_user_data           =*/ nullptr,
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
@@ -1151,7 +1271,7 @@ index fa115ffe4..33f532a16 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4257,6 +4525,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4257,6 +4613,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  
@@ -1163,10 +1283,10 @@ index fa115ffe4..33f532a16 100644
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 95b722628..537ced610 100644
+index 95b722628..aab6223fb 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -356,6 +356,44 @@ private:
+@@ -356,6 +356,51 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -1208,11 +1328,18 @@ index 95b722628..537ced610 100644
 +    uint32_t zones_kv_size     = 0;     // the KV size booked in the budget
 +    bool     zones_fa_logged   = false;
 +
++    // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
++    // runtime holds back, are not booked); returns the measured free bytes
++    size_t   zones_clamp();
++    // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
++    void     zones_log_state(const char * what);
++    ggml_backend_dev_t zones_dev() const; // the device the budget is for
++
      ggml_backend_t backend_cpu = nullptr;
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..f726182d8 100644
+index 1d0554fa1..395dd1e8c 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -1274,13 +1401,18 @@ index 1d0554fa1..f726182d8 100644
  
      {
          const size_t memory_size_k = size_k_bytes();
-@@ -2186,6 +2222,14 @@ const slot_info_vec_t *   sinfos_in) {
+@@ -2186,6 +2222,19 @@ const slot_info_vec_t *   sinfos_in) {
  
          const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
  
 +        // dynamic KV: make room for the restored cells first
 +        if (is_dynamic()) {
-+            const uint32_t need = (seq_id == -1 ? 0 : used_cells()) + cell_count;
++            const uint32_t used = seq_id == -1 ? 0 : used_cells();
++            const uint32_t need = used + cell_count;
++            // the zone rule first, as before a batch: room from the flex layers, then the growth
++            if (need > get_size() && grow_hook) {
++                grow_hook(need - used);
++            }
 +            if (need > get_size() && !resize(dyn_round(need))) {
 +                throw std::runtime_error("failed to restore kv cache: the dynamic KV cannot grow to the restored cells");
 +            }
@@ -1289,7 +1421,7 @@ index 1d0554fa1..f726182d8 100644
          slot_info sinfo;
  
          bool res = true;
-@@ -2780,6 +2824,712 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2780,6 +2829,763 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -1496,9 +1628,12 @@ index 1d0554fa1..f726182d8 100644
 +// new mappings must not be accessed before a commit: it waits until they are valid and zeroes them
 +typedef bool                  (*ggml_backend_vmm_arena_commit_t)(void * arena);
 +typedef bool                  (*ggml_backend_buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
++// true if unmapped chunks keep their memory until the arena is freed (HIP): a shrink then frees the arena instead
++typedef bool                  (*ggml_backend_vmm_unmap_keeps_memory_t)(void);
 +
 +// test aid (LLAMA_KV_VMM_SIM=1): growable buffers simulated with a buffer of the section size, to test the in-place path without VMM;
-+// LLAMA_KV_VMM_SIM=2: every commit fails, 3: only the growth commits fail (the fallbacks to a copy, as when the HIP barrier allocation fails)
++// LLAMA_KV_VMM_SIM=2: every commit fails, 3: only the growth commits fail (the fallbacks to a copy, as when the HIP barrier allocation fails),
++// 4: the unmapped memory is kept (HIP), a shrink frees the arenas and goes through the host
 +static int kv_sim_level() {
 +    static const int level = getenv("LLAMA_KV_VMM_SIM") ? atoi(getenv("LLAMA_KV_VMM_SIM")) : 0;
 +    return level;
@@ -1542,6 +1677,9 @@ index 1d0554fa1..f726182d8 100644
 +    GGML_UNUSED(buffer);
 +    return kv_sim_level() != 2 && kv_sim_level() != 3;
 +}
++static bool kv_sim_unmap_keeps_memory(void) {
++    return kv_sim_level() == 4;
++}
 +
 +static void * kv_growable_fn(ggml_backend_buffer_type_t buft, const char * name) {
 +    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -1558,6 +1696,7 @@ index 1d0554fa1..f726182d8 100644
 +        if (strcmp(name, "ggml_backend_buffer_vmm_chunk")    == 0) { return (void *) kv_sim_vmm_chunk; }
 +        if (strcmp(name, "ggml_backend_vmm_arena_commit")    == 0) { return (void *) kv_sim_arena_commit; }
 +        if (strcmp(name, "ggml_backend_buffer_grow_commit")  == 0) { return (void *) kv_sim_grow_commit; }
++        if (strcmp(name, "ggml_backend_vmm_unmap_keeps_memory") == 0) { return (void *) kv_sim_unmap_keeps_memory; }
 +        return nullptr;
 +    }
 +    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1658,6 +1797,13 @@ index 1d0554fa1..f726182d8 100644
 +    if (dyn_vmm.size() != layers.size()) {
 +        dyn_vmm.assign(layers.size(), 0);
 +    }
++    // the buffer type of each layer, read before a shrink frees buffers early
++    std::vector<ggml_backend_buffer_type_t> buft_of(layers.size());
++    std::vector<uint8_t> on_host(layers.size());
++    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++        buft_of[ikv] = ggml_backend_buffer_get_type(layers[ikv].k->buffer);
++        on_host[ikv] = ggml_backend_buffer_is_host(layers[ikv].k->buffer);
++    }
 +
 +    // growable K/V: map more memory at the end first, for all the layers, then one commit (the mappings are not valid before it)
 +    std::vector<uint8_t> grown(layers.size(), 0);
@@ -1669,7 +1815,7 @@ index 1d0554fa1..f726182d8 100644
 +                continue;
 +            }
 +            auto & layer = layers[ikv];
-+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
++            ggml_backend_buffer_type_t buft = buft_of[ikv];
 +            auto grow = (ggml_backend_buffer_grow_t) kv_growable_fn(buft, "ggml_backend_buffer_grow");
 +            bool ok = grow != nullptr;
 +            for (ggml_tensor * t : { layer.k, layer.v }) {
@@ -1693,7 +1839,7 @@ index 1d0554fa1..f726182d8 100644
 +            }
 +            LLAMA_LOG_ERROR("%s: the new K/V mappings on %s could not be committed, falling back to new buffers and a copy\n", __func__, ggml_backend_buft_name(buft));
 +            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-+                if (grown[ikv] && ggml_backend_buffer_get_type(layers[ikv].k->buffer) == buft) {
++                if (grown[ikv] && buft_of[ikv] == buft) {
 +                    grown[ikv]   = 0;
 +                    dyn_vmm[ikv] = 0;
 +                }
@@ -1702,7 +1848,12 @@ index 1d0554fa1..f726182d8 100644
 +        t_alloc += ggml_time_us() - t1;
 +    }
 +
-+    // growable K/V shrinking: the used cells are below n, only the whole free chunks at the top are unmapped (no allocation, no copy)
++    // growable K/V shrinking: the used cells are below n, only the whole free chunks at the top are unmapped (no allocation, no copy);
++    // where unmapped chunks keep their memory (HIP), the used rows go to the host and the arena is freed (its VRAM comes back),
++    // the layer gets a new section below
++    std::vector<std::vector<uint8_t>> staged(2*layers.size());
++    std::vector<uint8_t> via_host(layers.size(), 0);
++    size_t n_via_host = 0;
 +    if (n < n_old && !force) {
 +        const int64_t t1 = ggml_time_us();
 +        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -1710,7 +1861,21 @@ index 1d0554fa1..f726182d8 100644
 +                continue;
 +            }
 +            auto & layer = layers[ikv];
-+            auto shrink = (ggml_backend_buffer_shrink_t) kv_growable_fn(ggml_backend_buffer_get_type(layer.k->buffer), "ggml_backend_buffer_shrink");
++            auto keeps = (ggml_backend_vmm_unmap_keeps_memory_t) kv_growable_fn(buft_of[ikv], "ggml_backend_vmm_unmap_keeps_memory");
++            if (keeps && keeps()) {
++                int i = 0;
++                for (ggml_tensor * t : { layer.k, layer.v }) {
++                    auto & h = staged[2*ikv + i++];
++                    if (t && n_used > 0) {
++                        h.resize(t->nb[1]*n_used*t->ne[2]);
++                        ggml_backend_tensor_get(t, h.data(), 0, h.size());
++                    }
++                }
++                via_host[ikv] = 1;
++                n_via_host++;
++                continue;
++            }
++            auto shrink = (ggml_backend_buffer_shrink_t) kv_growable_fn(buft_of[ikv], "ggml_backend_buffer_shrink");
 +            bool ok = shrink != nullptr;
 +            for (ggml_tensor * t : { layer.k, layer.v }) {
 +                if (ok && t) {
@@ -1722,6 +1887,12 @@ index 1d0554fa1..f726182d8 100644
 +            } else {
 +                LLAMA_LOG_WARN("%s: layer %u: shrinking the K/V in place failed (VMM), falling back to a new buffer and a copy\n", __func__, layer.il);
 +                dyn_vmm[ikv] = 0;
++            }
++        }
++        // their buffers go before the new sections are made: the arena and its VRAM go with its last section
++        for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
++            if (owner[ib] != SIZE_MAX && via_host[owner[ib]] && n_owners[ib] == 1) {
++                ctxs_bufs.bufs[ib].second.reset();
 +            }
 +        }
 +        t_free += ggml_time_us() - t1;
@@ -1739,12 +1910,12 @@ index 1d0554fa1..f726182d8 100644
 +        std::map<ggml_backend_buffer_type_t, size_t> want;
 +        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
 +            const auto & layer = layers[ikv];
-+            if (ggml_backend_buffer_is_host(layer.k->buffer) || flex_kv_layers.count(layer.il) > 0 || grown[ikv]) {
++            if (on_host[ikv] || flex_kv_layers.count(layer.il) > 0 || grown[ikv]) {
 +                continue; // host or flex layer, or a growable layer that grew in place
 +            }
 +            for (const ggml_tensor * t : { layer.k, layer.v }) {
 +                if (t) {
-+                    want[ggml_backend_buffer_get_type(layer.k->buffer)] += t->nb[1]*dyn_max*t->ne[2] + (64u << 20);
++                    want[buft_of[ikv]] += t->nb[1]*dyn_max*t->ne[2] + (64u << 20);
 +                }
 +            }
 +        }
@@ -1777,9 +1948,9 @@ index 1d0554fa1..f726182d8 100644
 +        const int64_t t1 = ggml_time_us();
 +        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
 +            const auto & layer = layers[ikv];
-+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
++            ggml_backend_buffer_type_t buft = buft_of[ikv];
 +            auto it_ar = arenas.find(buft);
-+            if (it_ar == arenas.end() || grown[ikv] || ggml_backend_buffer_is_host(layer.k->buffer) || flex_kv_layers.count(layer.il) > 0) {
++            if (it_ar == arenas.end() || grown[ikv] || on_host[ikv] || flex_kv_layers.count(layer.il) > 0) {
 +                continue;
 +            }
 +            auto & ar = it_ar->second;
@@ -1807,7 +1978,7 @@ index 1d0554fa1..f726182d8 100644
 +            }
 +            LLAMA_LOG_ERROR("%s: the new K/V sections on %s could not be committed, falling back to ordinary buffers and a copy\n", __func__, ggml_backend_buft_name(buft));
 +            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-+                if (!bufs_section[ikv].empty() && ggml_backend_buffer_get_type(layers[ikv].k->buffer) == buft) {
++                if (!bufs_section[ikv].empty() && buft_of[ikv] == buft) {
 +                    bufs_section[ikv].clear();
 +                }
 +            }
@@ -1821,7 +1992,7 @@ index 1d0554fa1..f726182d8 100644
 +    const uint32_t n_rows = std::min(n_used, n);
 +    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
 +        auto & layer = layers[ikv];
-+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
++        ggml_backend_buffer_type_t buft = buft_of[ikv];
 +
 +        // grown or shrunk in place above: the tensors keep their address and content (no transient copy), only their shape changes
 +        if (grown[ikv]) {
@@ -1924,6 +2095,9 @@ index 1d0554fa1..f726182d8 100644
 +            ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
 +            if (!b) {
 +                LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
++                if (via_host[ikv]) {
++                    GGML_ABORT("the K/V of layer %u was freed for the shrink, a new buffer could not be allocated", layer.il);
++                }
 +                return false;
 +            }
 +            ggml_backend_buffer_clear(b.get(), 0);
@@ -1940,6 +2114,15 @@ index 1d0554fa1..f726182d8 100644
 +            ggml_tensor * src = i == 0 ? layer.k : layer.v;
 +            ggml_tensor * dst = i == 0 ? nl.k : nl.v;
 +            if (!src) {
++                continue;
++            }
++            // the arena was freed above: the used rows come back from the host
++            if (via_host[ikv]) {
++                const auto & h = staged[2*ikv + i];
++                if (!h.empty()) {
++                    ggml_backend_tensor_set(dst, h.data(), 0, h.size());
++                    n_copied += h.size();
++                }
 +                continue;
 +            }
 +            for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1993,8 +2176,8 @@ index 1d0554fa1..f726182d8 100644
 +    }
 +    n_resize++;
 +
-+    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
-+        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, (ggml_time_us() - t0) / 1000.0,
++    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy; %zu with the VMM range freed), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
++        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, n_via_host, (ggml_time_us() - t0) / 1000.0,
 +        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
 +    return true;
 +}
@@ -2003,18 +2186,19 @@ index 1d0554fa1..f726182d8 100644
  // llama_kv_cache_context
  //
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 52cc8cd32..869989219 100644
+index 52cc8cd32..b25d1f86c 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -5,6 +5,7 @@
+@@ -5,6 +5,8 @@
  #include "llama-kv-cells.h"
  #include "llama-memory.h"
  
++#include <functional>
 +#include <map>
  #include <unordered_map>
  #include <vector>
  
-@@ -250,7 +251,49 @@ public:
+@@ -250,7 +252,54 @@ public:
      // note: used by n-gram input embeddings
      void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
  
@@ -2038,6 +2222,10 @@ index 52cc8cd32..869989219 100644
 +    // device bytes that a resize to n needs on top of the new size for a moment (the copy path holds the old and the new layer)
 +    size_t resize_peak(uint32_t n) const;
 +
++    // called before a state load grows the cache, with the cells to add after the used ones: the owner's zone rule makes room
++    // (flex layers off) and grows; a remaining shortfall is grown by the load itself
++    void set_grow_hook(std::function<void(uint32_t n_tokens)> fn) { grow_hook = std::move(fn); }
++
 +    // bytes of one cell over the layers (only those whose K/V is in device memory if device_only), and of one layer at the current size
 +    size_t cell_bytes(bool device_only) const;
 +    size_t layer_bytes(int32_t il) const;
@@ -2049,6 +2237,7 @@ index 52cc8cd32..869989219 100644
 +    uint64_t n_resize  = 0;
 +    bool     dyn_vmm_off = false;      // LLAMA_KV_NO_VMM=1: always the copy path
 +    std::vector<uint8_t> dyn_vmm;      // per layer: K and V in growable (VMM) buffers
++    std::function<void(uint32_t)> grow_hook;
 +
 +    bool relayout(uint32_t n, bool force); // force: rebuild the buffers even at the same size (one per layer, growable where possible)
 +
