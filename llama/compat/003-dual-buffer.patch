@@ -1339,7 +1339,7 @@ index 95b722628..aab6223fb 100644
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..395dd1e8c 100644
+index 1d0554fa1..a3f27180e 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -1890,9 +1890,9 @@ index 1d0554fa1..395dd1e8c 100644
 +            }
 +        }
 +        // their buffers go before the new sections are made: the arena and its VRAM go with its last section
-+        for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
++        for (size_t ib = 0; ib < ctxs_bufs.size(); ++ib) {
 +            if (owner[ib] != SIZE_MAX && via_host[owner[ib]] && n_owners[ib] == 1) {
-+                ctxs_bufs.bufs[ib].second.reset();
++                ctxs_bufs[ib].second.reset();
 +            }
 +        }
 +        t_free += ggml_time_us() - t1;
