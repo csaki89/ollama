@@ -13,7 +13,7 @@ VMM layout: one address range per device, a section per K/V, fixed size chunks (
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
 zeroing; growth steps of one chunk per section; llama_memory_reserve grows the KV for a whole prompt in one step (called by llama-server). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, e3bb28d1c, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, cdf51f253, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -1339,7 +1339,7 @@ index 95b722628..aab6223fb 100644
      std::vector<ggml_backend_ptr> backends;
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1d0554fa1..a3f27180e 100644
+index 1d0554fa1..ff80f01fa 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -1421,7 +1421,7 @@ index 1d0554fa1..a3f27180e 100644
          slot_info sinfo;
  
          bool res = true;
-@@ -2780,6 +2829,763 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2780,6 +2829,781 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -1854,6 +1854,7 @@ index 1d0554fa1..a3f27180e 100644
 +    std::vector<std::vector<uint8_t>> staged(2*layers.size());
 +    std::vector<uint8_t> via_host(layers.size(), 0);
 +    size_t n_via_host = 0;
++    size_t n_lost_vmm = 0, n_on_cpu = 0; // of those: no new section, an ordinary device buffer / the CPU instead
 +    if (n < n_old && !force) {
 +        const int64_t t1 = ggml_time_us();
 +        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
@@ -2093,11 +2094,23 @@ index 1d0554fa1..a3f27180e 100644
 +        dyn_vmm[ikv] = !bufs_layer.empty();
 +        if (bufs_layer.empty()) {
 +            ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++            if (via_host[ikv]) {
++                // the old K/V is gone (its range was freed): an ordinary device buffer, else the CPU; stop only if both fail
++                if (b) {
++                    n_lost_vmm++;
++                } else {
++                    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++                    ggml_backend_buffer_type_t buft_cpu = cpu ? ggml_backend_dev_buffer_type(cpu) : nullptr;
++                    b.reset(buft_cpu ? ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft_cpu) : nullptr);
++                    if (!b) {
++                        GGML_ABORT("layer %u: the K/V was freed for the shrink and no buffer for %u cells could be allocated, "
++                            "neither on %s nor on the CPU", layer.il, n, ggml_backend_buft_name(buft));
++                    }
++                    n_on_cpu++;
++                }
++            }
 +            if (!b) {
 +                LLAMA_LOG_ERROR("%s: layer %u: failed to allocate %s for %u cells\n", __func__, layer.il, ggml_backend_buft_name(buft), n);
-+                if (via_host[ikv]) {
-+                    GGML_ABORT("the K/V of layer %u was freed for the shrink, a new buffer could not be allocated", layer.il);
-+                }
 +                return false;
 +            }
 +            ggml_backend_buffer_clear(b.get(), 0);
@@ -2176,6 +2189,11 @@ index 1d0554fa1..a3f27180e 100644
 +    }
 +    n_resize++;
 +
++    if (n_lost_vmm > 0 || n_on_cpu > 0) {
++        LLAMA_LOG_ERROR("%s: the VMM range was freed for the shrink, but %zu of %zu layers got no new section: %zu restored by copy into "
++            "ordinary device buffers, %zu kept on the CPU (no device memory; they stay there)\n", __func__,
++            n_lost_vmm + n_on_cpu, n_via_host, n_lost_vmm, n_on_cpu);
++    }
 +    LLAMA_LOG_INFO("%s: KV %u -> %u cells (%u used, %.2f MiB copied; layers: %zu %s in place, %zu new growable, %zu new by copy; %zu with the VMM range freed), %.1f ms: alloc %.1f, copy %.1f, free %.1f\n",
 +        __func__, n_old, n, n_used, n_copied / 1024.0 / 1024.0, n_grow, n < n_old ? "shrunk" : "grown", n_vmm_new, n_copy, n_via_host, (ggml_time_us() - t0) / 1000.0,
 +        t_alloc / 1000.0, t_copy / 1000.0, t_free / 1000.0);
