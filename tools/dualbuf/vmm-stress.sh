@@ -66,7 +66,7 @@ run() {
   [ -n "$gap" ] && printf '                     gap: %s\n' "$gap" | tee -a "$SUM"
   # case e: does the in-place shrink give the VRAM back, does a plain allocation get it, does freeing the arena give it back
   if [ "$t" = impl ] && [ "$c" = e ] && [ "$rc" -eq 0 ]; then
-    grep -E 'unmapped chunks|plain allocation|arena freed:|WARNING' "$log" | sed -E 's/^ +/                     /' | tee -a "$SUM"
+    grep -E 'accounting after|unmapped chunks|plain allocation|arena freed:|WARNING' "$log" | sed -E 's/^ +/                     /' | tee -a "$SUM"
   fi
   printf '%s %s %s %d %d\n' "$t" "$c" "$s" "$ok" "$RUNS" >> /tmp/vmm-stress-counts.txt
   echo "    ($done_runs/$total runs, $(( $(date +%s) - T0 )) s)"

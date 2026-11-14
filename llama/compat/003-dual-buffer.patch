@@ -9,11 +9,11 @@ at runtime (zone 2: repacked copy + host copy; debug trigger: LLAMA_FLEX_TEST).
 three-zone placement from two --fit runs (dense and MoE), a KV cache that grows with the use
 (growable VMM buffers on CUDA/HIP, copy fallback elsewhere; LLAMA_KV_NO_VMM=1 turns VMM off),
 and flex layers that go off when the KV needs device memory and come back when it shrinks.
-VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, default the 2 MiB alignment), shrunk in place (on HIP the arena is freed via the host: unmapped chunks keep their VRAM),
+VMM layout: one address range per device, a section per K/V, fixed size chunks (chosen at load from the granularity, the alignment and the measured driver booking unit; GGML_CUDA_VMM_CHUNK_KIB), shrunk in place (on HIP the arena is freed via the host: unmapped chunks keep their VRAM),
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
 zeroing; growth steps of one chunk per section; llama_memory_reserve grows the KV for a whole prompt in one step (called by llama-server). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, 4f0f2e8dc, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, 9a6ae470d, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,10 +290,18 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..c28caed41 100644
+index 043511b72..970a4c81e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
+@@ -86,6 +86,7 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <numeric>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -728,7 +729,7 @@ struct ggml_backend_cuda_buffer_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -302,7 +310,7 @@ index 043511b72..c28caed41 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -894,6 +894,440 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -894,6 +895,493 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -366,9 +374,9 @@ index 043511b72..c28caed41 100644
 +
 +// Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
 +// first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
-+// GGML_CUDA_VMM_CHUNK_KIB (default: the section alignment, 2 MiB), rounded to the minimum granularity, a divisor of the alignment.
-+// Not smaller by default: the amdgpu KFD books every VRAM allocation aligned to 2 MiB in its free memory (VRAM_AVAILABLITY_ALIGN),
-+// so 1 MiB chunks halve what hipMemGetInfo reports and what KFD allocations may still take.
++// The chunk is chosen at runtime from the granularities, the section alignment and the booking unit of the driver, measured at the
++// first arena (ggml_cuda_vmm_booking_unit; the amdgpu KFD books every allocation rounded to 2 MiB in its free memory, so smaller
++// chunks would count double in hipMemGetInfo); GGML_CUDA_VMM_CHUNK_KIB overrides it.
 +
 +struct ggml_cuda_vmm_arena {
 +    ggml_backend_buffer_type_t buft;
@@ -542,6 +550,40 @@ index 043511b72..c28caed41 100644
 +    return ggml_cuda_vmm_commit((ggml_cuda_vmm_arena *) arena);
 +}
 +
++// the unit the driver books a device allocation with in its free memory (amdgpu KFD: 2 MiB, more than the granularity), measured
++// once per device: the free memory before and after a minimal handle, twice; 0 if unclear (the probes differ, nothing booked)
++static size_t ggml_cuda_vmm_booking_unit(int device, const CUmemAllocationProp & prop, size_t gran_min) {
++    static std::mutex mtx;
++    static size_t unit[GGML_CUDA_MAX_DEVICES] = {};
++    static bool   done[GGML_CUDA_MAX_DEVICES] = {};
++    std::lock_guard<std::mutex> lock(mtx);
++    if (done[device]) {
++        return unit[device];
++    }
++    done[device] = true;
++    const size_t size = std::max<size_t>(gran_min, 1);
++    size_t d[2] = { 0, 1 };
++    for (int i = 0; i < 2; ++i) {
++        size_t f0 = 0, f1 = 0, total = 0;
++        CUmemGenericAllocationHandle h;
++        if (cudaMemGetInfo(&f0, &total) != cudaSuccess || !GGML_CUDA_VMM_OK(cuMemCreate(&h, size, &prop, 0))) {
++            (void) cudaGetLastError();
++            return 0;
++        }
++        const cudaError_t r = cudaMemGetInfo(&f1, &total);
++        (void) cuMemRelease(h);
++        if (r != cudaSuccess) {
++            (void) cudaGetLastError();
++            return 0;
++        }
++        d[i] = f0 > f1 ? f0 - f1 : 0;
++    }
++    if (d[0] > 0 && d[0] == d[1] && d[0] % size == 0) {
++        unit[device] = d[0];
++    }
++    return unit[device];
++}
++
 +// a new arena of size bytes on the device of buft; NULL if the device has no VMM (the caller falls back)
 +static void * ggml_backend_cuda_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
 +    if (buft->iface.get_name != ggml_backend_cuda_buffer_type_get_name) {
@@ -573,6 +615,34 @@ index 043511b72..c28caed41 100644
 +    if (gran_min > 0) {
 +        align = gran_min * ((align + gran_min - 1) / gran_min);
 +    }
++    // the chunk: a common multiple of every known bound, the granularities, the section alignment and the unit the driver books an
++    // allocation with in its free memory (measured, the API does not give it); not below the alignment (more mappings per step)
++    // (at most 32 alignments: the KV reserves 64 MiB of address space per section for the alignment)
++    const size_t unit = ggml_cuda_vmm_booking_unit(device, prop, gran_min);
++    size_t chunk = align;
++    if (unit > 0 && std::lcm(align, unit) <= 32*align) {
++        chunk = std::lcm(align, unit);
++    }
++    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
++    if (env_chunk && atoll(env_chunk) > 0) {
++        chunk = (size_t) atoll(env_chunk) << 10;
++        if (gran_min > 0) {
++            chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
++        }
++        if (align % chunk != 0 && chunk % align != 0) {
++            chunk = align;
++        }
++    }
++    align = std::max(align, chunk); // the sections start on chunk boundaries
++    {
++        static bool logged[GGML_CUDA_MAX_DEVICES] = {};
++        if (!logged[device]) {
++            logged[device] = true;
++            GGML_LOG_INFO("%s: device %d: VMM granularity minimum %zu, recommended %zu; section alignment %zu; driver booking unit %zu%s; chunk %zu%s\n",
++                __func__, device, gran_min, gran_rec, align, unit,
++                unit > 0 ? " (measured)" : " (unclear: the largest known bound is used)", chunk, env_chunk ? " (GGML_CUDA_VMM_CHUNK_KIB)" : "");
++        }
++    }
 +    const size_t reserved = align * ((std::max<size_t>(size, 1) + align - 1) / align);
 +    CUdeviceptr base = 0;
 +    const auto r_reserve = cuMemAddressReserve(&base, reserved, align, 0, 0);
@@ -580,15 +650,6 @@ index 043511b72..c28caed41 100644
 +        __func__, device, physical, reserved, (void *) base, gran_rec, gran_min, align, (int) r_reserve);
 +    if (!GGML_CUDA_VMM_OK(r_reserve)) {
 +        return nullptr;
-+    }
-+    // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
-+    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
-+    size_t chunk = env_chunk ? (size_t) atoll(env_chunk) << 10 : align;
-+    if (gran_min > 0) {
-+        chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
-+    }
-+    if (chunk == 0 || chunk > align || align % chunk != 0) {
-+        chunk = align;
 +    }
 +    GGML_CUDA_VMM_LOG("%s: chunk %zu bytes\n", __func__, chunk);
 +    (void) ggml_cuda_vmm_sync(); // its one-time log line not between a mapping and its first access
@@ -743,7 +804,7 @@ index 043511b72..c28caed41 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -5811,6 +6245,41 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5811,6 +6299,41 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -842,10 +903,10 @@ index 720b45140..ebbd81517 100644
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fa115ffe4..944749e38 100644
+index fa115ffe4..742a49224 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -9,7 +9,7 @@
+@@ -9,12 +9,14 @@
  #include "llama-memory.h"
  #include "llama-mmap.h"
  #include "llama-model.h"
@@ -854,7 +915,14 @@ index fa115ffe4..944749e38 100644
  #include "llama-sampler.h"
  #include "llama.h"
  
-@@ -96,6 +96,38 @@ llama_context::llama_context(
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -96,6 +98,38 @@ llama_context::llama_context(
      t_start_us = model.t_start_us;
      t_load_us  = model.t_load_us;
  
@@ -893,7 +961,7 @@ index fa115ffe4..944749e38 100644
      const auto & hparams = model.hparams;
  
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
-@@ -395,7 +427,27 @@ llama_context::llama_context(
+@@ -395,7 +429,27 @@ llama_context::llama_context(
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
          };
  
@@ -922,7 +990,7 @@ index fa115ffe4..944749e38 100644
      }
  
      // init backends
-@@ -613,6 +665,280 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -613,6 +667,321 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -1089,6 +1157,33 @@ index fa115ffe4..944749e38 100644
 +    }
 +}
 +
++// the free VRAM by the kernel driver (amdgpu sysfs: mem_info_vram_total - mem_info_vram_used) of the card whose total is closest
++// to total (within 1/16); false if there is none (not Linux, not amdgpu)
++static bool zones_sysfs_free(size_t total, size_t & free_out) {
++#if defined(__linux__)
++    size_t best = SIZE_MAX;
++    for (int c = 0; c < 16; ++c) {
++        unsigned long long t = 0, u = 0;
++        const std::string base = "/sys/class/drm/card" + std::to_string(c) + "/device/mem_info_vram_";
++        FILE * ft = fopen((base + "total").c_str(), "r");
++        FILE * fu = ft ? fopen((base + "used").c_str(), "r") : nullptr;
++        const bool ok = ft && fu && fscanf(ft, "%llu", &t) == 1 && fscanf(fu, "%llu", &u) == 1 && u <= t;
++        if (fu) { fclose(fu); }
++        if (ft) { fclose(ft); }
++        const size_t diff = (size_t) (t > total ? t - total : total - t);
++        if (ok && diff <= total/16 && diff < best) {
++            best     = diff;
++            free_out = (size_t) (t - u);
++        }
++    }
++    return best != SIZE_MAX;
++#else
++    GGML_UNUSED(total);
++    GGML_UNUSED(free_out);
++    return false;
++#endif
++}
++
 +ggml_backend_dev_t llama_context::zones_dev() const {
 +    const auto flex = model.flex_layers();
 +    if (!flex.empty()) {
@@ -1110,13 +1205,23 @@ index fa115ffe4..944749e38 100644
 +    }
 +    size_t dev_free = 0, dev_total = 0;
 +    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-+    const int64_t real = (int64_t) dev_free - (int64_t) zones_vram_margin;
++    // the kernel's own figure where there is one: the booked free memory is checked against it, the lower one counts
++    size_t sys_free = 0;
++    const bool sys = zones_sysfs_free(dev_total, sys_free);
++    const int64_t booked = zones_headroom + (int64_t) zones_vram_margin;
++    if (sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
++        LLAMA_LOG_WARN("%s: zones: the booked free memory (%.0f MiB) is off from the device: driver %.0f MiB, sysfs %.0f MiB\n", __func__,
++            booked / 1048576.0, dev_free / 1048576.0, sys_free / 1048576.0);
++    }
++    const size_t free_real = sys ? std::min(dev_free, sys_free) : dev_free;
++    const int64_t real = (int64_t) free_real - (int64_t) zones_vram_margin;
 +    if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
-+        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB, margin %.0f MiB)\n", __func__,
-+            zones_headroom / 1048576.0, real / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
++        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB: driver %.0f, sysfs %s; margin %.0f MiB)\n", __func__,
++            zones_headroom / 1048576.0, real / 1048576.0, free_real / 1048576.0, dev_free / 1048576.0,
++            sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_vram_margin / 1048576.0);
 +        zones_headroom = real;
 +    }
-+    return dev_free;
++    return free_real;
 +}
 +
 +void llama_context::zones_log_state(const char * what) {
@@ -1151,11 +1256,15 @@ index fa115ffe4..944749e38 100644
 +    if (ggml_backend_dev_t dev = zones_dev()) {
 +        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 +    }
++    size_t sys_free = 0;
++    const bool sys = zones_sysfs_free(dev_total, sys_free);
 +    LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s; "
-+        "KV %u cells (%u used, %.0f MiB on the device); device free %.0f MiB (budget %.0f MiB, margin %.0f MiB)\n", __func__, what,
++        "KV %u cells (%u used, %.0f MiB on the device); device free: booked %.0f, driver %.0f, sysfs %s MiB (budget %.0f MiB, margin %.0f MiB)\n",
++        __func__, what,
 +        w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
 +        off.empty() ? "" : ", off: ", off.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
-+        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, dev_free / 1048576.0, zones_headroom / 1048576.0,
++        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, (zones_headroom + (int64_t) zones_vram_margin) / 1048576.0,
++        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", zones_headroom / 1048576.0,
 +        zones_vram_margin / 1048576.0);
 +}
 +
@@ -1203,7 +1312,7 @@ index fa115ffe4..944749e38 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -639,7 +965,18 @@ void llama_context::sched_reserve() {
+@@ -639,7 +1008,18 @@ void llama_context::sched_reserve() {
      gf_res_reserve.reset(new llm_graph_result(max_nodes));
      gf_res_prev_active = nullptr;
  
@@ -1222,7 +1331,7 @@ index fa115ffe4..944749e38 100644
  
      llama_memory_context_ptr mctx;
      if (memory) {
-@@ -679,6 +1016,7 @@ void llama_context::sched_reserve() {
+@@ -679,6 +1059,7 @@ void llama_context::sched_reserve() {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                  cparams.pipeline_parallel = false;
                  sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
@@ -1230,7 +1339,7 @@ index fa115ffe4..944749e38 100644
                  gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
              }
              if (!gf) {
-@@ -1794,6 +2132,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1794,6 +2175,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -1255,7 +1364,7 @@ index fa115ffe4..944749e38 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -1802,8 +2158,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -1802,8 +2201,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -1264,7 +1373,7 @@ index fa115ffe4..944749e38 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -3780,6 +4134,8 @@ llama_context_params llama_context_default_params() {
+@@ -3780,6 +4177,8 @@ llama_context_params llama_context_default_params() {
          /*.cb_eval_user_data           =*/ nullptr,
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
@@ -1273,7 +1382,7 @@ index fa115ffe4..944749e38 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4257,6 +4613,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4257,6 +4656,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  

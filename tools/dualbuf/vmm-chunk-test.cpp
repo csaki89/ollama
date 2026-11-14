@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <list>
+#include <numeric>
 #include <vector>
 
 static const size_t KiB = 1024, MiB = 1024*1024;
@@ -87,11 +88,28 @@ static uint32_t vmm_step(size_t chunk, size_t row, uint32_t max) {
     return std::max<uint32_t>(256, cells - cells % 256);
 }
 
-// the chunk choice of ggml_backend_cuda_vmm_arena_new
+// the chunk choice of ggml_backend_cuda_vmm_arena_new with GGML_CUDA_VMM_CHUNK_KIB (kib), for an alignment that is not raised
 static size_t pick_chunk(size_t kib, size_t gran_min, size_t align) {
     size_t chunk = kib << 10;
     if (gran_min > 0) chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
-    if (chunk == 0 || chunk > align || align % chunk != 0) chunk = align;
+    if (chunk == 0 || (align % chunk != 0 && chunk % align != 0)) chunk = align;
+    return chunk;
+}
+
+// a driver that books every allocation rounded up to unit in its free memory (amdgpu KFD: 2 MiB); 0: books the size
+static size_t booked(size_t size, size_t unit) {
+    return unit ? unit * ((size + unit - 1) / unit) : size;
+}
+
+// ggml_cuda_vmm_booking_unit (two probes of a minimal handle) and the chunk without GGML_CUDA_VMM_CHUNK_KIB; align is raised to it
+static size_t auto_chunk(size_t gran_min, size_t gran_rec, size_t min_align, size_t driver_unit, size_t & align, size_t & unit) {
+    align = std::max(gran_rec, min_align);
+    if (gran_min > 0) align = gran_min * ((align + gran_min - 1) / gran_min);
+    const size_t d0 = booked(gran_min, driver_unit), d1 = booked(gran_min, driver_unit);
+    unit = d0 > 0 && d0 == d1 && d0 % gran_min == 0 ? d0 : 0;
+    size_t chunk = align;
+    if (unit > 0 && std::lcm(align, unit) <= 32*align) chunk = std::lcm(align, unit);
+    align = std::max(align, chunk);
     return chunk;
 }
 
@@ -185,6 +203,26 @@ int main() {
     CHECK(pick_chunk(512, 4*KiB, 2*MiB) == 512*KiB, "512 KiB chunk");
     CHECK(pick_chunk(3000, 4*KiB, 2*MiB) == 2*MiB, "a chunk that does not divide the alignment");
     CHECK(pick_chunk(1024, 2*MiB, 2*MiB) == 2*MiB, "minimum granularity 2 MiB");
+    // the automatic chunk: the measured booking unit decides, the driver's booking then equals the mapped size
+    struct { size_t gmin, grec, drv, want_chunk, want_unit; const char * what; } cases[] = {
+        { 4*KiB, 4*KiB,  2*MiB, 2*MiB, 2*MiB, "RX 6700 / amdgpu KFD: granularity 4 KiB, booking 2 MiB" },
+        { 4*KiB, 4*KiB,  0,     2*MiB, 4*KiB, "a driver that books the size: the alignment" },
+        { 4*KiB, 4*KiB,  8*MiB, 8*MiB, 8*MiB, "a larger booking unit raises the chunk and the alignment" },
+        { 2*MiB, 2*MiB,  2*MiB, 2*MiB, 2*MiB, "CUDA-like: granularity 2 MiB" },
+        { 4*KiB, 4*KiB,  3*MiB, 6*MiB, 3*MiB, "a booking unit that is not a power of two: the common multiple" },
+    };
+    for (const auto & c : cases) {
+        size_t align = 0, unit = 0;
+        const size_t chunk = auto_chunk(c.gmin, c.grec, 2*MiB, c.drv, align, unit);
+        CHECK(chunk == c.want_chunk && unit == c.want_unit, "%s: chunk %zu, unit %zu", c.what, chunk, unit);
+        CHECK(align % chunk == 0 && chunk % c.gmin == 0, "%s: chunk %zu, align %zu", c.what, chunk, align);
+        // 96 sections grown by 5 steps of one chunk: the driver books exactly what is mapped
+        const size_t mapped = 96*5*chunk, drv = 96*5*booked(chunk, c.drv);
+        CHECK(mapped == drv, "%s: mapped %zu MiB, booked by the driver %zu MiB", c.what, mapped/MiB, drv/MiB);
+        printf("auto chunk: %s -> unit %zu KiB, chunk %zu KiB, alignment %zu KiB\n", c.what, unit/KiB, chunk/KiB, align/KiB);
+    }
+    // the old 1 MiB chunk on the KFD: the driver books double (the 1918 -> 190 MiB on the NAS for 864 MiB)
+    CHECK(96*9*booked(1*MiB, 2*MiB) == 2*96*9*1*MiB, "1 MiB chunks are booked double");
     CHECK(vmm_step(2*MiB, 1*KiB, 32768) == 2048, "qwen3-coder:30b step with the default chunk (the 2 MiB alignment)");
     CHECK(vmm_step(1*MiB, 1*KiB, 32768) == 1024, "qwen3-coder:30b step with GGML_CUDA_VMM_CHUNK_KIB=1024");
     CHECK(vmm_step(1*MiB, 3*KiB, 32768) == 256, "3 KiB rows: 341 cells -> 256");

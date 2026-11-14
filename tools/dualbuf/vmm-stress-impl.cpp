@@ -472,12 +472,28 @@ int main(int argc, char ** argv) {
     } else if (cs == 'e') {
         printf("  KV pattern: %d sections of %zu MiB, from %zu MiB by %zu KiB to %zu MiB, shrink to %zu MiB, grow again\n",
             n_secs, e_max/MiB, e_start/MiB, e_step/1024, e_top/MiB, e_start/MiB);
+        const size_t f_base = dev_free(), v_base = vram_used();
         arena a = new_arena((size_t) n_secs*e_max + 64*MiB);
         auto secs = start_sections(a, n_secs, e_start, e_max);
         grow_to(secs, e_step, e_top);
         report_vram("grown");
         int64_t st0[4];
         vmm_stats(st0);
+        // with the chosen chunk the mapped bytes, the driver's free memory (hipMemGetInfo) and the sysfs VRAM change alike
+        {
+            const long long mapped = st0[1] >> 20;
+            const long long drv    = ((long long) f_base - (long long) dev_free()) >> 20;
+            const long long sysd   = ((long long) vram_used() - (long long) v_base) >> 20;
+            printf("  accounting after the growth: mapped %lld MiB, driver free -%lld MiB, sysfs used +%lld MiB\n", mapped, drv,
+                v_base ? sysd : -1);
+            const long long tol = mapped/16 + 8;
+            if (!g_sim && std::llabs(drv - mapped) > tol) {
+                fail("the driver books " + std::to_string(drv) + " MiB for " + std::to_string(mapped) + " MiB mapped (chunk size vs driver booking unit)");
+            }
+            if (!g_sim && v_base && std::llabs(sysd - mapped) > tol) {
+                fail("the sysfs VRAM grew by " + std::to_string(sysd) + " MiB for " + std::to_string(mapped) + " MiB mapped");
+            }
+        }
         const size_t vram_grown = vram_used();
         const size_t size_top = secs[0].size;
         for (auto & s : secs) {
