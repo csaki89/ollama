@@ -7,8 +7,8 @@
 #   docker exec -e QUICK=1 ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh   (one run per case)
 # From a checkout (pattern only, compiled here):
 #   docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
-# Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), CASES (both tests, "a b c d", e: impl only),
-#      IMPL_CASES (impl, default CASES if set, else "a b c d e"),
+# Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), CASES (both tests, "a b c d", e and f: impl only),
+#      IMPL_CASES (impl, default CASES if set, else "a b c d e f"; f: e with one address reservation per arena),
 #      WAIT_MS (5), CHUNK_MIB (64), TARGET_GIB (6), ARCH (gfx1030, only for compiling the pattern)
 set -u
 cd "$(dirname "$0")"
@@ -17,9 +17,9 @@ export LD_LIBRARY_PATH="/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama:${LD_LIBRARY_P
 unset GGML_CUDA_VMM_DEBUG GGML_CUDA_VMM_SYNC GGML_CUDA_VMM_WAIT_MS  # logging would delay the first access; the mode is set per run
 RUNS=${RUNS:-3}; [ "${QUICK:-0}" = 1 ] && RUNS=1
 WAIT_MS=${WAIT_MS:-5}; CHUNK_MIB=${CHUNK_MIB:-64}; TARGET_GIB=${TARGET_GIB:-6}
-# CASES alone filters both tests (the pattern has no case e); IMPL_CASES overrides it for impl
+# CASES alone filters both tests (the pattern has no case e or f); IMPL_CASES overrides it for impl
 [ -n "${CASES:-}" ] && [ -z "${IMPL_CASES:-}" ] && IMPL_CASES=$CASES
-SYNCS=${SYNCS:-none wait barrier both}; CASES=${CASES:-a b c d}; IMPL_CASES=${IMPL_CASES:-a b c d e}; TESTS=${TESTS:-impl pattern}
+SYNCS=${SYNCS:-none wait barrier both}; CASES=${CASES:-a b c d}; IMPL_CASES=${IMPL_CASES:-a b c d e f}; TESTS=${TESTS:-impl pattern}
 CASES=$(echo $CASES | tr ' ' '\n' | grep -E '^[a-d]$' | tr '\n' ' ')
 SUM=/tmp/vmm-stress-summary.txt; : > "$SUM"
 
@@ -65,8 +65,8 @@ run() {
   printf '%-7s %-1s %-8s %d/%d  %s\n' "$t" "$c" "$s" "$ok" "$RUNS" "${info:-$back}" | tee -a "$SUM"
   [ -n "$gap" ] && printf '                     gap: %s\n' "$gap" | tee -a "$SUM"
   # case e: does the in-place shrink give the VRAM back, does a plain allocation get it, does freeing the arena give it back
-  if [ "$t" = impl ] && [ "$c" = e ] && [ "$rc" -eq 0 ]; then
-    grep -E 'accounting after|unmapped chunks|plain allocation|arena freed:|WARNING' "$log" | sed -E 's/^ +/                     /' | tee -a "$SUM"
+  if [ "$t" = impl ] && { [ "$c" = e ] || [ "$c" = f ]; } && [ "$rc" -eq 0 ]; then
+    grep -E 'address reservation|accounting after|unmapped chunks|plain allocation|whole-section|arena freed:|WARNING' "$log" | sed -E 's/^ +/                     /' | tee -a "$SUM"
   fi
   printf '%s %s %s %d %d\n' "$t" "$c" "$s" "$ok" "$RUNS" >> /tmp/vmm-stress-counts.txt
   echo "    ($done_runs/$total runs, $(( $(date +%s) - T0 )) s)"

@@ -190,7 +190,79 @@ static void run(size_t chunk_kib) {
     check_all("max");
 }
 
+// ggml_cuda_vmm_piece: at most size bytes from p that lie in one reservation of a per-chunk range [begin, end)
+static size_t piece(size_t begin, size_t end, size_t chunk, size_t p, size_t size) {
+    if (p >= begin && p < end) return std::min(size, chunk - (p - begin) % chunk);
+    return size;
+}
+
+// the reservations of a section with a reservation per chunk (ggml-cuda growable buffer: reserve_chunks, renew, capacity);
+// taken: addresses another allocation got meanwhile (the runtime then gives the reservation elsewhere)
+struct resv_section {
+    size_t base, section, chunk;
+    std::vector<size_t> resv;
+    std::vector<size_t> * taken;
+    bool reserve_at(size_t want) {
+        if (std::find(taken->begin(), taken->end(), want) != taken->end()) return false;
+        resv.push_back(want);
+        return true;
+    }
+    bool reserve_chunks() {
+        for (size_t off = 0; off < section; off += chunk) {
+            if (!reserve_at(base + off)) { resv.clear(); return false; }
+        }
+        return true;
+    }
+    bool renew(size_t i) {
+        const size_t p = resv[i];
+        if (std::find(taken->begin(), taken->end(), p) == taken->end()) return true;
+        resv[i] = resv.back();
+        resv.pop_back();
+        resv.resize(std::min(resv.size(), i));
+        return false;
+    }
+    size_t capacity() const { return resv.size()*chunk; }
+};
+
+static void test_per_chunk() {
+    // the splitting of runtime copies: random ranges in a 96 x 32 MiB range of 2 MiB reservations, and outside it
+    const size_t chunk = 2*MiB, begin = 64*MiB, end = begin + 96*32*MiB;
+    uint64_t rng = 12345;
+    auto rnd = [&](size_t m) { rng = rng*6364136223846793005ull + 1442695040888963407ull; return (size_t) ((rng >> 17) % m); };
+    for (int t = 0; t < 20000; ++t) {
+        const size_t p = rnd(end + 16*MiB), size = 1 + rnd(9*MiB);
+        size_t done = 0, n_pieces = 0;
+        while (done < size) {
+            const size_t q = p + done, n = piece(begin, end, chunk, q, size - done);
+            CHECK(n > 0, "empty piece");
+            if (q >= begin && q < end) {
+                CHECK((q - begin)/chunk == (q + n - 1 - begin)/chunk, "piece %zu + %zu crosses a chunk boundary", q, n);
+            }
+            done += n;
+            n_pieces++;
+        }
+        CHECK(done == size, "pieces cover %zu of %zu", done, size);
+        if (p + size <= begin || p >= end) CHECK(n_pieces == 1, "outside the range: %zu pieces", n_pieces);
+    }
+    // a section: all chunks reserved at their place; a shrink renews the top chunks in place; a taken slot ends the section there
+    std::vector<size_t> taken;
+    resv_section s { begin, 32*MiB, chunk, {}, &taken };
+    CHECK(s.reserve_chunks() && s.capacity() == 32*MiB, "reserve the section");
+    for (size_t i = 15; i >= 2; --i) CHECK(s.renew(i), "renew %zu", i);
+    CHECK(s.capacity() == 32*MiB, "the renewed section is whole");
+    for (size_t k = 0; k < s.resv.size(); ++k) CHECK(s.resv[k] == begin + k*chunk, "reservation %zu moved", k);
+    taken.push_back(begin + 9*chunk); // another allocation got chunk 9 between the free and the reservation
+    CHECK(!s.renew(9), "renew of a taken slot must fail");
+    CHECK(s.capacity() == 9*chunk, "the section ends below the taken slot: %zu MiB", s.capacity()/MiB);
+    resv_section s2 { begin + 32*MiB, 32*MiB, chunk, {}, &taken };
+    taken.push_back(begin + 32*MiB + 5*chunk);
+    CHECK(!s2.reserve_chunks() && s2.resv.empty(), "a section with a taken slot gets no reservation (fallback: one range)");
+    // reservations at 128K context (qwen3-coder:30b: 96 sections of 128 MiB) and at 32K
+    printf("per chunk: %zu reservations at 128K context, %zu at 32K (2 MiB chunks, 96 sections)\n", (size_t) 96*64, (size_t) 96*16);
+}
+
 int main() {
+    test_per_chunk();
     // the old scheme for comparison: a 4 MiB first mapping, then a 2 MiB one -> the clr rule fails
     {
         arena a { 2*MiB, 0, {} };

@@ -11,10 +11,13 @@
 //      mapped again on the same addresses of the same arena, and grown again
 //   c  the VRAM almost filled with ordinary buffers first, then growth
 //   d  8 arenas one after the other
-//   e  the KV pattern: 96 sections of 32 MiB, 4 MiB each at the start, growing by 768 KiB steps (not on chunk boundaries) to
+//   e  the KV pattern (with a reservation per chunk on HIP, the default): 96 sections of 32 MiB, 4 MiB each at the start, growing by 768 KiB steps (not on chunk boundaries) to
 //      13 MiB, shrunk in place to 4 MiB (ggml_backend_buffer_shrink: the top chunks unmapped, the content below kept; the sysfs
 //      VRAM after it, and a plain allocation of the unmapped size), grown again; then what the KV does on HIP: the content to the
-//      host, the arena freed (the VRAM must come back), a new arena at 4 MiB with the content back, grown again
+//      host, the arena freed (the VRAM must come back), a new arena at 4 MiB with the content back, grown again. With a
+//      reservation per chunk the VRAM must come back at the in-place shrink, the sections grow again on the same addresses, and
+//      whole-section copies and a memset over a chunk boundary must work (the runtime calls are split per reservation)
+//   f  e with one reservation per arena (GGML_CUDA_VMM_RESERVE=range: the layout before)
 // At the end: no arena and no mapped byte may be left (backend counters), and the VRAM must come back (sysfs, polled for 3 s).
 // Env: VMM_BACKEND (path of the backend library, default /usr/lib/ollama/rocm_v7_2/libggml-hip.so if it exists),
 //      VMM_IMPL_SIM=1 (simulated growable buffers, to test this program on a backend without VMM)
@@ -46,6 +49,7 @@ typedef bool                  (*buffer_grow_t)(ggml_backend_buffer_t buffer, siz
 typedef bool                  (*buffer_grow_commit_t)(ggml_backend_buffer_t buffer);
 typedef void                  (*vmm_stats_t)(int64_t * stats);
 typedef bool                  (*buffer_shrink_t)(ggml_backend_buffer_t buffer, size_t size);
+typedef bool                  (*keeps_memory_t)(ggml_backend_buffer_t buffer);
 
 static arena_new_t          arena_new;
 static arena_alignment_t    arena_alignment;
@@ -56,6 +60,7 @@ static buffer_grow_t        buffer_grow;
 static buffer_grow_commit_t buffer_grow_commit;
 static vmm_stats_t          vmm_stats;
 static buffer_shrink_t      buffer_shrink;
+static keeps_memory_t       keeps_memory;
 
 // simulated growable buffers: a buffer of the section size
 static ggml_backend_buffer_type_t sim_buft;
@@ -68,6 +73,7 @@ static bool sim_buffer_grow(ggml_backend_buffer_t b, size_t size) { return size 
 static bool sim_buffer_grow_commit(ggml_backend_buffer_t) { return true; }
 static void sim_vmm_stats(int64_t * stats) { memset(stats, 0, 4*sizeof(int64_t)); }
 static bool sim_buffer_shrink(ggml_backend_buffer_t, size_t) { return true; }
+static bool sim_keeps_memory(ggml_backend_buffer_t) { return false; }
 
 [[noreturn]] static void fail(const std::string & msg) {
     printf("FAIL: %s\n", msg.c_str());
@@ -289,11 +295,20 @@ static void remap_same(arena & a, std::vector<section> & secs, size_t size) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc < 2 || strlen(argv[1]) != 1 || argv[1][0] < 'a' || argv[1][0] > 'e') {
-        printf("usage: %s <a|b|c|d|e> [--chunk-mib N] [--target-gib N] [--sections N]\n", argv[0]);
+    if (argc < 2 || strlen(argv[1]) != 1 || argv[1][0] < 'a' || argv[1][0] > 'f') {
+        printf("usage: %s <a|b|c|d|e|f> [--chunk-mib N] [--target-gib N] [--sections N]\n", argv[0]);
         return 2;
     }
     const char cs = argv[1][0];
+    // f: the KV pattern of e with one address reservation per arena (the layout before the reservation per chunk)
+    if (cs == 'f') {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_VMM_RESERVE", "range");
+#else
+        setenv("GGML_CUDA_VMM_RESERVE", "range", 1);
+#endif
+    }
+    const bool kv_case = cs == 'e' || cs == 'f';
     size_t chunk   = 64*MiB;
     size_t target  = 6ull << 30;
     int    n_secs  = 4;
@@ -305,7 +320,7 @@ int main(int argc, char ** argv) {
         else { printf("unknown option %s\n", a.c_str()); return 2; }
     }
 
-    if (cs == 'e') {
+    if (kv_case) {
         n_secs = 96; // the KV pattern (case e)
     }
     std::string path = getenv("VMM_BACKEND") ? getenv("VMM_BACKEND") : "";
@@ -342,7 +357,7 @@ int main(int argc, char ** argv) {
     if (g_sim) {
         arena_new = sim_arena_new; arena_alignment = sim_arena_alignment; arena_buffer = sim_arena_buffer; arena_free = sim_arena_free;
         arena_commit = sim_arena_commit; buffer_grow = sim_buffer_grow; buffer_grow_commit = sim_buffer_grow_commit; vmm_stats = sim_vmm_stats;
-        buffer_shrink = sim_buffer_shrink;
+        buffer_shrink = sim_buffer_shrink; keeps_memory = sim_keeps_memory;
     } else {
         arena_new          = (arena_new_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_arena_new");
         arena_alignment    = (arena_alignment_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_arena_alignment");
@@ -353,7 +368,8 @@ int main(int argc, char ** argv) {
         buffer_grow_commit = (buffer_grow_commit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_grow_commit");
         vmm_stats          = (vmm_stats_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_stats");
         buffer_shrink      = (buffer_shrink_t)      ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_shrink");
-        if (!arena_new || !arena_alignment || !arena_buffer || !arena_free || !arena_commit || !buffer_grow || !buffer_grow_commit || !vmm_stats || !buffer_shrink) {
+        keeps_memory       = (keeps_memory_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_vmm_unmap_keeps_memory");
+        if (!arena_new || !arena_alignment || !arena_buffer || !arena_free || !arena_commit || !buffer_grow || !buffer_grow_commit || !vmm_stats || !buffer_shrink || !keeps_memory) {
             fail("the backend does not provide the growable buffer functions");
         }
     }
@@ -367,7 +383,7 @@ int main(int argc, char ** argv) {
     per_section = std::max(per_section - per_section % chunk, chunk);
     // case e: the KV pattern
     const size_t e_max = 32*MiB, e_start = 4*MiB, e_step = 768*1024, e_top = 13*MiB;
-    const size_t max_size = cs == 'e' ? e_max : per_section + chunk;
+    const size_t max_size = kv_case ? e_max : per_section + chunk;
     g_max_pages = max_size/PAGE;
     g_scratch = ggml_backend_buft_alloc_buffer(g_buft, (1 + n_secs)*g_max_pages*sizeof(float) + 4096);
     if (!g_scratch) {
@@ -469,7 +485,7 @@ int main(int argc, char ** argv) {
         for (auto * b : filler) {
             ggml_backend_buffer_free(b);
         }
-    } else if (cs == 'e') {
+    } else if (kv_case) {
         printf("  KV pattern: %d sections of %zu MiB, from %zu MiB by %zu KiB to %zu MiB, shrink to %zu MiB, grow again\n",
             n_secs, e_max/MiB, e_start/MiB, e_step/1024, e_top/MiB, e_start/MiB);
         const size_t f_base = dev_free(), v_base = vram_used();
@@ -496,6 +512,13 @@ int main(int argc, char ** argv) {
         }
         const size_t vram_grown = vram_used();
         const size_t size_top = secs[0].size;
+        const bool keeps = keeps_memory(secs[0].buf);
+        printf("  address reservation: %s\n", keeps ? "one per arena (an unmapped chunk keeps its VRAM until the arena is freed)"
+            : "one per chunk (an in-place shrink gives the VRAM back)");
+        std::vector<void *> bases;
+        for (auto & s : secs) {
+            bases.push_back(ggml_backend_buffer_get_base(s.buf));
+        }
         for (auto & s : secs) {
             if (!buffer_shrink(s.buf, e_start)) {
                 fail("buffer_shrink failed");
@@ -520,6 +543,9 @@ int main(int argc, char ** argv) {
             printf("  the VRAM of the unmapped chunks came back in %d ms\n", ms);
         }
         report_vram("shrunk in place");
+        if (!keeps && !g_sim && vram0 && ms < 0) {
+            fail("a reservation per chunk, but the VRAM of the unmapped chunks did not come back");
+        }
         // a plain device allocation (hipMalloc) of the unmapped size: does it get the kept memory?
         if (unmapped > 0) {
             const size_t v0 = vram_used();
@@ -535,8 +561,41 @@ int main(int argc, char ** argv) {
                 ggml_backend_buffer_free(b);
             }
         }
-        grow_to(secs, e_step, e_start + 6*e_step);
+        grow_to(secs, e_step, e_start + 6*e_step); // the kernels check every page: the kept content and the new chunks
         report_vram("grown again (same arena)");
+        for (size_t i = 0; i < secs.size(); ++i) {
+            if (ggml_backend_buffer_get_base(secs[i].buf) != bases[i]) {
+                fail("section " + std::to_string(i) + " moved when it grew again");
+            }
+        }
+        // runtime copies and memsets over several chunks (with a reservation per chunk they must be split): the whole of the
+        // first sections to the host, a memset over a chunk boundary, read back and checked, the content written back
+        {
+            const size_t n = secs[0].size, a_chunk = std::min(n/2, e_start/2);
+            const size_t ms_off = a_chunk - 4096, ms_len = 8192; // across 2 MiB, a chunk boundary with the 2 MiB chunk
+            ggml_init_params params = { ggml_tensor_overhead()*4, nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            for (size_t i = 0; i < std::min<size_t>(secs.size(), 4); ++i) {
+                ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, n);
+                if (ggml_backend_tensor_alloc(secs[i].buf, t, ggml_backend_buffer_get_base(secs[i].buf)) != GGML_STATUS_SUCCESS) {
+                    fail("tensor_alloc (whole section)");
+                }
+                std::vector<uint8_t> orig(n), back(n);
+                ggml_backend_tensor_get(t, orig.data(), 0, n);
+                ggml_backend_tensor_memset(t, 0x5a, ms_off, ms_len);
+                ggml_backend_tensor_get(t, back.data(), 0, n);
+                for (size_t j = 0; j < n; ++j) {
+                    const uint8_t want = j >= ms_off && j < ms_off + ms_len ? 0x5a : orig[j];
+                    if (back[j] != want) {
+                        fail("whole-section copy/memset: wrong byte " + std::to_string(j) + " of section " + std::to_string(i));
+                    }
+                }
+                ggml_backend_tensor_set(t, orig.data(), 0, n);
+            }
+            ggml_free(ctx);
+            mark_and_check(secs, std::vector<size_t>(secs.size(), secs[0].size)); // the content written back is the same
+            printf("  whole-section copies and a memset over a chunk boundary: OK\n");
+        }
 
         // what the KV does on HIP when it shrinks: the content to the host, the sections and the arena freed (the address range
         // with its VRAM), a new arena at the shrunk size, the content back
