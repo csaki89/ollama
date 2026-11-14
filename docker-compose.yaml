@@ -3,7 +3,7 @@
 # (that one stays on port 30068). Test API: http://<nas>:30069
 #
 # Before the first start:
-#  1. The image tag is pinned to the build of commit e967bb1 (workflow run 43591485024). For a newer build use the tag the "dualbuf-image" workflow printed
+#  1. The image tag is pinned to the build of commit e7b2d32 (workflow run 43596985752). For a newer build use the tag the "dualbuf-image" workflow printed
 #     (0.40.2-dualbuf-<7 char commit>). Do not use :latest, a restart could pull a different build.
 #  2. If the ghcr.io package is private, log in on the NAS first (see docs/SUMMARY.md).
 #
@@ -14,7 +14,7 @@
 #    manifest, the blobs are shared. See docs/SUMMARY.md.
 services:
   ollama-dualbuf:
-    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-e967bb1
+    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-e7b2d32
     container_name: ollama-dualbuf
     restart: unless-stopped
     ports:
