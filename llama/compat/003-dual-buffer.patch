@@ -9,11 +9,11 @@ at runtime (zone 2: repacked copy + host copy; debug trigger: LLAMA_FLEX_TEST).
 three-zone placement from two --fit runs (dense and MoE), a KV cache that grows with the use
 (growable VMM buffers on CUDA/HIP, copy fallback elsewhere; LLAMA_KV_NO_VMM=1 turns VMM off),
 and flex layers that go off when the KV needs device memory and come back when it shrinks.
-VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, 1 MiB), shrunk in place (on HIP the arena is freed via the host: unmapped chunks keep their VRAM),
+VMM layout: one address range per device, a section per K/V, fixed size chunks (GGML_CUDA_VMM_CHUNK_KIB, default the 2 MiB alignment), shrunk in place (on HIP the arena is freed via the host: unmapped chunks keep their VRAM),
 after mapping a KFD barrier on HIP (GGML_CUDA_VMM_SYNC; a failed barrier falls back to a copy), then synchronous
 zeroing; growth steps of one chunk per section; llama_memory_reserve grows the KV for a whole prompt in one step (called by llama-server). GGML_CUDA_VMM_DEBUG=1 logs every reservation, mapping,
 access setting, zeroing, growth and release.
-Ported from csaki89/llama.cpp (dual-buffer branch, cdf51f253, based on e14a77971) to the
+Ported from csaki89/llama.cpp (dual-buffer branch, 4f0f2e8dc, based on e14a77971) to the
 b11351 pin. Must be applied after 001 and 002 (they touch common.cpp/.h, llama.h and
 llama-context.cpp as well).
 
@@ -290,7 +290,7 @@ index 5bdade6de..7ab00d9a8 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 043511b72..65ed72d61 100644
+index 043511b72..c28caed41 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -728,7 +728,7 @@ struct ggml_backend_cuda_buffer_context {
@@ -302,7 +302,7 @@ index 043511b72..65ed72d61 100644
          CUDA_CHECK(cudaFree(dev_ptr));
      }
  };
-@@ -894,6 +894,438 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -894,6 +894,440 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
  
@@ -366,7 +366,9 @@ index 043511b72..65ed72d61 100644
 +
 +// Every mapping of an arena is one chunk of the same size: the ROCm hipMemSetAccess checks its size against the sizes of the
 +// first mappings of the whole address range (clr hip_vm.cpp), so a chunk after a larger first mapping fails (hipErrorInvalidValue).
-+// GGML_CUDA_VMM_CHUNK_KIB (default 1024), rounded to the minimum granularity, a divisor of the section alignment.
++// GGML_CUDA_VMM_CHUNK_KIB (default: the section alignment, 2 MiB), rounded to the minimum granularity, a divisor of the alignment.
++// Not smaller by default: the amdgpu KFD books every VRAM allocation aligned to 2 MiB in its free memory (VRAM_AVAILABLITY_ALIGN),
++// so 1 MiB chunks halve what hipMemGetInfo reports and what KFD allocations may still take.
 +
 +struct ggml_cuda_vmm_arena {
 +    ggml_backend_buffer_type_t buft;
@@ -581,7 +583,7 @@ index 043511b72..65ed72d61 100644
 +    }
 +    // the fixed chunk: a multiple of the minimum granularity that divides the alignment (otherwise the alignment itself)
 +    const char * env_chunk = getenv("GGML_CUDA_VMM_CHUNK_KIB");
-+    size_t chunk = (env_chunk ? (size_t) atoll(env_chunk) : 1024) << 10;
++    size_t chunk = env_chunk ? (size_t) atoll(env_chunk) << 10 : align;
 +    if (gran_min > 0) {
 +        chunk = gran_min * std::max<size_t>(1, (chunk + gran_min - 1) / gran_min);
 +    }
@@ -741,7 +743,7 @@ index 043511b72..65ed72d61 100644
  static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
      return 128;
  
-@@ -5811,6 +6243,41 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -5811,6 +6245,41 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -840,7 +842,7 @@ index 720b45140..ebbd81517 100644
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fa115ffe4..d1e6955be 100644
+index fa115ffe4..944749e38 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,7 +9,7 @@
@@ -1022,9 +1024,9 @@ index fa115ffe4..d1e6955be 100644
 +    }
 +
 +    // put the flex layers back, in reverse order, while the budget allows (weights + K/V at the current size);
-+    // the budget is first cut to what the device really has free
++    // the budget is first set to what the device really has free (both ways: the freed memory is back by now)
 +    if (rule && (shrunk || used == 0) && model.flex_next(true) >= 0) {
-+        zones_clamp();
++        zones_clamp(true);
 +        for (int il = model.flex_next(true); il >= 0; il = model.flex_next(true)) {
 +            const int64_t cost = (int64_t) (model.flex_layer_bytes(il) + (model.flex_whole(il) ? kv->layer_bytes(il) : 0));
 +            if (cost > zones_headroom) {
@@ -1101,7 +1103,7 @@ index fa115ffe4..d1e6955be 100644
 +    return nullptr;
 +}
 +
-+size_t llama_context::zones_clamp() {
++size_t llama_context::zones_clamp(bool up) {
 +    ggml_backend_dev_t dev = zones_dev();
 +    if (!dev) {
 +        return 0;
@@ -1109,7 +1111,7 @@ index fa115ffe4..d1e6955be 100644
 +    size_t dev_free = 0, dev_total = 0;
 +    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 +    const int64_t real = (int64_t) dev_free - (int64_t) zones_vram_margin;
-+    if (real < zones_headroom && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
++    if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
 +        LLAMA_LOG_INFO("%s: zones: budget %.0f -> %.0f MiB (measured free %.0f MiB, margin %.0f MiB)\n", __func__,
 +            zones_headroom / 1048576.0, real / 1048576.0, dev_free / 1048576.0, zones_vram_margin / 1048576.0);
 +        zones_headroom = real;
@@ -1283,7 +1285,7 @@ index fa115ffe4..d1e6955be 100644
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 95b722628..aab6223fb 100644
+index 95b722628..5dd4960d1 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -356,6 +356,51 @@ private:
@@ -1329,8 +1331,8 @@ index 95b722628..aab6223fb 100644
 +    bool     zones_fa_logged   = false;
 +
 +    // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
-+    // runtime holds back, are not booked); returns the measured free bytes
-+    size_t   zones_clamp();
++    // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
++    size_t   zones_clamp(bool up = false);
 +    // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
 +    void     zones_log_state(const char * what);
 +    ggml_backend_dev_t zones_dev() const; // the device the budget is for

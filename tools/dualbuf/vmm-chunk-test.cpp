@@ -180,11 +180,13 @@ int main() {
         a.subs.push_back({ 4*MiB, 2*MiB });
         printf("old scheme (4 MiB first, then 2 MiB): set access %s\n", clr_set_access_ok(a, 2*MiB) ? "ok" : "hipErrorInvalidValue");
     }
-    CHECK(pick_chunk(1024, 4*KiB, 2*MiB) == 1*MiB, "default chunk");
+    CHECK(pick_chunk(2048, 4*KiB, 2*MiB) == 2*MiB, "default chunk (the alignment)");
+    CHECK(pick_chunk(1024, 4*KiB, 2*MiB) == 1*MiB, "1 MiB chunk");
     CHECK(pick_chunk(512, 4*KiB, 2*MiB) == 512*KiB, "512 KiB chunk");
     CHECK(pick_chunk(3000, 4*KiB, 2*MiB) == 2*MiB, "a chunk that does not divide the alignment");
     CHECK(pick_chunk(1024, 2*MiB, 2*MiB) == 2*MiB, "minimum granularity 2 MiB");
-    CHECK(vmm_step(1*MiB, 1*KiB, 32768) == 1024, "qwen3-coder:30b step");
+    CHECK(vmm_step(2*MiB, 1*KiB, 32768) == 2048, "qwen3-coder:30b step with the default chunk (the 2 MiB alignment)");
+    CHECK(vmm_step(1*MiB, 1*KiB, 32768) == 1024, "qwen3-coder:30b step with GGML_CUDA_VMM_CHUNK_KIB=1024");
     CHECK(vmm_step(1*MiB, 3*KiB, 32768) == 256, "3 KiB rows: 341 cells -> 256");
     CHECK(vmm_step(1*MiB, 8*KiB, 32768) == 256, "8 KiB rows: 128 cells -> at least 256 (two chunks a step)");
     CHECK(vmm_step(2*MiB, 512, 32768) == 4096, "512 B rows, 2 MiB chunk");
