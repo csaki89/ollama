@@ -82,8 +82,9 @@ const (
 )
 
 const (
-	llamaArgFitTargetEnv = "LLAMA_ARG_FIT_TARGET"
-	bytesPerMiB          = 1 << 20
+	llamaArgFitTargetEnv         = "LLAMA_ARG_FIT_TARGET"
+	llamaArgZonesMarginMMProjEnv = "LLAMA_ARG_ZONES_MARGIN_MMPROJ"
+	bytesPerMiB                  = 1 << 20
 
 	// mmprojOffloadHeadroom leaves 1 GiB for backend buffers beyond projector weights.
 	mmprojOffloadHeadroom = 1 << 30
@@ -718,6 +719,7 @@ func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
 
 		envs := cloneStringMap(launch.extraEnvs)
 		envs[llamaArgFitTargetEnv] = strconv.FormatUint(existingTarget+pad, 10)
+		setZonesMarginMMProj(envs, launch.mmprojMemory)
 		return envs
 	}
 
@@ -729,7 +731,15 @@ func (launch llamaServerLaunchConfig) extraEnvsForStart() map[string]string {
 
 	envs := cloneStringMap(launch.extraEnvs)
 	envs[llamaArgFitTargetEnv] = strconv.FormatUint(pad, 10)
+	setZonesMarginMMProj(envs, launch.mmprojMemory)
 	return envs
+}
+
+// setZonesMarginMMProj tells the dual-buffer zones which part of the fit target the
+// projector weights are: the projector is loaded after the context, by the time the
+// zones measure the free memory it is already on the device.
+func setZonesMarginMMProj(envs map[string]string, mmprojMemory uint64) {
+	envs[llamaArgZonesMarginMMProjEnv] = strconv.FormatUint((mmprojMemory+bytesPerMiB-1)/bytesPerMiB, 10)
 }
 
 func (launch llamaServerLaunchConfig) mmprojFitTargetMiB() (uint64, bool) {
