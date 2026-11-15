@@ -1655,6 +1655,8 @@ func (s *Server) DeleteHandler(c *gin.Context) {
 		return
 	}
 
+	// dualbuf: the llamacpp:<hex> shadows of the converted children go with the model
+	children := manifest.ManifestListChildDigests(n)
 	removed, err := manifest.RemoveNamed(n)
 	if err != nil {
 		switch {
@@ -1664,6 +1666,13 @@ func (s *Server) DeleteHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
 		return
+	}
+	if len(children) > 0 {
+		shadowBlobs, err := manifest.RemoveOrphanRunnerShadows(children...)
+		if err != nil {
+			slog.Warn("could not remove converted manifest shadows", "model", n.DisplayShortest(), "error", err)
+		}
+		removed = append(removed, shadowBlobs...)
 	}
 	removeGGUFMetadata(removed...)
 }

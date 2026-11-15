@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/compatmigrate"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/mlx"
@@ -942,6 +943,14 @@ func narrowManifestListToLocal(data []byte) ([]byte, string, error) {
 }
 
 func PruneLayers() error {
+	// dualbuf: the sources of local compat migrations and the converted
+	// manifest shadows of removed models are dropped first, so their blobs
+	// are unreferenced below
+	compatmigrate.CleanupMigratedSources()
+	if _, err := manifest.RemoveOrphanRunnerShadows(); err != nil {
+		slog.Warn("could not remove orphan converted manifest shadows", "error", err)
+	}
+
 	var candidates []string
 	p, err := manifest.BlobsPath("")
 	if err != nil {

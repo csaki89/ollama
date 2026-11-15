@@ -44,6 +44,12 @@ func TestEnsureLocalCompatibilityMigrationAppendsToExistingManifestList(t *testi
 	})
 	wrapSourceManifestAsList(t, source)
 
+	sourceManifest, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerGGML)
+	if err != nil {
+		t.Fatalf("ParseNamedManifestForRunner(ggml) error = %v", err)
+	}
+	sourceChildren := manifest.ManifestListChildDigests(source)
+
 	migrated, err := EnsureLocalCompatibilityMigration(source)
 	if err != nil {
 		t.Fatalf("EnsureLocalCompatibilityMigration() error = %v", err)
@@ -63,14 +69,30 @@ func TestEnsureLocalCompatibilityMigrationAppendsToExistingManifestList(t *testi
 	if parent.MediaType != manifest.MediaTypeManifestList {
 		t.Fatalf("expected manifest list, got %q", parent.MediaType)
 	}
-	if len(parent.Manifests) != 2 {
-		t.Fatalf("expected two child manifests, got %d", len(parent.Manifests))
+	// dualbuf: the converted child replaces the source, whose GGUF blob is removed
+	if len(parent.Manifests) != 1 {
+		t.Fatalf("expected one child manifest, got %d", len(parent.Manifests))
 	}
-	if _, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerGGML); err != nil {
-		t.Fatalf("expected ggml child to resolve: %v", err)
+	if _, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerGGML); err == nil {
+		t.Fatal("expected the ggml child to be gone")
 	}
-	if _, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerLlamaCPP); err != nil {
+	converted, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerLlamaCPP)
+	if err != nil {
 		t.Fatalf("expected llamacpp child to resolve: %v", err)
+	}
+	shared := map[string]bool{}
+	for _, layer := range converted.Layers {
+		shared[layer.Digest] = true
+	}
+	for _, layer := range sourceManifest.Layers {
+		if !shared[layer.Digest] && blobExists(layer.Digest) {
+			t.Fatalf("expected the source blob %s to be removed", layer.Digest)
+		}
+	}
+	for _, digest := range sourceChildren {
+		if blobExists(digest) {
+			t.Fatalf("expected the source child manifest blob %s to be removed", digest)
+		}
 	}
 
 	migratedAgain, err := EnsureLocalCompatibilityMigration(source)
@@ -1443,5 +1465,62 @@ func TestEnsureLocalCompatibilityMigrationRepairsDanglingV2Entry(t *testing.T) {
 	}
 	if _, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerLlamaCPP); err != nil {
 		t.Fatalf("expected repaired llamacpp child to resolve: %v", err)
+	}
+}
+
+// dualbuf: removing a migrated model also removes its llamacpp:<hex> shadow
+// and the converted blobs the shadow kept.
+func TestRemovedMigratedModelDropsConvertedShadow(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	registerTestCompatMigrator(t)
+
+	source := model.ParseName("registry.ollama.ai/library/testcompat:latest")
+	writeSourceManifest(t, source, sourceManifestInput{
+		config: model.ConfigV2{
+			ModelFormat:   "gguf",
+			ModelFamily:   "testcompat",
+			ModelFamilies: []string{"testcompat"},
+		},
+		modelKV: outKV{
+			"general.architecture":  "testcompat",
+			"tokenizer.ggml.tokens": []string{"x"},
+		},
+		modelTensors: []*outTensor{
+			fixtureTensor("token_embd.weight", gguf.TensorTypeF16, []uint64{1, 8}),
+		},
+	})
+	if migrated, err := EnsureLocalCompatibilityMigration(source); err != nil || !migrated {
+		t.Fatalf("EnsureLocalCompatibilityMigration() = %v, %v", migrated, err)
+	}
+
+	converted, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerLlamaCPP)
+	if err != nil {
+		t.Fatalf("ParseNamedManifestForRunner(llamacpp) error = %v", err)
+	}
+	children := manifest.ManifestListChildDigests(source)
+	if len(children) != 1 {
+		t.Fatalf("expected one child digest, got %d", len(children))
+	}
+	shadow, err := convertedLegacyShadowName(children[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.ReadManifestData(shadow); err != nil {
+		t.Fatalf("expected the converted shadow to exist: %v", err)
+	}
+
+	if _, err := manifest.RemoveNamed(source); err != nil {
+		t.Fatalf("RemoveNamed() error = %v", err)
+	}
+	if _, err := manifest.RemoveOrphanRunnerShadows(children...); err != nil {
+		t.Fatalf("RemoveOrphanRunnerShadows() error = %v", err)
+	}
+	if _, err := manifest.ReadManifestData(shadow); err == nil {
+		t.Fatal("expected the converted shadow to be removed")
+	}
+	for _, layer := range converted.Layers {
+		if blobExists(layer.Digest) {
+			t.Fatalf("expected converted blob %s to be removed", layer.Digest)
+		}
 	}
 }

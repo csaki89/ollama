@@ -237,7 +237,10 @@ func EnsureLocalCompatibilityMigration(name model.Name) (bool, error) {
 	}
 
 	refs = append(refs, convertedRef)
-	return writeCompatibilityManifestList(name, source, refs)
+	// dualbuf: the converted child replaces the source (see cleanup.go); upstream
+	// kept both and a legacy anchor: writeCompatibilityManifestList(name, source, refs)
+	src.Close() // the source files are removed below (Windows cannot remove an open file)
+	return replaceSourceWithConverted(name, source, refs)
 }
 
 // unsupportedSourceLayer reports a source layer type the conversion would

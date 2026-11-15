@@ -87,15 +87,18 @@ func loadSourceModelFromManifest(source model.Name, mf *manifest.Manifest) (*Sou
 	return src, nil
 }
 
+// Close can be called more than once (dualbuf: before the source blobs go).
 func (src *SourceModel) Close() error {
 	var err error
 	if src.GGUF != nil {
 		err = src.GGUF.Close()
+		src.GGUF = nil
 	}
 	if src.ProjectorGGUF != nil {
 		if closeErr := src.ProjectorGGUF.Close(); err == nil {
 			err = closeErr
 		}
+		src.ProjectorGGUF = nil
 	}
 	return err
 }
