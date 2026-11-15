@@ -1668,7 +1668,7 @@ func (s *Server) DeleteHandler(c *gin.Context) {
 		return
 	}
 	if len(children) > 0 {
-		shadowBlobs, err := manifest.RemoveOrphanRunnerShadows(children...)
+		shadowBlobs, err := manifest.RemoveOrphanRunnerShadows(0, children...)
 		if err != nil {
 			slog.Warn("could not remove converted manifest shadows", "model", n.DisplayShortest(), "error", err)
 		}
@@ -2393,6 +2393,8 @@ func Serve(ln net.Listener) error {
 	if err := fixBlobs(blobsDir); err != nil {
 		return err
 	}
+
+	cleanupCompatMigrations()
 
 	if !envconfig.NoPrune() {
 		if _, err := manifest.Manifests(false); err != nil {

@@ -3,6 +3,7 @@ package manifest
 import (
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/types/model"
 )
@@ -41,8 +42,9 @@ func ManifestListChildDigests(n model.Name) []string {
 // RemoveOrphanRunnerShadows removes the llamacpp:<hex> tags whose child no
 // manifest list references, and the blobs only they kept. With digests, only
 // the tags of those children (a removed model); without, every orphan (at
-// startup, when no migration is writing one).
-func RemoveOrphanRunnerShadows(digests ...string) ([]string, error) {
+// startup). A tag younger than minAge stays (a migration may still be writing
+// its manifest list).
+func RemoveOrphanRunnerShadows(minAge time.Duration, digests ...string) ([]string, error) {
 	refs, err := namedManifestRefs(true)
 	if err != nil {
 		return nil, err
@@ -52,12 +54,14 @@ func RemoveOrphanRunnerShadows(digests ...string) ([]string, error) {
 	listed := make(map[string]struct{})
 	shadows := make(map[model.Name]string)
 	for n, ref := range refs {
-		data, _, digest, err := readVerifiedManifest(ref.path, ref.root)
+		data, fi, digest, err := readVerifiedManifest(ref.path, ref.root)
 		if err != nil {
 			continue
 		}
 		if IsRunnerShadow(n, digest) {
-			shadows[n] = hexOf(digest)
+			if minAge <= 0 || time.Since(fi.ModTime()) >= minAge {
+				shadows[n] = hexOf(digest)
+			}
 			continue
 		}
 		m, err := parseManifest(data)

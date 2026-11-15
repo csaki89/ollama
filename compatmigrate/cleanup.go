@@ -38,7 +38,7 @@ func replaceSourceWithConverted(name model.Name, source *manifest.Manifest, refs
 	return true, nil
 }
 
-func removeSourceBlobs(name model.Name, sources []*manifest.Manifest, manifestDigests []string) {
+func removeSourceBlobs(name model.Name, sources []*manifest.Manifest, manifestDigests []string) []string {
 	candidates := append([]string{}, manifestDigests...)
 	for _, m := range sources {
 		if m.Config.Digest != "" {
@@ -53,39 +53,44 @@ func removeSourceBlobs(name model.Name, sources []*manifest.Manifest, manifestDi
 		slog.Warn("could not remove the source blobs of the local compat migration", "model", name.DisplayShortest(), "error", err)
 	}
 	slog.Info("removed the source blobs of the local compat migration", "model", name.DisplayShortest(), "blobs", len(removed))
+	return removed
 }
 
 // CleanupMigratedSources applies the same to the models an older build
 // migrated: a manifest list with a complete llamacpp child that has its
 // llamacpp:<hex> shadow (written only by the local migration) drops its ggml
-// GGUF children. Run at startup, before the blob prune.
-func CleanupMigratedSources() {
+// GGUF children. Run at startup; returns the removed blob digests.
+func CleanupMigratedSources() []string {
 	ms, err := manifest.Manifests(true)
 	if err != nil {
 		slog.Warn("could not list manifests for the compat migration cleanup", "error", err)
-		return
+		return nil
 	}
+	var removed []string
 	for name, mf := range ms {
 		if manifest.IsRunnerShadow(name, mf.Digest()) {
 			continue
 		}
-		if err := cleanupMigratedSource(name); err != nil {
+		blobs, err := cleanupMigratedSource(name)
+		if err != nil {
 			slog.Warn("compat migration cleanup failed", "model", name.DisplayShortest(), "error", err)
 		}
+		removed = append(removed, blobs...)
 	}
+	return removed
 }
 
-func cleanupMigratedSource(name model.Name) error {
+func cleanupMigratedSource(name model.Name) ([]string, error) {
 	unlock := lockCompatibilityMigration(name)
 	defer unlock()
 
 	data, err := manifest.ReadManifestData(name)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	var parent manifest.Manifest
 	if err := json.Unmarshal(data, &parent); err != nil || parent.MediaType != manifest.MediaTypeManifestList {
-		return nil
+		return nil, nil
 	}
 
 	converted := false
@@ -113,12 +118,11 @@ func cleanupMigratedSource(name model.Name) error {
 		kept = append(kept, child)
 	}
 	if !converted || len(sources) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	if _, err := manifest.WriteManifestList(name, kept); err != nil {
-		return err
+		return nil, err
 	}
-	removeSourceBlobs(name, sources, sourceDigests)
-	return nil
+	return removeSourceBlobs(name, sources, sourceDigests), nil
 }

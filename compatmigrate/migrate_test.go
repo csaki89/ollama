@@ -1512,7 +1512,7 @@ func TestRemovedMigratedModelDropsConvertedShadow(t *testing.T) {
 	if _, err := manifest.RemoveNamed(source); err != nil {
 		t.Fatalf("RemoveNamed() error = %v", err)
 	}
-	if _, err := manifest.RemoveOrphanRunnerShadows(children...); err != nil {
+	if _, err := manifest.RemoveOrphanRunnerShadows(0, children...); err != nil {
 		t.Fatalf("RemoveOrphanRunnerShadows() error = %v", err)
 	}
 	if _, err := manifest.ReadManifestData(shadow); err == nil {
@@ -1522,5 +1522,66 @@ func TestRemovedMigratedModelDropsConvertedShadow(t *testing.T) {
 		if blobExists(layer.Digest) {
 			t.Fatalf("expected converted blob %s to be removed", layer.Digest)
 		}
+	}
+}
+
+// dualbuf: a list an older build wrote (source child and converted child with
+// its shadow) loses the source child at startup.
+func TestCleanupMigratedSourcesDropsSourceChild(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	registerTestCompatMigrator(t)
+
+	source := model.ParseName("registry.ollama.ai/library/testcompat:latest")
+	writeSourceManifest(t, source, sourceManifestInput{
+		config: model.ConfigV2{
+			ModelFormat:   "gguf",
+			ModelFamily:   "testcompat",
+			ModelFamilies: []string{"testcompat"},
+		},
+		modelKV: outKV{
+			"general.architecture":  "testcompat",
+			"tokenizer.ggml.tokens": []string{"x"},
+		},
+		modelTensors: []*outTensor{
+			fixtureTensor("token_embd.weight", gguf.TensorTypeF16, []uint64{1, 8}),
+		},
+	})
+	wrapSourceManifestAsList(t, source)
+	sourceManifest, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerGGML)
+	if err != nil {
+		t.Fatalf("ParseNamedManifestForRunner(ggml) error = %v", err)
+	}
+	if migrated, err := EnsureLocalCompatibilityMigration(source); err != nil || !migrated {
+		t.Fatalf("EnsureLocalCompatibilityMigration() = %v, %v", migrated, err)
+	}
+	converted := manifest.ManifestListChildDigests(source)
+
+	// the list as an older build left it
+	sourceRef, err := manifestReferenceForChild(sourceManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	convertedRef, err := manifest.NewManifestReference(converted[0], manifest.RunnerLlamaCPP, manifest.FormatGGUF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.WriteManifestList(source, []manifest.Manifest{sourceRef, convertedRef}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(manifest.ManifestListChildDigests(source)); n != 2 {
+		t.Fatalf("expected two children before the cleanup, got %d", n)
+	}
+
+	CleanupMigratedSources()
+
+	children := manifest.ManifestListChildDigests(source)
+	if len(children) != 1 || !manifest.SameDigest(children[0], converted[0]) {
+		t.Fatalf("expected only the converted child after the cleanup, got %v", children)
+	}
+	if blobExists(sourceRef.BlobDigest()) {
+		t.Fatal("expected the source child manifest blob to be removed")
+	}
+	if _, err := manifest.ParseNamedManifestForRunner(source, manifest.RunnerLlamaCPP); err != nil {
+		t.Fatalf("expected the converted child to resolve: %v", err)
 	}
 }

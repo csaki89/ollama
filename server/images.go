@@ -942,15 +942,21 @@ func narrowManifestListToLocal(data []byte) ([]byte, string, error) {
 	return out, warning, nil
 }
 
-func PruneLayers() error {
-	// dualbuf: the sources of local compat migrations and the converted
-	// manifest shadows of removed models are dropped first, so their blobs
-	// are unreferenced below
-	compatmigrate.CleanupMigratedSources()
-	if _, err := manifest.RemoveOrphanRunnerShadows(); err != nil {
+// cleanupCompatMigrations (dualbuf) drops the source children of local compat
+// migrations and the converted manifest shadows no model references, with
+// their blobs. Targeted, so it runs with OLLAMA_NOPRUNE too; a shadow younger
+// than the prune grace period is kept (a migration of a second instance on
+// the same store may still be writing its manifest list).
+func cleanupCompatMigrations() {
+	removed := compatmigrate.CleanupMigratedSources()
+	shadowBlobs, err := manifest.RemoveOrphanRunnerShadows(layerPruneGracePeriod)
+	if err != nil {
 		slog.Warn("could not remove orphan converted manifest shadows", "error", err)
 	}
+	removeGGUFMetadata(append(removed, shadowBlobs...)...)
+}
 
+func PruneLayers() error {
 	var candidates []string
 	p, err := manifest.BlobsPath("")
 	if err != nil {
