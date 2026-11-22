@@ -53,6 +53,10 @@ jobs:
       - name: Compute tags
         id: meta
         run: |
+          # the fork does not carry every upstream release tag (and pushing a v* tag to the fork would start the upstream
+          # release.yaml there), so read them from upstream: the version below is the binary version Ollama checks
+          # against "model requires ollama version ..." (read only, nothing is pushed)
+          git fetch --quiet --no-tags https://github.com/ollama/ollama.git '+refs/tags/v*:refs/tags/v*'
           ver="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
           ver="${ver#v}"
           sha="$(git rev-parse --short=7 HEAD)"
