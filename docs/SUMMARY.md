@@ -25,12 +25,12 @@
 Az Actionsből, `GITHUB_TOKEN`-nel feltöltött csomag **alapból privát**.
 - **Nyilvánossá tétel (ajánlott, a GitHub felületén kell megtenni):** GitHub → Packages → `ollama-dualbuf` → Package settings → Change visibility → Public. Utána a NAS bejelentkezés nélkül húzza: `docker pull ghcr.io/csaki89/ollama-dualbuf:<címke>`, a TrueNAS is tudja. Az image nem tartalmaz titkot (Ollama és llama.cpp, mindkettő MIT), a hátránya csak az, hogy bárki letöltheti.
 - **Privát marad:** a NAS shellben (root) `docker login ghcr.io -u csaki89`, jelszónak egy személyes hozzáférési token (classic, `read:packages` jogosultság). A token a NAS-on a Docker konfigurációs fájljában (`config.json`) tárolódik, lejárhat (akkor a frissítés/újratelepítés elhasal), és a TrueNAS rendszerfrissítése a bejelentkezést elveszítheti. Előny: az image nem nyilvános.
-A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; privátnál van token-kezelés. A compose-ban a címke rögzített, ne `latest` legyen.
+A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; privátnál van token-kezelés. A compose az ág mozgó címkéjét használja (DECISIONS 49), a `latest`-et a workflow nem frissíti; rögzítéshez és visszaálláshoz a fix `<verzió>-dualbuf-<commit>` címke való.
 
 ## Hogyan kell a NAS-on elindítani
 1. Push az origin-re (kifejezett kérésre), az Actions lefut; a `Compute tags` lépés kiírja a címkét (`0.40.2-dualbuf-<commit>`).
 2. Láthatóság beállítása vagy `docker login` (lásd fent).
-3. A `docker-compose.yaml` már a rögzített címkét tartalmazza (`0.40.2-dualbuf-81388ee`); újabb build esetén írd át a `Compute tags` lépés által kiírt címkére.
+3. A `docker-compose.yaml` az ág mozgó címkéjét tartalmazza (`dual-buffer-0.40.16`); újabb buildnél az appban kézzel kell pullt és újraindítást kérni (lásd a v0.40.16-os ellenőrzőlista 1. pontját).
 4. TrueNAS: Apps → Discover Apps → „Install via YAML” → a fájl tartalma, az app neve pl. `ollama-dualbuf`. A teszt a **30069**-es porton fut a mostani (30068) mellett, ugyanazt a `/mnt/nvme/ollama/models` mappát használja.
 5. Ellenőrzés: `docker logs ollama-dualbuf` (az `OLLAMA_DEBUG=1`-gyel bővebb) → `using llama-server for model`, `load_tensors: dual-buffer: N weights also stored in ROCm_Host (X MiB)`, `ROCm0 model buffer`, `CPU_REPACK model buffer`, `ROCm_Host model buffer`, és a `load_mode = none`. Ha `dual-buffer ... disabling it` figyelmeztetést látsz, az ok a sorban van (mmap, `--no-repack` vagy nincs host-puffer).
 
@@ -121,3 +121,14 @@ Ebből a checkoutból, egy paranccsal (minden futás külön folyamat, a végén
 docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
 ```
 Szűkítés: `-e SYNCS="barrier both" -e CASES="a c" -e RUNS=5 -e WAIT_MS=1`.
+
+## Ellenőrzés a NAS-on: v0.40.16 (`dual-buffer-0.40.16`)
+Zárójelben: melyik bizonytalan döntést ellenőrzi (DECISIONS 48 a–d). Visszaállás: a compose `image:` sorában `ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-11359f1`, majd pull és újraindítás.
+1. **Az image frissítése (minden új buildnél kézzel):** TrueNAS → Apps → `ollama-dualbuf` → Edit, a YAML-ban az új `docker-compose.yaml` (image: `ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`). A mozgó címkét a TrueNAS/Docker magától nem húzza újra (az alap pull-szabály csak hiányzó image-et húz), ezért az appnál kérj kézzel pullt (Apps → az app → „Pull Images”/Update, vagy a NAS shellben `docker pull ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`), utána indítsd újra az appot (Stop → Start). Ellenőrzés: `docker exec ollama-dualbuf ollama --version` → `0.40.16`; `docker image inspect ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16 --format '{{index .RepoDigests 0}} {{index .Config.Labels "org.opencontainers.image.version"}}'` a workflow által kiírt fix címkét mutatja.
+2. **Indul a mostani beállításokkal:** `docker logs ollama-dualbuf 2>&1 | grep -iE "gfx|rocm|error"`: a ROCm-eszköz látszik (gfx1030 a `HSA_OVERRIDE_GFX_VERSION=10.3.0`-val), a healthcheck `healthy`.
+3. **embeddinggemma-2:270m (a cél):** amíg a 0.40.2-es példány nem húz semmit (közös modellmappa): `curl -s http://<nas>:30069/api/pull -d '{"model":"embeddinggemma-2:270m"}'`, majd `curl -s http://<nas>:30069/api/embed -d '{"model":"embeddinggemma-2:270m","input":"hello world"}' | jq '.embeddings[0] | length'` → `768`. Összevetésül `qwen3-embedding:0.6b` → `1024`. A 0.40.2-es példány a modellt listázza, de nem futtatja (várható).
+4. **Dual-buffer és zónák egy modellbetöltésnél:** a naplóban `using llama-server for model`, `dual-buffer: N weights also stored in ROCm_Host`, `zones: flash attention ..., dynamic KV on`, `set_dynamic: ... layers in place (VMM)`; nincs `disabling it`, `fallback` vagy `GGML_LOG_ERROR`-sor (48 a, c).
+5. **`vmm-stress.sh`** (előtte a modelleket unload): `docker exec ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh` (gyors: `-e QUICK=1`); minden eset hibátlan, a VRAM visszajön (48 a).
+6. **`arch_test.sh`, `long_ctx.sh`** (a NAS-on lévő mérőscriptek, ebben a repóban nincsenek): hibátlan futás, a `long_ctx.sh` 118K-ig hibátlan átmenettel; a naplóban a `relayout: KV ...` és a `flex_move` sorok a 0.40.2-es futáshoz hasonlóak (48 c).
+7. **qwen3-coder:30b sebesség** a dokumentált értékekhez képest: rövid gen ~36–37 tok/s, 60K-n gen ~18,9 tok/s, 118K-ig hibátlan átmenet. A llama.cpp ~830 commitot lépett (HIP MMQ, flash attention), az eltérés mindkét irányba lehet; érdemi romlásnál a fix 0.40.2-es címkével ugyanaz a mérés (48 b).
+8. **Közös modellmappa:** a tesztek után a 0.40.2-es példány (30068) a saját modelljeit változatlanul listázza és futtatja; a 0.40.16 a 0.40.2-vel közös store-on fut, a két példány verziója már nem azonos (48 d).

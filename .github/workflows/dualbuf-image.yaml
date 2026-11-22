@@ -66,7 +66,10 @@ jobs:
           # same GOFLAGS as the upstream release workflow (binary version and release mode)
           echo GOFLAGS="'-ldflags=-w -s \"-X=github.com/ollama/ollama/version.Version=$ver\" \"-X=github.com/ollama/ollama/server.mode=release\"'" >> "$GITHUB_OUTPUT"
           echo "tag=$ver-dualbuf-$sha" >> "$GITHUB_OUTPUT"
-          echo "Image tag: $ver-dualbuf-$sha"
+          # moving tag per branch (the last build of the branch overwrites it); a docker tag is [A-Za-z0-9_.-], at most 128
+          branch="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-128)"
+          echo "branch_tag=$branch" >> "$GITHUB_OUTPUT"
+          echo "Image tags: $ver-dualbuf-$sha (fixed), $branch (moving)"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -97,6 +100,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # the image the moving branch tag points to before this build (empty for the first build of a branch), compared below
+      - name: Previous build of the branch
+        id: prev
+        run: |
+          ref="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.branch_tag }}"
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "previous $ref: ${digest:-none}"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -115,9 +127,11 @@ jobs:
           # layer cache (base, dependencies, Go modules) in the registry: the ROCm base does not fit the 10 GB Actions cache
           cache-from: ${{ !inputs.cold && format('type=registry,ref={0}:buildcache', steps.meta.outputs.image) || '' }}
           cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          # fixed (version-hash) tag and the moving branch tag; no :latest, so a build of an experimental branch does not
+          # overwrite a tag another branch (or the server) uses
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.branch_tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -166,12 +180,16 @@ jobs:
             test "$rc" -eq 2
           '
 
-      # what differs from the image pinned in docker-compose.yaml (file names; sizes of every rebuilt file differ anyway)
-      - name: Compare with the pinned image
+      # what differs from the previous build of the branch (file names; sizes of every rebuilt file differ anyway); the
+      # moving branch tag already points to this build here, so the reference is its digest from before the build
+      - name: Compare with the previous build of the branch
         continue-on-error: true
         run: |
           img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
-          ref="$(sed -n 's/^ *image: *//p' docker-compose.yaml | head -1)"
+          if [ -z "${{ steps.prev.outputs.digest }}" ]; then
+            echo "first build of ${{ steps.meta.outputs.branch_tag }}, nothing to compare"; exit 0
+          fi
+          ref="${{ steps.meta.outputs.image }}@${{ steps.prev.outputs.digest }}"
           echo "reference: $ref"
           docker pull -q "$ref"
           list() {

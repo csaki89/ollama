@@ -3,8 +3,11 @@
 # (that one stays on port 30068). Test API: http://<nas>:30069
 #
 # Before the first start:
-#  1. The image tag is pinned to the build of commit 11359f1 (workflow run 43662702303). For a newer build use the tag the "dualbuf-image" workflow printed
-#     (0.40.2-dualbuf-<7 char commit>). Do not use :latest, a restart could pull a different build.
+#  1. The image is the moving tag of the dual-buffer-0.40.16 branch: every "dualbuf-image" build of that branch overwrites it
+#     (Ollama 0.40.16, llama.cpp b12177). The default pull policy only pulls a missing image, so a restart alone keeps
+#     the build already on the NAS: for a newer build pull the image and restart the app by hand. Every build also has a
+#     fixed tag (<version>-dualbuf-<7 char commit>, printed by the workflow) to pin or roll back to; the last 0.40.2 build
+#     is 0.40.2-dualbuf-11359f1. The workflow no longer updates :latest.
 #  2. If the ghcr.io package is private, log in on the NAS first (see docs/SUMMARY.md).
 #
 # Shared model directory: this instance reads the SAME blobs/manifests as the running one.
@@ -15,7 +18,7 @@
 #    manifest, the blobs are shared. See docs/SUMMARY.md.
 services:
   ollama-dualbuf:
-    image: ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-11359f1
+    image: ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16
     container_name: ollama-dualbuf
     restart: unless-stopped
     ports:
