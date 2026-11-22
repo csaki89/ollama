@@ -7,7 +7,7 @@ See `AGENTS.md` for the shared agent instructions for this repository.
 ## Szabályok
 - Soha ne nyiss pull requestet, issue-t vagy kommentet, és ne tölts fel semmit az ollama/ollama repóba. Az `upstream` remote csak frissítések lehúzására való (a push URL `DISABLED`).
 - A gh alapértelmezett repója a saját fork (csaki89/ollama).
-- A munka a `dual-buffer` branchben folyik (a `v0.40.2` tagből indult), a `main` tiszta marad.
+- A munka a `dual-buffer` branchben folyik (a `v0.40.2` tagből indult), a `main` tiszta marad. A v0.40.16-ra frissítés a `dual-buffer-0.40.16` branchen (merge, DECISIONS 41-48).
 - A dual-buffer branchen a commitok előre jóvá vannak hagyva, nem kell egyenként rákérdezni. A commit üzenetet te írod: rövid, és tartalmazza: `Assisted-by: Claude`.
 - Push az originre (csaki89/ollama) csak kifejezett kérésre.
 - A `../llama-dualbuf` repó (csaki89/llama.cpp, dual-buffer branch) csak olvasható forrás: onnan olvasni, másolni szabad, módosítani, commitolni vagy pusholni nem.
@@ -29,8 +29,8 @@ A dual-buffer a csaki89/llama.cpp repó `dual-buffer` branchében kész és tesz
 - Igazolt: a `use_mmap: false` opció (kérésben vagy Modelfile-ban) split módban is `--load-mode none`-nal indítja a llama-servert.
 
 ## Hol van a llama.cpp ebben a repóban
-- A llama-server külön épül: `llama/server/CMakeLists.txt`, FetchContent-tel a rögzített llama.cpp forrásból (`LLAMA_CPP_VERSION`: b11351 a v0.40.2-ben).
-- Az Ollama-specifikus patchek: `llama/compat/` (pl. `001-llama-cpp-hooks.patch`, `002-clef.patch`).
+- A llama-server külön épül: `llama/server/CMakeLists.txt`, FetchContent-tel a rögzített llama.cpp forrásból (`LLAMA_CPP_VERSION`: b11351 a v0.40.2-ben, b12177 a v0.40.16-ban).
+- Az Ollama-specifikus patchek: `llama/compat/` (`001-llama-cpp-hooks.patch`; a `002-clef.patch` a v0.40.16-ban megszűnt), utánuk a fork `003-dual-buffer.patch` és `004-cpu-variants.patch` patche.
 - A Linux/ROCm image a `Dockerfile`-ban épül (`llama-server-rocm_v7_2` stage, `cmake -S llama/server --preset rocm_v7_2_linux`, ROCm 7.2.1 az `rocm/dev-almalinux-8` alapon).
 - Az ROCm image fordítása Linuxon/Dockerben történik, nem ezen a Windows gépen.
 

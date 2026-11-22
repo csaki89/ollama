@@ -7,7 +7,8 @@ name: dualbuf-image
 
 on:
   push:
-    branches: [dual-buffer]
+    # dual-buffer-0.40.16: the update to Ollama v0.40.16 (llama.cpp b12177), built before it replaces dual-buffer
+    branches: [dual-buffer, dual-buffer-0.40.16]
   workflow_dispatch:
     inputs:
       cold:
