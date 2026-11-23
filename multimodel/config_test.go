@@ -223,18 +223,25 @@ func TestLaunch(t *testing.T) {
 	if l.KVType != "f16" {
 		t.Fatalf("kv: %q", l.KVType)
 	}
+	if l.Env["LLAMA_ARG_ZONES_FLEX"] != "1" {
+		t.Fatalf("coder flex band: %+v", l.Env)
+	}
+	if nk := c.Resolve("x:y", nil, nil, map[string]any{"dynamic_kv": false}, nil).Launch(); nk.Env["LLAMA_ARG_AUTO_ZONES"] != "0" || nk.Env["LLAMA_ARG_ZONES_FLEX"] != "" {
+		t.Fatalf("no dynamic KV: %+v", nk.Env)
+	}
 	l = c.Resolve("qwen3-embedding:0.6b", nil, nil, nil, nil).Launch()
 	if l.Env["LLAMA_ARG_DUAL_BUFFER"] != "0" {
 		t.Fatalf("embedding dual: %+v", l.Env)
 	}
 	l = c.Resolve("zoff", nil, nil, nil, nil).Launch()
-	if l.Env["LLAMA_ARG_AUTO_ZONES"] != "0" || len(l.Notes) == 0 {
+	// zones: off keeps the dynamic KV (defaults: dynamic_kv true), without a flex band
+	if l.Env["LLAMA_ARG_AUTO_ZONES"] != "1" || l.Env["LLAMA_ARG_ZONES_FLEX"] != "0" || len(l.Notes) != 0 {
 		t.Fatalf("zones off: %+v", l)
 	}
 	if l.Parallel != 3 || l.KVType != "q8_0" || l.Args["-ub"][0] != "256" || l.Args["--flash-attn"][0] != "on" {
 		t.Fatalf("zoff launch: %+v", l)
 	}
-	if fp := l.Fingerprint(); fp != "LLAMA_ARG_AUTO_ZONES=0;LLAMA_ARG_DUAL_BUFFER=1;--flash-attn=on;-ub=256;np=3;kv=q8_0" {
+	if fp := l.Fingerprint(); fp != "LLAMA_ARG_AUTO_ZONES=1;LLAMA_ARG_DUAL_BUFFER=1;LLAMA_ARG_ZONES_FLEX=0;--flash-attn=on;-ub=256;np=3;kv=q8_0" {
 		t.Fatalf("fingerprint: %s", fp)
 	}
 	if m := c.ModelOptions("qwen3-vl:8b"); m["num_ctx"] != float64(16384) {

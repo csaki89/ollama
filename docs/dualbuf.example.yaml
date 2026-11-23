@@ -7,7 +7,7 @@
 
 defaults:
   dual_buffer: true      # LLAMA_ARG_DUAL_BUFFER
-  dynamic_kv: true       # with zones (default auto): LLAMA_ARG_AUTO_ZONES (they are one switch in the fork)
+  dynamic_kv: true       # LLAMA_ARG_AUTO_ZONES (the KV grows with the use)
   kv_type: f16           # OLLAMA_KV_CACHE_TYPE
   keep_alive: 30m        # OLLAMA_KEEP_ALIVE; -1 = forever (never fully unloaded for RAM)
 
@@ -22,7 +22,7 @@ models:
     devices: [x080, cpu]   # the first free device wins, for every request
     on_busy: wait          # wait for the first device up to wait_timeout, then go on
     wait_timeout: 120s
-    zones: auto            # auto | off (off also turns the dynamic KV off); the flex band size is computed
+    zones: auto            # auto | off (off: dynamic KV without a flex band, --no-zones-flex); the band size is computed
     max_context: 131072    # num_ctx
   qwen3-vl:8b:
     devices: [x080, cpu]
@@ -38,7 +38,7 @@ models:
 
 swap:
   enabled: true            # an idle model on the first device is parked to make room
-  keep_in_ram: pinned      # pinned: the parked model's file pages are locked in RAM (Linux, memlock); none
+  keep_in_ram: pinned      # pinned: in-process park (--park: pinned GPU-format copies, the swap is a DMA); none: process-level swap
   save_kv: true            # the parked model's KV is kept in RAM (tmpfs) and restored
   # kv_dir: /models/dualbuf-kv   # where kv_save writes (default <models>/dualbuf-kv)
 

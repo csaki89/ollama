@@ -21,9 +21,14 @@ func FromConfig(src string) bool {
 	return src != "" && src != SrcBuiltin && src != SrcEnv
 }
 
-// AutoZones is the effective --auto-zones switch: the dynamic KV and the flex band come together in the
-// fork (the band is only made with a dynamic KV), so zones: off also turns the dynamic KV off.
+// AutoZones is the effective --auto-zones switch (the dynamic KV); zones: off keeps it without a flex band
+// (--no-zones-flex). The flex band needs the dynamic KV: with dynamic_kv false there is none.
 func (e Effective) AutoZones() bool {
+	return e.DynamicKV.V
+}
+
+// FlexBand reports whether the flex band is made (zones: auto with the dynamic KV).
+func (e Effective) FlexBand() bool {
 	return e.DynamicKV.V && e.Zones.V != ZonesOff
 }
 
@@ -35,8 +40,10 @@ func (e Effective) Launch() Launch {
 	}
 	if FromConfig(e.DynamicKV.Src) || FromConfig(e.Zones.Src) {
 		l.Env["LLAMA_ARG_AUTO_ZONES"] = boolEnv(e.AutoZones())
-		if e.DynamicKV.V && e.Zones.V == ZonesOff {
-			l.Notes = append(l.Notes, "zones: off turns the dynamic KV off as well (they are one switch, --auto-zones)")
+		if e.DynamicKV.V {
+			l.Env["LLAMA_ARG_ZONES_FLEX"] = boolEnv(e.FlexBand())
+		} else if e.Zones.V == ZonesAuto && FromConfig(e.Zones.Src) {
+			l.Notes = append(l.Notes, "zones: auto needs dynamic_kv: true, no flex band")
 		}
 	}
 	if FromConfig(e.KVType.Src) {
