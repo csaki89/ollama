@@ -74,7 +74,7 @@ Image: `ghcr.io/csaki89/ollama-dualbuf:multimodel` (a 2. kör első buildje: `0.
 4. **VRAM a park után (a parkoló folyamat maradéka):** a `park: parked:` sor `sysfs G -> H` értéke és `cat /sys/class/drm/card*/device/mem_info_vram_used` a park előtt és után. Várt: a felszabadulás ≈ súlyok + KV + compute; a maradék (a HIP-kontextus, rocBLAS-munkaterület) néhány száz MiB. Ezt az értéket írd vissza (`OPEN-QUESTIONS.md` 1.).
 5. **Összevetés a folyamatszintű cserével:** ugyanez `keep_in_ram: none`-nal (folyamat újraindítás, a fájl a page cache-ből) – várt 6–12 s; és a 30069-es (`dual-buffer-0.40.16`) példány hideg betöltésével.
 6. **Parkolt modell a CPU-n:** amíg a coder parkol és a vl generál az X080-on, egy `qwen3-coder:30b` kérés `on_busy: next`-tel: `dualbuf: the CPU request runs on the parked instance` (nincs új `-ngl 0`-s folyamat, nincs unpark); a válasz értelmes (a parkolt modell a pinned példányokból a CPU-n számol, lassú).
-7. **Projektor:** a qwen3-vl:8b parkolásakor a projektor VRAM-ja a helyén marad (`OPEN-QUESTIONS.md` 2.); a `sysfs` különbség ennyivel kisebb.
+7. **Projektor:** a qwen3-vl:8b parkolásakor a llama-server naplójában `park: the projector is on the CPU now (N ms)`, unparkkor `... on the device now`; a sysfs-különbség a projektorral együtt a teljes foglalás. Parkolt állapotban egy képes kérés (`on_busy: next`) a CPU-n is működjön; unpark után a képes kérés válasza egyezzen a park előttivel.
 
 ## 11. Vulkan sparse KV a RX 550-en (10 perc)
 1. A `vulkaninfo` (0.4. pont) `sparseBinding`, `sparseResidencyBuffer` és a compute sorcsalád `QUEUE_SPARSE_BINDING_BIT`-je.

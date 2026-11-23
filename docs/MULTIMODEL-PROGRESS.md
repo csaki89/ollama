@@ -1,6 +1,24 @@
 # Többmodelles működés: haladás
 
-## Összefoglaló (reggelre)
+## Összefoglaló, 2. kör (folyamaton belüli csere, Vulkan sparse KV) — reggelre
+
+**Elkészült** (csaki89/llama.cpp `multimodel` 6b19b5a28 és csaki89/ollama `multimodel`, mindkettő pusholva; a patch 003 a llama.cpp-forrás diffje a b12177 + 001 fára):
+- **Folyamaton belüli GPU-csere (park/unpark)** a llama.cpp-ben: `--park` mellett minden GPU-s súlynak (az 1. zónáénak és a kimeneti rétegnek is) pinned, GPU-formájú példánya van; `POST /park` a folyamatot életben hagyva felszabadítja a súlyokat, a KV-t (a VMM/sparse arénákkal együtt) és a compute puffereket, a projektort a CPU-ra tölti; `POST /unpark` DMA-val visszatölt, a KV új növelhető szakaszokba kerül, a zónák a mért szabad memóriával újramérnek. Parkolt állapotban a modell a CPU-n kiszolgál; az első CPU-s kérés demote-ol (repack a pinned példányból, RAM-ellenőrzéssel), a repackelt példány a `POST /park/drop`-ig marad.
+- **Az Ollama ezt használja** (`keep_in_ram: pinned`): áldozatnál `POST /park`, a parkolt példány kérésénél unpark (előbb helyet csinál), a CPU-ra helyezett kérés a parkolt példányon fut. Folyamatszintű csere csak akkor, ha a pinned példányok nem fértek a RAM-keretbe (naplósor mindkét oldalon). RAM-hiánynál elsőként a demote-olt példányok mennek, a parkolt példányok a RAM-könyvelésben vannak, tartalék max(1 GiB, 5%).
+- **Vulkan dinamikus KV helyben növeléssel** (sparse binding, a VMM-interfész Vulkan-megvalósítása); tartalék csak hiányzó képességnél, a naplósor megnevezi.
+- **`zones` és `dynamic_kv` két kapcsoló** (`--no-zones-flex` / `LLAMA_ARG_ZONES_FLEX`).
+
+**Bizonyítottan működik** (laptop, Iris Xe; részletek: `test-results.md` „2. kör”):
+- llama-server: park/unpark 3× azonos kimenettel, a KV megmarad (`prompt_n=1`); flex sávval is; demote és drop; park 70–162 ms, unpark 0,19–0,53 s / 935 MiB.
+- Ollamán át: 8 csere, mind folyamaton belül (park 0,23–0,54 s, unpark 0,29–0,89 s), 2 llama-server folyamat összesen, azonos válaszok, a KV megmarad; a pinned példányok elutasításakor a folyamatszintű tartalék naplósorral; valódi RAM-hiánynál a parkolt modell LRU-kirakása; CPU-s kérés a parkolt példányon demote-tal.
+- Vulkan sparse KV: 28/28 réteg helyben nő (4096 → 24576) és zsugorodik, a felszabadított memória a meghajtó szerint visszajön (+490/560 MiB); a kimenet azonos a másolásos úttal.
+- CI: Go vet + `-race` tesztek zöldek; az image a park- és sparse-kóddal ROCm/HIP-re és Vulkanra fordul (`0.40.16-dualbuf-3ab2eb5`, majd a későbbi buildek).
+
+**Nyitva** (`OPEN-QUESTIONS.md`): a parkoló folyamat VRAM-maradéka diszkrét GPU-n (az iGPU-n nem mérhető tisztán); a rekurrens állapot (hibrid modellek) nem parkol; a projektor-park laptopon nem tesztelt (nincs vision modell); a 10 GB-os csereidő csak a NAS-on mérhető.
+
+**Reggeli NAS-sorrend** (`NAS-TESTS.md`): 0. előkészítés → 1. config nélkül azonos → 2. config/eszközök → **10. folyamaton belüli csere az X080-on** (a fő mérés: unpark-idő 10 GB-nál, cél ~1 s; VRAM-maradék sysfs-szel; összevetés `keep_in_ram: none`-nal és a hideg betöltéssel; parkolt modell a CPU-n; projektor) → **11. Vulkan sparse KV a RX 550-en** → 3. → 4. → 8. → 7. → 5. → 9.
+
+## Összefoglaló, 1. kör
 
 **Elkészült** (branch: `multimodel` a csaki89/ollama-ban, pusholva; a csaki89/llama.cpp `multimodel` branche helyben létrejött, de llama.cpp-módosítás nem kellett, ezért nincs rajta új commit és nincs pusholva):
 - Felderítés (`MULTIMODEL-RESEARCH.md`) és terv (`MULTIMODEL-DESIGN.md`): a logika az Ollama Go-ütemezője mellett, egy új `multimodel/` csomagban, vékony horgokkal; a llama-server router módja elvetve (indoklás a tervben).
@@ -46,8 +64,3 @@
 - Példa-config: `docs/dualbuf.example.yaml`; laptopos config és szkriptek: `tools/dualbuf/multimodel/`.
 - Image/compose: `Dockerfile` (`rocm-vulkan`, `EXTRA_APT_PACKAGES`, `LLAMA_SERVER_VULKAN_TARGETS`), `.github/workflows/dualbuf-image.yaml` (a `multimodel` ág, `[skip image]`), `.github/workflows/multimodel-ci.yaml`, `docker-compose.multimodel.yaml`.
 
-## 2. kör (folyamatban, a használati keret miatt megszakítva)
-- **Kész, laptopon mérve (llama-server, Iris Xe):** Vulkan sparse KV (28/28 réteg helyben nő és zsugorodik, 0 másolás; a meghajtó szerinti szabad memória +490 MiB / 560 MiB felszabadítás); folyamaton belüli park/unpark (3 kör, azonos kimenet, KV megmarad; park: súly 111–162 ms, unpark 189–384 ms / 935 MiB; flex sávval is azonos); `--no-zones-flex`; a RAM-védelem elutasítja a pinned példányokat, ha nem férnek el (naplósor). Forrás: csaki89/llama.cpp `multimodel` (a45647ddb, 79ba3cd13), szkriptek: `tools/dualbuf/park.sh`, `vk-sparse-grow.sh`.
-- **Patch 003 frissítve** (tiszta b12177 + 001 fán felmegy, 004 utána is).
-- **Ollama-horgok megírva, nem tesztelve:** `LLAMA_ARG_PARK`, folyamaton belüli park áldozatnál, unpark a kérésnél, CPU-kérés a parkolt példányon, `MAX_LOADED_MODELS` a parkoltakat nem számolja, RAM-tartalék. A CI-futás és a laptopos Ollama-teszt hátra van.
-- **Hátra:** a `zones`/`dynamic_kv` szétválasztása az Ollama-configban (`LLAMA_ARG_ZONES_FLEX`), NAS-TESTS kiegészítése (X080 csereidő, RX 550 sparse), a parkolt példány VRAM-maradéka diszkrét GPU-n, a projektor (mmproj) és a rekurrens állapot parkolása (ma a helyén marad) → OPEN-QUESTIONS.

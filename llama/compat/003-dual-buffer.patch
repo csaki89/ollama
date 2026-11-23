@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel 608b8393b): Vulkan sparse growable KV buffers, --no-zones-flex, --park / POST /park, /unpark, /park/drop (in-process park, demote while parked).
+multimodel (csaki89/llama.cpp multimodel 6b19b5a28): Vulkan sparse growable KV buffers, --no-zones-flex, --park / POST /park, /unpark, /park/drop (in-process park, demote while parked, the projector on the CPU while parked).
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 977c3ab..dd5fafa 100644
@@ -5276,7 +5276,7 @@ index e6768ca..35841dd 100644
  
      struct impl;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5f7e67b..225f921 100644
+index 5f7e67b..a36ce48 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -330,6 +330,7 @@ struct server_slot {
@@ -5287,7 +5287,17 @@ index 5f7e67b..225f921 100644
  
      stop_type stop;
  
-@@ -1287,6 +1288,9 @@ private:
+@@ -1027,6 +1028,9 @@ public:
+ 
+     mtmd_context * mctx = nullptr;
+     mtmd_helper_cap mtmd_cap = {};
++    // dual-buffer fork, llama_park: the projector parameters, to load it again on the CPU (parked) or the device (unparked)
++    mtmd_context_params mparams_park = {};
++    bool                mparams_park_set = false;
+     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+     const llama_vocab * vocab = nullptr;
+@@ -1287,6 +1291,9 @@ private:
                              if (i < params_base.fit_params_target.size()) {
                                  SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                  params_base.fit_params_target[i] += size;
@@ -5297,7 +5307,19 @@ index 5f7e67b..225f921 100644
                              }
                              break;
                          }
-@@ -3178,6 +3182,33 @@ private:
+@@ -1397,6 +1404,11 @@ private:
+                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                 return false;
+             }
++            mparams_park = mparams;
++            mparams_park.progress_callback           = nullptr; // its user data is a local of this function
++            mparams_park.progress_callback_user_data = nullptr;
++            mparams_park.warmup                      = false;
++            mparams_park_set = true;
+             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+ 
+             init_opt.video_params.fps_target = params_base.video_fps;
+@@ -3178,6 +3190,61 @@ private:
                  {
                      // do nothing
                  } break;
@@ -5321,8 +5343,36 @@ index 5f7e67b..225f921 100644
 +                        res->success = true;
 +                        res->demoted = llama_park_drop_demoted(ctx_tgt);
 +                    } else {
-+                        res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
++                        const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
++                        res->success = llama_park(ctx_tgt, to_park);
 +                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
++                        // the projector on the device: loaded again on the CPU while parked, back on the device after
++                        if (res->success && mctx && mparams_park_set && mparams_park.use_gpu) {
++                            mtmd_context_params p = mparams_park;
++                            p.use_gpu = !to_park;
++                            const int64_t t_mm = ggml_time_us();
++                            mtmd_context * nctx = nullptr;
++                            if (to_park) {
++                                nctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
++                                if (nctx) {
++                                    mtmd_free(mctx);
++                                }
++                            } else {
++                                mtmd_free(mctx);
++                                mctx = nullptr;
++                                nctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
++                            }
++                            if (nctx) {
++                                mctx = nctx;
++                                for (auto & slot : slots) {
++                                    slot.mctx = mctx;
++                                }
++                                SRV_INF("park: the projector is on the %s now (%.1f ms)\n", to_park ? "CPU" : "device", (ggml_time_us() - t_mm) / 1000.0);
++                            } else {
++                                SRV_ERR("park: loading the projector on the %s failed%s\n", to_park ? "CPU" : "device", to_park ? ", it stays on the device" : "");
++                                res->success = to_park; // without a projector after an unpark the media requests fail
++                            }
++                        }
 +                    }
 +                    res->parked  = llama_is_parked(ctx_tgt);
 +                    res->t_ms    = (ggml_time_us() - t0) / 1000.0;
@@ -5331,7 +5381,7 @@ index 5f7e67b..225f921 100644
              case SERVER_TASK_TYPE_METRICS:
                  {
                      int n_processing_slots = 0;
-@@ -4341,6 +4372,7 @@ private:
+@@ -4341,6 +4408,7 @@ private:
                          metrics.add_prompt_cached(n_past);
  
                          slot.prompt.tokens.keep_first(n_past);
@@ -5339,7 +5389,7 @@ index 5f7e67b..225f921 100644
  
                          // this is to signal the client that the request has started processing
                          if (slot.task->params.stream) {
-@@ -4372,6 +4404,12 @@ private:
+@@ -4372,6 +4440,12 @@ private:
  
                      slot.mem.seq_rm(slot.id, p0, -1);
  
@@ -5352,7 +5402,7 @@ index 5f7e67b..225f921 100644
                      // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                      bool wait_shared = false;
                      if (slot.task->n_tokens_shared > 0) {
-@@ -5858,6 +5896,33 @@ void server_routes::init_routes() {
+@@ -5858,6 +5932,33 @@ void server_routes::init_routes() {
          return res;
      };
  

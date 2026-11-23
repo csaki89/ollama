@@ -88,3 +88,26 @@ Nem tesztelt a laptopon: a VRAM-hiány miatti csere (az iGPU szabad memóriája 
 - Dinamikus KV: `set_dynamic: dynamic KV: 4096 -> 8192 cells ... 28 by copy`, a promptnál `relayout: KV 4096 -> 8192 cells (... 28 new by copy) 160.4 ms: alloc 119.7, copy 36.3, free 4.0`, `zones_state ... KV 8192 cells (224 MiB on the device)`. Válasz: „The color of the frog is green.”
 - Ugyanez a kérés `options.dynamic_kv: false`-szal: a naplósor `dynamic_kv=false(request)`, az ujjlenyomat eltér, újratöltés; az új folyamatban nincs `auto zones`/`set_dynamic` sor (statikus KV). Válasz: ugyanaz.
 - Következtetés: a dinamikus KV Vulkanon a másolásos úton működik (a helyben növelés, VMM/sparse, csak CUDA/HIP-en van).
+
+# Többmodelles munka, 2. kör: Vulkan sparse KV és folyamaton belüli csere (laptop, 2026-11-23)
+
+## Vulkan sparse KV (llama-server közvetlenül; csaki89/llama.cpp `multimodel`, Iris Xe)
+qwen2.5-1.5B Q4_K_M, `--auto-zones -fa on --load-mode none`; szkript: llama.cpp `tools/dualbuf/vk-sparse-grow.sh`.
+- `ggml_backend_vk_vmm_arena_new: Vulkan0: sparse KV buffers: block 65536, chunk 2097152 bytes`; `set_dynamic: ... growth on the device: 28/28 layers in place (VMM)`.
+- `-c 8192`, ~7000 tokenes prompt: `relayout: KV 4096 -> 8192 cells (... 28 grown in place, 0 new by copy ...) 171.7 ms`; új rövid kérés: `KV 8192 -> 4096 cells (... 28 shrunk in place ...) 32.9 ms`. A válasz azonos a `GGML_VK_SPARSE=0`-s (másolásos, `no growable (sparse) KV buffers: GGML_VK_SPARSE=0; the KV grows by copy`) futáséval.
+- `-c 32768`, ~20 000 tokenes prompt: 4096 → 24576 cella helyben (930 ms, 0 MiB másolva), vissza 4096-ra helyben (117 ms); a meghajtó szerinti szabad memória (`zones_state ... driver`) 5555 → 6045 MiB (a felszabadított 560 MiB-ból +490 MiB; az iGPU közös memóriáján más folyamatok is mozgatják).
+
+## Folyamaton belüli park/unpark (llama-server közvetlenül)
+Ugyanaz a modell, `--park`; szkriptek: llama.cpp `tools/dualbuf/park.sh`, `park-demote.sh`. A laptopon kevés a szabad RAM (577 MiB), a RAM-védelem ezért elsőre elutasította a pinned példányokat (`park: the pinned copies of the GPU weights (935 MiB) do not fit the free RAM (577 MiB, system ...), no in-process park`); a mérésekhez `LLAMA_DUAL_BUFFER_FREE_MIB=4096/6000`.
+- 3 kör oda-vissza: minden unpark után a válasz bájtra azonos a referenciával, a következő kérés `prompt_n=1` (a KV megmaradt). Parkolt állapotban a CPU-n kiszolgál.
+- Idők (935 MiB súly, 112 MiB KV): park súlyok 70–162 ms, K/V 88–197 ms, scheduler 17–45 ms; unpark súlyok 189–526 ms (1,9–5,2 GB/s), K/V 87–141 ms, scheduler 36–86 ms. A szabad memória a park után 6025 MiB (indulás 7384; a maradék ~1360 MiB-ban az iGPU közös heapjén a pinned példányok és a host-K/V is benne van, `OPEN-QUESTIONS.md` 1.).
+- Flex sávval (`--fit-target 6600`: 1. zóna 15 réteg, flex 11–13 kint): park/unpark 3×, a kimenet azonos, a kint lévő flex rétegek a helyükön maradnak.
+- Demote: parkolt állapotban az első CPU-s kérésnél `park: demoted 596.53 MiB (repacked ...) in 1795 ms`, unpark/park után megmarad, `POST /park/drop` felszabadítja (`dropped (596.53 MiB)`); minden unpark után azonos kimenet. A laptopon a repackelt és a pinned példány CPU-s generálási sebessége nem különíthető el (11–13 tok/s mindkettő, mérési zaj).
+
+## Az Ollamán át (`ollama.exe 0.40.16-mm-2f4d126`, a végleges patch 003-mal fordított llama-server, Vulkan iGPU)
+Config: `tools/dualbuf/multimodel/laptop-dualbuf.yaml` (`swap: { enabled: true, keep_in_ram: pinned }`), `OLLAMA_MAX_LOADED_MODELS=1`; szkript: `swap.sh` (A = qwen25:1.5b, B = qwen3:0.6b, kétszer).
+- `LLAMA_DUAL_BUFFER_FREE_MIB=6000 OLLAMA_DUALBUF_RAM_FREE_MIB=6000`: 8 csere, mindegyik folyamaton belül (`dualbuf: model parked in process ... duration=226–540ms`, `model unparked ... duration=292–892ms`), csak 2 llama-server folyamat indult az egész futás alatt, az első kiértékelés után minden ismételt prompt 1 tokenből (a KV megmaradt), a válaszok minden körben azonosak.
+- `LLAMA_DUAL_BUFFER_FREE_MIB=500` (a pinned példányok nem férnek el): `park: ... no in-process park` a llama-serverben, az Ollamában `dualbuf: no in-process park (...), the swap restarts the process`, a folyamatszintű csere fut (KV a RAM-ba és vissza: `KV restored from=ram`).
+- Valódi laptop-RAM (felülírás nélkül): az Ollama RAM-terve szűknek látta a RAM-ot, a parkolt modell (LRU) teljesen kirakódott (KV az NVMe-re), a következő kérésnél visszatöltődött (`KV restored from=disk`).
+- Parkolt modell CPU-s kérése: az igpu foglalt (qwen3 generál), a qwen25-kérés `on_busy: wait 3s` után `device=cpu reason=next`, `dualbuf: the CPU request runs on the parked instance`, demote (597 MiB, 1,7 s), helyes válasz; nincs új `-ngl 0`-s folyamat (összesen 2 llama-server).
+- Javított hiba a mérés közben: a parkolt példány RAM-áldozatként busy-loopot okozott (az ütemező a parkoltakat a betöltött-számlálóból is kivonta); most csak a `MAX_LOADED_MODELS`-összevetésből maradnak ki.
