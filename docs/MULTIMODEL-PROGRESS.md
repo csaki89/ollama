@@ -12,7 +12,7 @@
 - llama-server: park/unpark 3× azonos kimenettel, a KV megmarad (`prompt_n=1`); flex sávval is; demote és drop; park 70–162 ms, unpark 0,19–0,53 s / 935 MiB.
 - Ollamán át: 8 csere, mind folyamaton belül (park 0,23–0,54 s, unpark 0,29–0,89 s), 2 llama-server folyamat összesen, azonos válaszok, a KV megmarad; a pinned példányok elutasításakor a folyamatszintű tartalék naplósorral; valódi RAM-hiánynál a parkolt modell LRU-kirakása; CPU-s kérés a parkolt példányon demote-tal.
 - Vulkan sparse KV: 28/28 réteg helyben nő (4096 → 24576) és zsugorodik, a felszabadított memória a meghajtó szerint visszajön (+490/560 MiB); a kimenet azonos a másolásos úttal.
-- CI: Go vet + `-race` tesztek zöldek; az image a park- és sparse-kóddal ROCm/HIP-re és Vulkanra fordul (`0.40.16-dualbuf-3ab2eb5`, majd a későbbi buildek).
+- CI: Go vet + `-race` tesztek zöldek; az image a park- és sparse-kóddal ROCm/HIP-re és Vulkanra fordul (a végleges kóddal: `ghcr.io/csaki89/ollama-dualbuf:0.40.16-dualbuf-e090dfc`, mozgó címke `:multimodel`).
 
 **Nyitva** (`OPEN-QUESTIONS.md`): a parkoló folyamat VRAM-maradéka diszkrét GPU-n (az iGPU-n nem mérhető tisztán); a rekurrens állapot (hibrid modellek) nem parkol; a projektor-park laptopon nem tesztelt (nincs vision modell); a 10 GB-os csereidő csak a NAS-on mérhető.
 
