@@ -291,6 +291,11 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 			kind = multimodel.KindCPUFallback
 		}
 		cands = append(cands, multimodel.Candidate{Key: r.modelKey, Model: r.modelPath, Kind: kind, LastUsed: time.Unix(0, r.dualbufLastUsed.Load()), Forever: forever, Bytes: host, Ref: r})
+		// the repacked (demoted) copies a parked model made for the CPU: freed first, the model stays
+		if d, ok := r.llama.(demoter); ok && d.DemotedBytes() > 0 {
+			cands = append(cands, multimodel.Candidate{Key: r.modelKey + "#demoted", Model: r.modelPath, Kind: multimodel.KindCPUFallback,
+				LastUsed: time.Unix(0, r.dualbufLastUsed.Load()), Bytes: d.DemotedBytes(), Ref: demotedCopies{r}})
+		}
 	}
 	plan := multimodel.PlanEvictions(ram, need, cands)
 	if len(plan) == 0 {
@@ -299,7 +304,16 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	slog.Info("dualbuf: RAM is short for the load, freeing", "model", dualbufModelName(req.model), "need", format.HumanBytes2(need),
 		"limit", format.HumanBytes2(ram.Limit), "used", format.HumanBytes2(ram.Used), "source", ram.Source, "candidates", len(plan))
 	for _, c := range plan {
-		if c.Kind == multimodel.KindParked {
+		if dc, ok := c.Ref.(demotedCopies); ok {
+			if d, ok := dc.r.llama.(demoter); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				freed, err := d.DropDemoted(ctx)
+				cancel()
+				slog.Info("dualbuf: demoted copies dropped for RAM", "model", c.Model, "freed", format.HumanBytes2(freed), "error", err)
+			}
+			continue
+		}
+		if c.Kind == multimodel.KindParked && c.Ref == nil {
 			s.dualbuf.Drop(c.Key)
 			continue
 		}
@@ -679,3 +693,12 @@ func (s *Scheduler) dualbufVictimExcept(req *LlmRequest, except *runnerRef) *run
 	}
 	return pick
 }
+
+// demoter: the repacked copies a parked instance made for its CPU runs (llama-server POST /park/drop frees them)
+type demoter interface {
+	DemotedBytes() uint64
+	DropDemoted(ctx context.Context) (uint64, error)
+}
+
+// demotedCopies is the eviction candidate of the demoted copies of a runner (dropped, the runner stays).
+type demotedCopies struct{ r *runnerRef }

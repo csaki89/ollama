@@ -201,15 +201,25 @@ func (s *llamaServerRunner) applyZonesStateLocked(buffers map[memoryBufferKey]me
 var (
 	parkCopiesRegex = regexp.MustCompile(`park: \d+ GPU weights in \d+ groups have a pinned GPU-format copy`)
 	parkNoRegex     = regexp.MustCompile(`park: .*no in-process park|park: --park requires`)
+	demotedRegex    = regexp.MustCompile(`park: demoted ([\d.]+) MiB`)
+	droppedRegex    = regexp.MustCompile(`park: the demoted \(repacked\) copies were dropped`)
 )
 
-// parseParkLocked notes from the load log whether the instance can park in process.
+// parseParkLocked notes from the log whether the instance can park in process, and the RAM of its demoted copies.
 func (s *llamaServerRunner) parseParkLocked(b []byte) {
 	if parkCopiesRegex.Match(b) {
 		s.dualbufPark.copies = true
 	}
 	if parkNoRegex.Match(b) {
 		s.dualbufPark.refused = true
+	}
+	if m := demotedRegex.FindSubmatch(b); m != nil {
+		if mib, err := strconv.ParseFloat(string(m[1]), 64); err == nil {
+			s.dualbufPark.demoted += uint64(mib * 1024 * 1024)
+		}
+	}
+	if droppedRegex.Match(b) {
+		s.dualbufPark.demoted = 0
 	}
 }
 
@@ -219,6 +229,39 @@ type dualbufParkState struct {
 	refused bool   // --park was asked, the copies did not fit
 	parked  bool   // POST /park succeeded, no /unpark since
 	vram    uint64 // the device memory before the park (to check the room for the unpark)
+	demoted uint64 // bytes of the repacked (demoted) copies the instance holds, from the last park/unpark/drop answer
+}
+
+// DemotedBytes is the RAM of the repacked copies the parked model made for the CPU (0: none).
+func (s *llamaServerRunner) DemotedBytes() uint64 {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.demoted
+}
+
+// DropDemoted frees the repacked copies (POST /park/drop); the parked model then computes from its pinned copies.
+func (s *llamaServerRunner) DropDemoted(ctx context.Context) (uint64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/park/drop", s.port), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var r struct {
+		Demoted uint64 `json:"demoted_bytes"`
+	}
+	_ = json.Unmarshal(data, &r)
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("park/drop: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	s.memoryMu.Lock()
+	s.dualbufPark.demoted = 0
+	s.memoryMu.Unlock()
+	return r.Demoted, nil
 }
 
 // CanPark reports whether the runner was loaded with park copies.
@@ -282,13 +325,15 @@ func (s *llamaServerRunner) parkAction(ctx context.Context, park bool) (time.Dur
 	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var r struct {
-		Success bool `json:"success"`
-		Parked  bool `json:"parked"`
+		Success bool   `json:"success"`
+		Parked  bool   `json:"parked"`
+		Demoted uint64 `json:"demoted_bytes"`
 	}
 	_ = json.Unmarshal(data, &r)
 	took := time.Since(start)
 	s.memoryMu.Lock()
 	s.dualbufPark.parked = r.Parked
+	s.dualbufPark.demoted = r.Demoted
 	if park && r.Parked {
 		s.dualbufPark.vram = vram
 	}

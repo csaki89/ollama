@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel 79ba3cd13): Vulkan sparse growable KV buffers, --no-zones-flex, --park / POST /park, /unpark (in-process park).
+multimodel (csaki89/llama.cpp multimodel 608b8393b): Vulkan sparse growable KV buffers, --no-zones-flex, --park / POST /park, /unpark, /park/drop (in-process park, demote while parked).
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 977c3ab..dd5fafa 100644
@@ -1995,7 +1995,7 @@ index b46cba3..611b3e9 100644
  }
  
 diff --git a/include/llama.h b/include/llama.h
-index 988b178..d85f151 100644
+index 988b178..1ad90e3 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -348,11 +348,28 @@ extern "C" {
@@ -2039,7 +2039,7 @@ index 988b178..d85f151 100644
          // Abort callback
          // if it returns true, execution of llama_decode() will be aborted
          // currently works only with CPU execution
-@@ -821,6 +843,18 @@ extern "C" {
+@@ -821,6 +843,22 @@ extern "C" {
      // Check if the memory supports shifting
      LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
  
@@ -2054,12 +2054,16 @@ index 988b178..d85f151 100644
 +    // Returns false if the model has no park copies or a step failed (an unpark that failed leaves the model parked).
 +    LLAMA_API bool llama_park(struct llama_context * ctx, bool park);
 +    LLAMA_API bool llama_is_parked(const struct llama_context * ctx);
++    // Parked, the first decode repacks the park copies for the CPU (a demote, if the RAM allows); the repacked copies stay
++    // (parked and unparked) until dropped here. Returns the bytes freed / held.
++    LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
++    LLAMA_API size_t llama_park_demoted_bytes(const struct llama_context * ctx);
 +
      //
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3eda87a..9d2792e 100644
+index 3eda87a..f428bbe 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,6 +9,12 @@
@@ -2733,7 +2737,23 @@ index 3eda87a..9d2792e 100644
  }
  
  void llama_context::synchronize() {
-@@ -2089,6 +2698,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2003,6 +2612,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         return encode(batch_inp);
+     }
+ 
++    // parked and running on the CPU: once per park, the park copies are repacked for the CPU (a demote, if the RAM allows)
++    if (parked && !park_demote_tried) {
++        park_demote_tried = true;
++        if (model.park_demote() > 0) {
++            sched_need_reserve = true;
++            gf_res_prev_active = nullptr;
++        }
++    }
++
+     if (batch_inp.tokens.empty()) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+@@ -2089,6 +2707,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -2770,7 +2790,7 @@ index 3eda87a..9d2792e 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -2097,8 +2736,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2097,8 +2745,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -2779,7 +2799,7 @@ index 3eda87a..9d2792e 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -4273,6 +4910,8 @@ llama_context_params llama_context_default_params() {
+@@ -4273,6 +4919,8 @@ llama_context_params llama_context_default_params() {
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.moe_cache_size              =*/ 0,
@@ -2788,7 +2808,7 @@ index 3eda87a..9d2792e 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4758,6 +5397,115 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4758,6 +5406,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  
@@ -2802,6 +2822,26 @@ index 3eda87a..9d2792e 100644
 +
 +bool llama_is_parked(const llama_context * ctx) {
 +    return ctx ? ctx->is_parked() : false;
++}
++
++size_t llama_park_drop_demoted(llama_context * ctx) {
++    return ctx ? ctx->park_drop_demoted() : 0;
++}
++
++size_t llama_park_demoted_bytes(const llama_context * ctx) {
++    return ctx ? ctx->get_model().park_demoted_bytes() : 0;
++}
++
++size_t llama_context::park_drop_demoted() {
++    if (sched) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++    const size_t freed = model.park_drop_demoted();
++    if (freed > 0) {
++        sched_need_reserve = true;
++        gf_res_prev_active = nullptr;
++    }
++    return freed;
 +}
 +
 +bool llama_context::park(bool to_park) {
@@ -2864,6 +2904,7 @@ index 3eda87a..9d2792e 100644
 +        park_op_offload    = cparams.op_offload;
 +        cparams.op_offload = false;
 +        parked = true;
++        park_demote_tried = false;
 +    } else {
 +        // weights back from the pinned copies (DMA), the flex layers to their placement before the park
 +        ok = model.park_move(true, &w_bytes);
@@ -2905,7 +2946,7 @@ index 3eda87a..9d2792e 100644
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index cf2949a..90eabe9 100644
+index cf2949a..5e82c30 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -19,6 +19,7 @@
@@ -2916,7 +2957,7 @@ index cf2949a..90eabe9 100644
  
  class llama_io_read_i;
  class llama_io_write_i;
-@@ -379,6 +380,83 @@ private:
+@@ -379,6 +380,85 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -2946,10 +2987,12 @@ index cf2949a..90eabe9 100644
 +    // llama_park: free every device allocation (weights to their pinned copies, K/V to the host, compute buffers), or load it back
 +    bool park(bool to_park);
 +    bool is_parked() const { return parked; }
++    size_t park_drop_demoted();
 +
 +private:
 +    bool parked          = false;
 +    bool park_op_offload = true; // cparams.op_offload before the park
++    bool park_demote_tried = false; // the demote of this park was tried (once, at the first decode while parked)
 +
 +public:
 +    // dynamic KV: room for n_tokens new tokens after the cells in use, in one step (llama_memory_reserve)
@@ -4042,7 +4085,7 @@ index bcb82bd..f7c8604 100644
          assert(i < pos.size());
          assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 3a63afa..a066150 100644
+index 3a63afa..bb79a60 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1142,8 +1142,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
@@ -4056,7 +4099,7 @@ index 3a63afa..a066150 100644
  
          auto it = ctx_map.find(key);
          if (it == ctx_map.end()) {
-@@ -1174,6 +1174,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1174,6 +1174,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return it->second.get();
      };
  
@@ -4067,11 +4110,12 @@ index 3a63afa..a066150 100644
 +    ggml_backend_buffer_type_t flex_cpu_buft = nullptr;
 +    ggml_backend_buffer_type_t flex_host_buft = nullptr; // set if the twin is repacked: original-format copy in the host buffer
 +    bool park_tensor = false; // the twin is a park copy (pinned GPU-format copy of a weight outside the flex band)
++    ggml_backend_buffer_type_t park_demote_buft = nullptr; // its repacked CPU buffer type (a demote while parked), if any
 +
      auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
          if (!t_meta) {
              if (flags & TENSOR_NOT_REQUIRED) {
-@@ -1309,6 +1317,67 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1309,6 +1318,78 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              n_tensors_moved++;
          }
  
@@ -4132,6 +4176,17 @@ index 3a63afa..a066150 100644
 +                if (host_buft && cpu_dev && weight_buft_supported(hparams, t_meta, op, host_buft, cpu_dev)) {
 +                    flex_cpu_buft = host_buft;
 +                    park_tensor   = true;
++                    // the CPU buffer type a flex twin would get: a repack buffer is the demote target (allocated only then)
++                    buft_list_t cpu_only;
++                    for (const auto & e : *buft_list_cpu) {
++                        if (ggml_backend_dev_type(e.first) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                            cpu_only.push_back(e);
++                        }
++                    }
++                    ggml_backend_buffer_type_t rb = select_weight_buft(hparams, t_meta, op, &cpu_only);
++                    if (rb && !ggml_backend_buft_is_host(rb)) {
++                        park_demote_buft = rb;
++                    }
 +                }
 +            }
 +        }
@@ -4139,7 +4194,7 @@ index 3a63afa..a066150 100644
          return buft;
      };
  
-@@ -1388,7 +1457,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1388,7 +1469,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return nullptr;
      }
  
@@ -4152,7 +4207,7 @@ index 3a63afa..a066150 100644
  
      // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
      if (flags & TENSOR_DUPLICATED) {
-@@ -1409,6 +1482,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1409,6 +1494,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          n_created++;
      }
  
@@ -4175,14 +4230,14 @@ index 3a63afa..a066150 100644
 +        }
 +        const auto it_w = weights_map.find(tn.str());
 +        GGML_ASSERT(it_w != weights_map.end());
-+        flex_pairs.push_back({ tensor, twin, host, flex_key, buft, it_w->second.idx, it_w->second.offs, flex_exps, park_tensor });
++        flex_pairs.push_back({ tensor, twin, host, flex_key, buft, it_w->second.idx, it_w->second.offs, flex_exps, park_tensor, park_demote_buft });
 +    }
 +
      return tensor;
  }
  
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 2348cc1..d068503 100644
+index 2348cc1..5d17a28 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -12,6 +12,7 @@
@@ -4202,7 +4257,7 @@ index 2348cc1..d068503 100644
      };
  
      struct ctx_key_comparator {
-@@ -156,12 +159,49 @@ struct llama_model_loader {
+@@ -156,12 +159,50 @@ struct llama_model_loader {
              if (lhs.lazy != rhs.lazy) {
                  return lhs.lazy < rhs.lazy;
              }
@@ -4237,6 +4292,7 @@ index 2348cc1..d068503 100644
 +        size_t        offs;
 +        bool          exps; // an expert tensor of a whole flex layer (own buffer, it moves without the rest of the layer)
 +        bool          park = false; // a park copy (cpu = GPU-format copy in the pinned host buffer), only llama_park moves it
++        ggml_backend_buffer_type_t demote_buft = nullptr; // park copy: the CPU (repack) buffer type of a demote, null = not repackable
 +    };
 +    // park copies (llama_model_params.park): every GPU weight outside the flex band gets a pinned GPU-format copy; their groups
 +    // are keyed from FLEX_PARK_BASE (+ layer), the tensors of no layer (output) at FLEX_PARK_BASE + FLEX_PARK_NOLAYER
@@ -4253,7 +4309,7 @@ index 2348cc1..d068503 100644
      size_t n_tensors_moved = 0;
      std::string first_tensor_moved_name;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index cab5669..1a9ab14 100644
+index cab5669..ea8dcf2 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -31,6 +31,7 @@
@@ -4374,7 +4430,7 @@ index cab5669..1a9ab14 100644
      // add the CPU buffer type
      for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
          ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-@@ -1360,6 +1438,22 @@ struct llama_model::impl {
+@@ -1360,6 +1438,28 @@ struct llama_model::impl {
      buft_list_t cpu_buft_list;
      std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
  
@@ -4387,6 +4443,12 @@ index cab5669..1a9ab14 100644
 +        size_t buf_idx_exps  = SIZE_MAX;
 +        bool   exps_on_gpu   = true;
 +        bool   park_only     = false; // park copies (zone 1, the output layer): only llama_park moves them, not the zone rule
++        // a park group demoted while parked: its weights repacked for the CPU (kept until dropped); the pinned copies are then
++        // held by the pairs' host tensors (in demote_ctxs), the repacked ones by the model tensors (parked) or the twins (unparked)
++        bool   demoted       = false;
++        size_t demote_bytes  = 0;
++        std::vector<ggml_context_ptr>        demote_ctxs;
++        std::vector<ggml_backend_buffer_ptr> demote_bufs;
 +        std::vector<llama_model_loader::flex_pair> pairs;
 +    };
 +    std::map<int, flex_layer> flex;
@@ -4397,7 +4459,7 @@ index cab5669..1a9ab14 100644
      struct layer_dev {
          ggml_backend_dev_t dev;
          buft_list_t * buft_list;
-@@ -1714,8 +1808,179 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1714,8 +1814,179 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
          __func__, load_mode_name);
  
@@ -4578,7 +4640,7 @@ index cab5669..1a9ab14 100644
      for (const auto & dev : devices) {
          buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
          // add CPU buffer types as a fallback
-@@ -1763,6 +2028,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1763,6 +2034,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
      const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
@@ -4602,7 +4664,7 @@ index cab5669..1a9ab14 100644
      auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
          const bool is_swa = il < n_layer_all && hparams.is_swa(il);
          if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
-@@ -1975,10 +2257,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1975,10 +2263,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              (output_s || output_in_s)) {
          throw std::runtime_error("output scales require a separate output weight");
      }
@@ -4638,7 +4700,7 @@ index cab5669..1a9ab14 100644
          }
      }
  
-@@ -2088,6 +2394,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2088,6 +2400,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              buf_ptrs.emplace_back(buf.get());
          }
  
@@ -4648,7 +4710,7 @@ index cab5669..1a9ab14 100644
          pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
  
          ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
-@@ -2144,6 +2453,347 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2144,6 +2459,462 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -4865,6 +4927,121 @@ index cab5669..1a9ab14 100644
 +    return ok;
 +}
 +
++size_t llama_model::park_demoted_bytes() const {
++    size_t res = 0;
++    for (const auto & [il, fl] : pimpl->flex) {
++        res += fl.demoted ? fl.demote_bytes : 0;
++    }
++    return res;
++}
++
++size_t llama_model::park_demote() const {
++    // what the demote needs: the repackable weights of the parked groups not demoted yet
++    size_t need = 0;
++    for (const auto & [il, fl] : pimpl->flex) {
++        if (fl.park_only && !fl.on_gpu && !fl.demoted) {
++            for (const auto & p : fl.pairs) {
++                need += p.demote_buft ? ggml_nbytes(p.gpu) : 0;
++            }
++        }
++    }
++    if (need == 0) {
++        return 0;
++    }
++    // the RAM guard: the free RAM (cgroup limit if any) minus a reserve
++    size_t ram_free = 0, ram_total = 0, cg_free = 0, cg_limit = 0;
++    const char * src = "system";
++    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
++        ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
++    }
++    if (get_cgroup_free(cg_free, cg_limit)) {
++        ram_free  = cg_free;
++        ram_total = cg_limit;
++        src       = "cgroup limit";
++    }
++    if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
++        ram_free  = (size_t) atoll(env) * 1024 * 1024;
++        ram_total = std::max(ram_total, ram_free);
++        src       = "env override";
++    }
++    const size_t reserve = std::max((size_t) 1 << 30, ram_total / 20);
++    if (ram_total > 0 && ram_free < need + reserve) {
++        LLAMA_LOG_WARN("%s: park: no demote, the repacked copies (%.0f MiB) do not fit the free RAM (%.0f MiB, %s, reserve %.0f MiB); the CPU computes from the pinned copies\n",
++            __func__, need / 1048576.0, ram_free / 1048576.0, src, reserve / 1048576.0);
++        return 0;
++    }
++    const int64_t t0 = ggml_time_us();
++    size_t done = 0;
++    for (auto & [il, fl] : pimpl->flex) {
++        if (!fl.park_only || fl.on_gpu || fl.demoted) {
++            continue;
++        }
++        std::map<ggml_backend_buffer_type_t, std::vector<llama_model_loader::flex_pair *>> by_buft;
++        for (auto & p : fl.pairs) {
++            if (p.demote_buft && !p.host) {
++                by_buft[p.demote_buft].push_back(&p);
++            }
++        }
++        for (auto & [buft, ps] : by_buft) {
++            ggml_init_params ip = { ggml_tensor_overhead()*(ps.size() + 1), nullptr, true };
++            ggml_context_ptr ctx(ggml_init(ip));
++            std::vector<ggml_tensor *> reps;
++            for (auto * p : ps) {
++                ggml_tensor * r = ggml_dup_tensor(ctx.get(), p->gpu);
++                ggml_set_name(r, ggml_get_name(p->gpu));
++                reps.push_back(r);
++            }
++            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++            if (!buf) {
++                LLAMA_LOG_WARN("%s: park: allocating %s for the demote failed, the CPU computes from the pinned copies\n", __func__, ggml_backend_buft_name(buft));
++                continue;
++            }
++            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            for (size_t i = 0; i < ps.size(); ++i) {
++                auto * p = ps[i];
++                // the model tensor holds the pinned copy while parked: the repack buffer converts it on the set
++                ggml_backend_tensor_set(reps[i], p->gpu->data, 0, ggml_nbytes(p->gpu));
++                flex_swap_storage(p->gpu, reps[i]); // the model computes from the repacked copy
++                p->host = reps[i];                  // the pinned copy: the source of the upload on the unpark
++                fl.demote_bytes += ggml_nbytes(p->gpu);
++                done += ggml_nbytes(p->gpu);
++            }
++            fl.demote_ctxs.push_back(std::move(ctx));
++            fl.demote_bufs.push_back(std::move(buf));
++        }
++        fl.demoted = !fl.demote_bufs.empty();
++    }
++    LLAMA_LOG_INFO("%s: park: demoted %.2f MiB (repacked for the CPU from the pinned copies) in %.1f ms; kept until dropped\n",
++        __func__, done / 1048576.0, (ggml_time_us() - t0) / 1000.0);
++    return done;
++}
++
++size_t llama_model::park_drop_demoted() const {
++    size_t freed = 0;
++    for (auto & [il, fl] : pimpl->flex) {
++        if (!fl.demoted) {
++            continue;
++        }
++        for (auto & p : fl.pairs) {
++            if (!p.host || !p.park) {
++                continue;
++            }
++            // the pinned copy goes back where it was: the model tensor (parked) or the twin (unparked)
++            flex_swap_storage(fl.on_gpu ? p.cpu : p.gpu, p.host);
++            p.host = nullptr;
++        }
++        freed += fl.demote_bytes;
++        fl.demote_bytes = 0;
++        fl.demote_bufs.clear();
++        fl.demote_ctxs.clear();
++        fl.demoted = false;
++    }
++    if (freed > 0) {
++        LLAMA_LOG_INFO("%s: park: the demoted (repacked) copies were dropped (%.2f MiB)\n", __func__, freed / 1048576.0);
++    }
++    return freed;
++}
++
 +bool llama_model::park_was_on_gpu(int il) const {
 +    const auto it = pimpl->park_prev.find(il);
 +    return it == pimpl->park_prev.end() || it->second.first;
@@ -4996,7 +5173,7 @@ index cab5669..1a9ab14 100644
      return true;
  }
  
-@@ -2783,6 +3433,15 @@ void llama_model::print_info() const {
+@@ -2783,6 +3554,15 @@ void llama_model::print_info() const {
  }
  
  ggml_backend_dev_t llama_model::dev_layer(int il) const {
@@ -5012,7 +5189,7 @@ index cab5669..1a9ab14 100644
      return pimpl->dev_layer.at(il).dev;
  }
  
-@@ -3525,10 +4184,17 @@ llama_model_params llama_model_default_params() {
+@@ -3525,10 +4305,17 @@ llama_model_params llama_model_default_params() {
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
@@ -5031,7 +5208,7 @@ index cab5669..1a9ab14 100644
          /*.load_mtp                    =*/ false,
      };
 diff --git a/src/llama-model.h b/src/llama-model.h
-index e6768ca..54c4414 100644
+index e6768ca..35841dd 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -763,6 +763,9 @@ struct llama_rope_params {
@@ -5054,7 +5231,7 @@ index e6768ca..54c4414 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -969,6 +975,29 @@ struct llama_model {
+@@ -969,6 +975,34 @@ struct llama_model {
      const float * tensor_split() const;
  
      uint32_t n_gpu_layers() const;
@@ -5081,10 +5258,15 @@ index e6768ca..54c4414 100644
 +    bool park_available() const;
 +    bool park_move(bool to_gpu, size_t * bytes = nullptr) const;
 +    bool park_was_on_gpu(int il) const; // a flex layer was on the device before the park
++    // parked and running on the CPU: the park copies repacked for the CPU (a demote, if the RAM allows), kept until dropped;
++    // returns the bytes repacked now (0: nothing to do, or no room: the CPU computes from the pinned copies)
++    size_t park_demote() const;
++    size_t park_drop_demoted() const; // frees the repacked copies, returns their bytes
++    size_t park_demoted_bytes() const;
      llama_split_mode split_mode() const;
      bool no_alloc() const;
  
-@@ -1014,6 +1043,8 @@ struct llama_model {
+@@ -1014,6 +1048,8 @@ struct llama_model {
      virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
  
  protected:
@@ -5094,7 +5276,7 @@ index e6768ca..54c4414 100644
  
      struct impl;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5f7e67b..2444f21 100644
+index 5f7e67b..225f921 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -330,6 +330,7 @@ struct server_slot {
@@ -5115,12 +5297,13 @@ index 5f7e67b..2444f21 100644
                              }
                              break;
                          }
-@@ -3178,6 +3182,26 @@ private:
+@@ -3178,6 +3182,33 @@ private:
                  {
                      // do nothing
                  } break;
 +            case SERVER_TASK_TYPE_PARK:
 +            case SERVER_TASK_TYPE_UNPARK:
++            case SERVER_TASK_TYPE_PARK_DROP:
 +                {
 +                    // only between requests: a park moves every weight and the K/V
 +                    bool busy = false;
@@ -5134,7 +5317,13 @@ index 5f7e67b..2444f21 100644
 +                    const int64_t t0 = ggml_time_us();
 +                    auto res = std::make_unique<server_task_result_park>();
 +                    res->id      = task.id;
-+                    res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
++                    if (task.type == SERVER_TASK_TYPE_PARK_DROP) {
++                        res->success = true;
++                        res->demoted = llama_park_drop_demoted(ctx_tgt);
++                    } else {
++                        res->success = llama_park(ctx_tgt, task.type == SERVER_TASK_TYPE_PARK);
++                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
++                    }
 +                    res->parked  = llama_is_parked(ctx_tgt);
 +                    res->t_ms    = (ggml_time_us() - t0) / 1000.0;
 +                    queue_results.send(std::move(res));
@@ -5142,7 +5331,7 @@ index 5f7e67b..2444f21 100644
              case SERVER_TASK_TYPE_METRICS:
                  {
                      int n_processing_slots = 0;
-@@ -4341,6 +4365,7 @@ private:
+@@ -4341,6 +4372,7 @@ private:
                          metrics.add_prompt_cached(n_past);
  
                          slot.prompt.tokens.keep_first(n_past);
@@ -5150,7 +5339,7 @@ index 5f7e67b..2444f21 100644
  
                          // this is to signal the client that the request has started processing
                          if (slot.task->params.stream) {
-@@ -4372,6 +4397,12 @@ private:
+@@ -4372,6 +4404,12 @@ private:
  
                      slot.mem.seq_rm(slot.id, p0, -1);
  
@@ -5163,17 +5352,17 @@ index 5f7e67b..2444f21 100644
                      // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                      bool wait_shared = false;
                      if (slot.task->n_tokens_shared > 0) {
-@@ -5858,6 +5889,32 @@ void server_routes::init_routes() {
+@@ -5858,6 +5896,33 @@ void server_routes::init_routes() {
          return res;
      };
  
 +    // dual-buffer fork: free the device (park) or load it back (unpark), see llama_park
-+    auto park_handler = [this](bool park) {
-+        return [this, park](const server_http_req & req) {
++    auto park_handler = [this](server_task_type type) {
++        return [this, type](const server_http_req & req) {
 +            auto res = create_response();
 +            auto & rd = res->rd;
 +            {
-+                server_task task(park ? SERVER_TASK_TYPE_PARK : SERVER_TASK_TYPE_UNPARK);
++                server_task task(type);
 +                task.id = rd.get_new_id();
 +                rd.post_task(std::move(task));
 +            }
@@ -5190,39 +5379,42 @@ index 5f7e67b..2444f21 100644
 +            return res;
 +        };
 +    };
-+    this->post_park   = park_handler(true);
-+    this->post_unpark = park_handler(false);
++    this->post_park      = park_handler(SERVER_TASK_TYPE_PARK);
++    this->post_unpark    = park_handler(SERVER_TASK_TYPE_UNPARK);
++    this->post_park_drop = park_handler(SERVER_TASK_TYPE_PARK_DROP);
 +
      this->post_slots = [this](const server_http_req & req) {
          auto res = create_response();
          if (params.slot_save_path.empty()) {
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index 53b7e25..76c19c5 100644
+index 53b7e25..a95379e 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
-@@ -112,6 +112,8 @@ struct server_routes {
+@@ -112,6 +112,9 @@ struct server_routes {
      server_http_context::handler_t get_metrics;
      server_http_context::handler_t get_slots;
      server_http_context::handler_t post_slots;
 +    server_http_context::handler_t post_park;   // dual-buffer fork: llama_park
 +    server_http_context::handler_t post_unpark;
++    server_http_context::handler_t post_park_drop;
      server_http_context::handler_t get_props;
      server_http_context::handler_t post_props;
      server_http_context::handler_t post_infill;
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9455816..7b30085 100644
+index 9455816..f0a320f 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -32,6 +32,8 @@ enum server_task_type {
+@@ -32,6 +32,9 @@ enum server_task_type {
      SERVER_TASK_TYPE_GET_LORA,
      SERVER_TASK_TYPE_SET_LORA,
      SERVER_TASK_TYPE_TTS,
 +    SERVER_TASK_TYPE_PARK,   // dual-buffer fork: llama_park (POST /park), when no slot is processing
 +    SERVER_TASK_TYPE_UNPARK, // POST /unpark
++    SERVER_TASK_TYPE_PARK_DROP, // POST /park/drop: free the demoted (repacked) copies
  };
  
  // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
-@@ -649,6 +651,17 @@ struct server_task_result_slot_save_load : server_task_result {
+@@ -649,6 +652,18 @@ struct server_task_result_slot_save_load : server_task_result {
      virtual json to_json() override;
  };
  
@@ -5231,9 +5423,10 @@ index 9455816..7b30085 100644
 +    bool   success = false;
 +    bool   parked  = false;
 +    double t_ms    = 0.0;
++    size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
 +
 +    virtual json to_json() override {
-+        return json { { "success", success }, { "parked", parked }, { "timings", { { "ms", t_ms } } } };
++        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "timings", { { "ms", t_ms } } } };
 +    }
 +};
 +
@@ -5241,15 +5434,16 @@ index 9455816..7b30085 100644
      size_t n_erased;
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index b625ad5..9cd8482 100644
+index b625ad5..f096dae 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -212,6 +212,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
+@@ -212,6 +212,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
      // Save & load slots
      ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
      ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 +    ctx_http.post("/park",                     ex_wrapper(routes.post_park));
 +    ctx_http.post("/unpark",                   ex_wrapper(routes.post_unpark));
++    ctx_http.post("/park/drop",                ex_wrapper(routes.post_park_drop));
  
      // Google Cloud Platform (Vertex AI) compat
      ctx_http.register_gcp_compat();
