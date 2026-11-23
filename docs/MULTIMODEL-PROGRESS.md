@@ -14,7 +14,7 @@
 - Az ütemező a fork mért memóriájával számol: a VRAM a `zones_state` sorokból futás közben is frissül.
 - Image: `rocm-vulkan` cél (ROCm + Vulkan backend + RADV), `docker-compose.multimodel.yaml` (port 30071, `shm_size`), CI (`multimodel-ci`: vet + `-race` tesztek Linuxon, Windowsos `ollama.exe`).
 
-**Bizonyítottan működik** (laptop, az Ollama-binárissal, Vulkan iGPU + CPU, `test-results.md` „Többmodelles munka”): config nélkül a gyári indítósor; a config megjelenése a futó modellt nem érinti; erősorrend és naplósor; eszközazonosítás; `on_busy: next` (0 s, CPU-példány), `on_busy: wait` lejár → tovább / időben felszabadul → `waited`; sor és érkezési sorrend; KV az NVMe-re és vissza (a visszatöltés után a llama-server 1 tokent számol, kimenet azonos); csere oda-vissza a KV-val (1 token, kimenet azonos, csere 3–4,4 s a laptopon); RAM-hiánynál a CPU-tartalék, majd a parkoló kiesik, a `keep_alive: -1` marad; dinamikus KV Vulkanon (másolással, 4096 → 8192). A slot-visszatöltés eltérő kontextusba (nagyobb, kisebb, dinamikus KV) és eltérő KV-típusnál (elutasítva) külön llama-server teszttel. Egységtesztek: `multimodel` (config, erősorrend, eszközök, koordinátor, RAM, kirakási sorrend, KV-fájlok), `llm` (kapcsoló-felülírás, `zones_state`), `server` (no-op config nélkül, elhelyezés és sor, opció-erősorrend, áldozatválasztás); a CI-ben `-race`-szel zöld. Az image (`0.40.16-dualbuf-d805f68`) lefordult a Vulkan-backenddel.
+**Bizonyítottan működik** (laptop, az Ollama-binárissal, Vulkan iGPU + CPU, `test-results.md` „Többmodelles munka”): config nélkül a gyári indítósor; a config megjelenése a futó modellt nem érinti; erősorrend és naplósor; eszközazonosítás; `on_busy: next` (0 s, CPU-példány), `on_busy: wait` lejár → tovább / időben felszabadul → `waited`; sor és érkezési sorrend; KV az NVMe-re és vissza (a visszatöltés után a llama-server 1 tokent számol, kimenet azonos); csere oda-vissza a KV-val (1 token, kimenet azonos, csere 3–4,4 s a laptopon); RAM-hiánynál a CPU-tartalék, majd a parkoló kiesik, a `keep_alive: -1` marad; dinamikus KV Vulkanon (másolással, 4096 → 8192). A slot-visszatöltés eltérő kontextusba (nagyobb, kisebb, dinamikus KV) és eltérő KV-típusnál (elutasítva) külön llama-server teszttel. Egységtesztek: `multimodel` (config, erősorrend, eszközök, koordinátor, RAM, kirakási sorrend, KV-fájlok), `llm` (kapcsoló-felülírás, `zones_state`), `server` (no-op config nélkül, elhelyezés és sor, opció-erősorrend, áldozatválasztás); a CI-ben `-race`-szel zöld. Az image lefordult a Vulkan-backenddel és a RADV-vel, a füstteszt zöld (`ghcr.io/csaki89/ollama-dualbuf:0.40.16-dualbuf-986377d`, mozgó címke: `:multimodel`).
 
 **Nyitva maradt** (`OPEN-QUESTIONS.md`):
 1. A csere folyamatszintű; a kért ~1 s / 10 GB-hoz a folyamaton belüli park kell (pinned GPU-formájú példány minden GPU-s súlyhoz, a pufferek elengedése/visszaépítése a llama.cpp-ben). A NAS-mérés (NAS-TESTS 6.) dönti el, kell-e.
@@ -37,7 +37,7 @@
 | 3e. KV-mentés (RAM, NVMe) | kész | llama-server teszt, laptop (Ollama) |
 | 3f. Csere (park) | folyamatszinten kész; folyamaton belüli: terv | laptop (Ollama); NAS: mérés |
 | 3g. Mért memória az ütemezőben | kész (RAM: cgroup; VRAM: `zones_state`) | egységteszt |
-| 3h. Vulkan az image-ben | kész | CI image-build (`d805f68`) |
+| 3h. Vulkan az image-ben | kész | CI image-build (`986377d`, füstteszt zöld) |
 | 3i. Vulkan dinamikus KV | másolással kész; sparse: nem | laptop (Ollama) |
 | Dokumentáció | kész | DECISIONS 50–63, NAS-TESTS, OPEN-QUESTIONS, test-results |
 
