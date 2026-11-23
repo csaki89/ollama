@@ -111,3 +111,16 @@ Config: `tools/dualbuf/multimodel/laptop-dualbuf.yaml` (`swap: { enabled: true, 
 - Valódi laptop-RAM (felülírás nélkül): az Ollama RAM-terve szűknek látta a RAM-ot, a parkolt modell (LRU) teljesen kirakódott (KV az NVMe-re), a következő kérésnél visszatöltődött (`KV restored from=disk`).
 - Parkolt modell CPU-s kérése: az igpu foglalt (qwen3 generál), a qwen25-kérés `on_busy: wait 3s` után `device=cpu reason=next`, `dualbuf: the CPU request runs on the parked instance`, demote (597 MiB, 1,7 s), helyes válasz; nincs új `-ngl 0`-s folyamat (összesen 2 llama-server).
 - Javított hiba a mérés közben: a parkolt példány RAM-áldozatként busy-loopot okozott (az ütemező a parkoltakat a betöltött-számlálóból is kivonta); most csak a `MAX_LOADED_MODELS`-összevetésből maradnak ki.
+
+# Vulkan–ROCm egyezés (1. lépés), laptop, 2026-11-24
+llama-server közvetlenül (csaki89/llama.cpp `multimodel` e795e5860), Intel Iris Xe (Vulkan, UMA), qwen2.5-1.5B Q4_K_M, `--auto-zones --dual-buffer -fa on --load-mode none`; szkript: llama.cpp `tools/dualbuf/vk-parity.sh` (egy ~11 000 vagy ~21 000 tokenes, majd két rövid kérés). Felmérés és eredmény: `docs/VULKAN-PARITY.md`.
+
+| futás | beállítás | napló (lényeg) | kimenet |
+|---|---|---|---|
+| main | `-c 16384 --fit-target 6000` | `flex band 2 whole layers`; `sparse block 65536; driver booking unit 65536 (measured); ...`; `26/28 layers in place (VMM), 2 by copy`; hosszú: `2 flex steps off`, `relayout: KV 4096 -> 11264 cells (26 grown in place ...)`; rövid: `relayout: KV 11264 -> 4608 cells (26 shrunk in place ...)`, `2 flex steps back` | = ref |
+| ref | ugyanez `--auto-zones` nélkül (statikus KV, nincs flex) | `dual-buffer: 10 weights also stored in Vulkan_Host (35.02 MiB)` | referencia |
+| nosparse | `GGML_VK_SPARSE=0` | `no growable (sparse) KV buffers: GGML_VK_SPARSE=0; the KV grows by copy`; `0/28 in place, 28 by copy`; a flex-ciklus ugyanaz | = ref |
+| nobudget | `GGML_VK_DISABLE_MEMORY_BUDGET=1` (+ `--flex-layers 2`) | `no VK_EXT_memory_budget (GGML_VK_DISABLE_MEMORY_BUDGET): ... not a measurement`; `zones: Vulkan0 does not measure its free memory ...: the budget follows the booking only`; `device memory budget 928 MiB (free 6928 MiB, ...)` (könyvelés); `zones_state ... driver -`; a darab: `driver booking unit 0 (unclear: no VK_EXT_memory_budget to measure it)` | = ref |
+| ret / ret_copy | `-c 65536 --fit-target 3000` (nincs flex sáv), ~21 000 token | sparse: `release unit 8388608 (measured ...)`, `chunk 8388608`; KV 4096 → 36864 → 4096 cella, 1008 → 112 MiB, **a meghajtó szerint 4883 → 5694 MiB szabad (+811 / 896 MiB, 90,5%)**; másolásos: 602 → 112 MiB, +443 / 490 MiB (90,4%) | azonos |
+
+A darab mért visszaadási egysége előtt (64 KiB-os darab) a zsugorítás 196 MiB-ból csak 72 MiB-ot adott vissza: ezért került a darabválasztásba (`release unit`).

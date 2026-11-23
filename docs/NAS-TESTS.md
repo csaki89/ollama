@@ -81,3 +81,20 @@ Image: `ghcr.io/csaki89/ollama-dualbuf:multimodel` (a 2. kör első buildje: `0.
 2. Az embedding-modell betöltésekor a naplóban vagy `ggml_backend_vk_vmm_arena_new: Vulkan0: sparse KV buffers: block B, chunk C bytes, memory type M` (támogatott), vagy `no growable (sparse) KV buffers: <a hiányzó képesség>; the KV grows by copy` (tartalék).
 3. Támogatott esetben: `set_dynamic: ... growth on the device: N/N layers in place (VMM)`; egy hosszú (4096 közeli) input után `relayout: KV ... cells (... N grown in place ...)`, egy rövid után `... shrunk in place`; a `zones_state` sor `driver` szabad memóriája a zsugorítás után a felszabadított résszel nő. A beágyazás bájtra azonos a `GGML_VK_SPARSE=0`-val futtatott értékkel (a compose `environment`-jébe ideiglenesen).
 4. Ha a RADV a sparse kötésnél hibát ad (`binding of N chunks failed`), a KV aznapi futása a másolásos útra esik; a naplósort küldd vissza.
+
+## 12. Vulkan–ROCm egyezés a diszkrét Vulkan-kártyán (RX 550) — llama.cpp `multimodel` e795e5860+ (20 perc)
+A llama-servert közvetlenül futtasd az image-ből (a Vulkan-backenddel), hogy az Ollama ütemezője ne szóljon bele:
+```
+docker run --rm -it --device /dev/dri/renderD128 --group-add video --group-add render -v /mnt/nvme/ollama/models:/models:ro \
+  --entrypoint /usr/lib/ollama/llama-server ghcr.io/csaki89/ollama-dualbuf:multimodel \
+  -m /models/blobs/<egy kis modell GGUF-ja, pl. qwen3:0.6b> -c 16384 -np 1 --load-mode none --auto-zones --dual-buffer -fa on \
+  --log-verbosity 4 --fit-target <a RX 550 szabad memóriájának kb. 85%-a MiB-ban> --port 8080
+```
+(A `GGML_BACKEND_PATH=/usr/lib/ollama/vulkan/libggml-vulkan.so` és `LD_LIBRARY_PATH=/usr/lib/ollama:/usr/lib/ollama/vulkan` kell; a laptopos `tools/dualbuf/vk-parity.sh` mintája szerint egy ~11 000 tokenes, majd két rövid kérés.)
+Várt naplósorok és értékek:
+1. `ggml_backend_vk_vmm_arena_new: Vulkan0: sparse block B; driver booking unit U (measured); release unit R (measured: ...); allocation limit L (...); chunk C` – a RADV-n várhatóan `B = 65536`, `U = B` vagy 4096 többszöröse, `R` ≤ 2 MiB (a RADV egy BO-t ad foglalásonként, a felszabadítás azonnal visszaad), `L` = 4294967295 vagy nagy, `C = max(B, U, R)`. Ha a sparse képesség hiányzik: `no growable (sparse) KV buffers: <hiányzó képesség>; the KV grows by copy` (tartalék).
+2. `set_dynamic: ... growth on the device: N/M layers in place (VMM)` (a flex rétegek K/V-je másolással, mint ROCm-on).
+3. Auto zónák és flex: `auto zones: n_ctx ... (zone 1); ... (zone 1 + 2)`, `flex band K whole layers`; a hosszú kérésnél `flex_move_part: layer L moved to CPU`, `flex_move: layer L K/V moved to Vulkan_Host`, `relayout: KV a -> b cells (... grown in place ...)`; az új rövid kérésnél `relayout: ... shrunk in place`, majd `flex_move_part: layer L moved to Vulkan0 (... source host/cpu/file x/y/0)`.
+4. Mért keret: `zones: device memory budget X MiB (free F MiB, margin T MiB)`; a `zones_state` sorban `driver D, sysfs S` – diszkrét AMD kártyán a sysfs is mér (`mem_info_vram_used`), a kettő 64 MiB-on belül egyezzen. A zsugorítás utáni `zones_state` `driver` és `sysfs` értéke a felszabadított KV-mérettel nőjön (±R).
+5. Kimenet: a hosszú és a két rövid válasz bájtra egyezzen a `--auto-zones` nélküli (statikus KV, flex nélküli) futáséval.
+6. Tartalékágak: `GGML_VK_SPARSE=0` → `the KV grows by copy`, a kimenet ugyanaz; `GGML_VK_DISABLE_MEMORY_BUDGET=1` → `ggml_backend_vk_dev_memory_measured: Vulkan0: no VK_EXT_memory_budget ...` és `zones: Vulkan0 does not measure its free memory (no memory budget): the budget follows the kernel's sysfs figure` (amdgpu-n a sysfs mér, így a keret abból jön), a `zones_state`-ben `driver -`.

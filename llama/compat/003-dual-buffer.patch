@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel 6b19b5a28): Vulkan sparse growable KV buffers, --no-zones-flex, --park / POST /park, /unpark, /park/drop (in-process park, demote while parked, the projector on the CPU while parked).
+multimodel (csaki89/llama.cpp multimodel d7e8d8d70): Vulkan sparse growable KV buffers (chunk from the device: sparse block, measured booking and release units, allocation limit), ggml_backend_dev_memory_measured / zones budget from the booking without a memory budget, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 977c3ab..dd5fafa 100644
@@ -1509,20 +1509,22 @@ index 7ea4abc..4abe2c9 100644
  
          src += (size_t) ncols * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-index cd9d074..2f4ca4c 100644
+index cd9d074..b6879c5 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-@@ -1,6 +1,9 @@
+@@ -1,6 +1,11 @@
  #include "ggml-vulkan-common.h"
  
 +#include <algorithm>
 +#include <atomic>
  #include <cstdint>
++#include <map>
++#include <numeric>
 +#include <set>
  #include <cstdlib>
  #include <mutex>
  #include <shared_mutex>
-@@ -867,3 +870,444 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
+@@ -867,3 +872,603 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
      return buf;
  }
  
@@ -1627,6 +1629,111 @@ index cd9d074..2f4ca4c 100644
 +    return ok;
 +}
 +
++// the heap usage of a memory type by the memory budget (VK_EXT_memory_budget); false without it
++static bool vk_heap_usage(vk_device & device, uint32_t mem_type, size_t & usage) {
++    if (device->idx >= vk_instance.device_supports_membudget.size() || !vk_instance.device_supports_membudget[device->idx]) {
++        return false;
++    }
++    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget;
++    vk::PhysicalDeviceMemoryProperties2 mp;
++    mp.pNext = &budget;
++    device->physical_device.getMemoryProperties2(&mp);
++    const uint32_t heap = mp.memoryProperties.memoryTypes[mem_type].heapIndex;
++    usage = (size_t) budget.heapUsage[heap];
++    return true;
++}
++
++// the unit the driver books one allocation of `size` bytes with: the heap usage change of one allocation, the same twice and a
++// multiple of the size; 0 if it cannot be measured (note says why). Once per device.
++static size_t vk_sparse_booking_unit(vk_device & device, uint32_t mem_type, size_t size, std::string & note) {
++    static std::mutex mtx;
++    static std::map<size_t, std::pair<size_t, std::string>> done;
++    std::lock_guard<std::mutex> lock(mtx);
++    auto it = done.find(device->idx);
++    if (it != done.end()) {
++        note = it->second.second;
++        return it->second.first;
++    }
++    size_t unit = 0;
++    size_t d[2] = { 0, 1 };
++    bool measured = true;
++    for (int i = 0; i < 2 && measured; ++i) {
++        size_t u0 = 0, u1 = 0;
++        if (!vk_heap_usage(device, mem_type, u0)) {
++            measured = false;
++            break;
++        }
++        vk::DeviceMemory m;
++        try {
++            m = device->device.allocateMemory(vk::MemoryAllocateInfo(size, mem_type));
++        } catch (const vk::SystemError &) {
++            measured = false;
++            break;
++        }
++        vk_heap_usage(device, mem_type, u1);
++        device->device.freeMemory(m);
++        d[i] = u1 > u0 ? u1 - u0 : 0;
++    }
++    if (!measured) {
++        note = " (unclear: no VK_EXT_memory_budget to measure it)";
++    } else if (d[0] > 0 && d[0] == d[1] && d[0] % size == 0) {
++        unit = d[0];
++        note = " (measured)";
++    } else {
++        note = " (unclear: the heap usage changed by " + std::to_string(d[0]) + " / " + std::to_string(d[1]) + " bytes)";
++    }
++    done[device->idx] = { unit, note };
++    return unit;
++}
++
++// the smallest allocation size (from `base`, doubled, a multiple of it) whose memory the driver gives back when freed: a few
++// allocations of it, then freed, must bring the heap usage back to where it was (a driver can serve small allocations from
++// larger blocks it keeps); 0 if it cannot be measured (no memory budget) or no size up to the limit does. Once per device.
++static size_t vk_sparse_release_unit(vk_device & device, uint32_t mem_type, size_t base, std::string & note) {
++    static std::mutex mtx;
++    static std::map<size_t, std::pair<size_t, std::string>> done;
++    std::lock_guard<std::mutex> lock(mtx);
++    auto it = done.find(device->idx);
++    if (it != done.end()) {
++        note = it->second.second;
++        return it->second.first;
++    }
++    const size_t limit = (size_t) 64 << 20;
++    const int    n     = 8;
++    size_t res = 0;
++    note = " (unclear: no VK_EXT_memory_budget to measure it)";
++    size_t u_probe = 0;
++    if (vk_heap_usage(device, mem_type, u_probe)) {
++        note = " (unclear: no size up to " + std::to_string(limit >> 20) + " MiB was given back in full)";
++        for (size_t s = base; s <= limit && res == 0; s *= 2) {
++            size_t u0 = 0, u1 = 0, u2 = 0;
++            vk_heap_usage(device, mem_type, u0);
++            std::vector<vk::DeviceMemory> ms;
++            try {
++                for (int i = 0; i < n; ++i) {
++                    ms.push_back(device->device.allocateMemory(vk::MemoryAllocateInfo(s, mem_type)));
++                }
++            } catch (const vk::SystemError &) {
++                for (auto & m : ms) {
++                    device->device.freeMemory(m);
++                }
++                break;
++            }
++            vk_heap_usage(device, mem_type, u1);
++            for (auto & m : ms) {
++                device->device.freeMemory(m);
++            }
++            vk_heap_usage(device, mem_type, u2);
++            if (u1 >= u0 + n*s && u2 <= u0) {
++                res  = s;
++                note = " (measured: " + std::to_string(n) + " allocations of it freed bring the heap usage back)";
++            }
++        }
++    }
++    done[device->idx] = { res, note };
++    return res;
++}
++
 +static void * ggml_backend_vk_vmm_arena_new(ggml_backend_buffer_type_t buft, size_t size) {
 +    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
 +        return nullptr;
@@ -1657,17 +1764,12 @@ index cd9d074..2f4ca4c 100644
 +        return no("the compute queue family " + std::to_string(qf) + " has no VK_QUEUE_SPARSE_BINDING_BIT");
 +    }
 +
-+    size_t chunk = 2u << 20;
-+    if (const char * env = getenv("GGML_VK_SPARSE_CHUNK_KIB"); env && atoll(env) > 0) {
-+        chunk = (size_t) atoll(env) << 10;
-+    }
-+
 +    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
 +    if (device->buffer_device_address) {
 +        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
 +    }
 +    // the sparse block is the memory requirement's alignment: probe it with a small buffer
-+    vk::BufferCreateInfo bci(vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, chunk, usage, vk::SharingMode::eExclusive);
++    vk::BufferCreateInfo bci(vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, 1u << 20, usage, vk::SharingMode::eExclusive);
 +    vk::MemoryRequirements req;
 +    try {
 +        vk::Buffer probe = device->device.createBuffer(bci);
@@ -1677,7 +1779,49 @@ index cd9d074..2f4ca4c 100644
 +        return no(std::string("creating a sparse buffer failed: ") + e.what());
 +    }
 +    const size_t block = std::max<size_t>(req.alignment, 1);
-+    chunk = block * ((chunk + block - 1) / block);
++    int probe_type = -1;
++    {
++        const vk::PhysicalDeviceMemoryProperties mp0 = device->physical_device.getMemoryProperties();
++        for (uint32_t i = 0; i < mp0.memoryTypeCount; ++i) {
++            if ((req.memoryTypeBits & (1u << i)) && (mp0.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
++                probe_type = (int) i;
++                break;
++            }
++        }
++    }
++    if (probe_type < 0) {
++        return no("no device local memory type for a sparse buffer");
++    }
++    // the chunk, from the device like the ggml-cuda VMM: the sparse block (the alignment), the unit the driver books an allocation with
++    // (measured: the memory budget's heap usage before and after one block allocation, twice) and the allocation count limit (the
++    // chunks of one KV arena use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
++    std::string unit_note;
++    const size_t unit = vk_sparse_booking_unit(device, (uint32_t) probe_type, block, unit_note);
++    size_t chunk = block;
++    if (unit > 0 && std::lcm(block, unit) <= 32*block) {
++        chunk = std::lcm(block, unit);
++    }
++    // a chunk the driver gives back when it is freed (the shrink must return the memory)
++    std::string release_note;
++    const size_t release = vk_sparse_release_unit(device, (uint32_t) probe_type, chunk, release_note);
++    chunk = std::max(chunk, release);
++    const uint32_t alloc_limit = device->properties.limits.maxMemoryAllocationCount;
++    const size_t   max_chunks  = std::max<size_t>(1, alloc_limit / 4);
++    const size_t   count_min   = (std::max<size_t>(size, 1) + max_chunks - 1) / max_chunks;
++    if (chunk < count_min) {
++        chunk = chunk * ((count_min + chunk - 1) / chunk);
++    }
++    const char * env_chunk = getenv("GGML_VK_SPARSE_CHUNK_KIB");
++    if (env_chunk && atoll(env_chunk) > 0) {
++        chunk = block * std::max<size_t>(1, (((size_t) atoll(env_chunk) << 10) + block - 1) / block);
++    }
++    {
++        std::lock_guard<std::mutex> lock(log_mtx);
++        if (logged.insert(device->name + "/chunk").second) {
++            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s\n",
++                device->name.c_str(), block, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk, env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "");
++        }
++    }
 +    const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
 +    if (reserved > device->physical_device.getProperties().limits.sparseAddressSpaceSize) {
 +        return no("the KV (" + std::to_string(reserved) + " bytes) is larger than sparseAddressSpaceSize");
@@ -1953,7 +2097,24 @@ index cd9d074..2f4ca4c 100644
 +    }
 +}
 +
++// true if ggml_backend_dev_memory measures the free memory (VK_EXT_memory_budget); without it the free memory is the heap size
++static bool ggml_backend_vk_dev_memory_measured(ggml_backend_dev_t dev) {
++    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
++    const bool measured = ctx && ctx->device < vk_instance.device_supports_membudget.size() && vk_instance.device_supports_membudget[ctx->device];
++    if (!measured && ctx) {
++        static std::mutex mtx;
++        static std::set<size_t> logged;
++        std::lock_guard<std::mutex> lock(mtx);
++        if (logged.insert(ctx->device).second) {
++            GGML_LOG_WARN("ggml_backend_vk_dev_memory_measured: %s: no VK_EXT_memory_budget%s: the free memory it reports is the heap size, not a measurement\n",
++                ctx->name.c_str(), getenv("GGML_VK_DISABLE_MEMORY_BUDGET") ? " (GGML_VK_DISABLE_MEMORY_BUDGET)" : "");
++        }
++    }
++    return measured;
++}
++
 +void * ggml_vk_sparse_proc_address(const char * name) {
++    if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }
 +    if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }
 +    if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0)    { return (void *) ggml_backend_vk_vmm_arena_alignment; }
 +    if (strcmp(name, "ggml_backend_vmm_arena_buffer") == 0)       { return (void *) ggml_backend_vk_vmm_arena_buffer; }
@@ -1981,10 +2142,20 @@ index 0af8a5c..e4adadb 100644
  // comm
  #if !defined(_WIN32)
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index b46cba3..611b3e9 100644
+index b46cba3..aea8e01 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -16474,6 +16474,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
+@@ -5511,7 +5511,8 @@ void ggml_vk_instance_init() {
+             }
+         }
+ 
+-        vk_instance.device_supports_membudget.push_back(membudget_supported);
++        // GGML_VK_DISABLE_MEMORY_BUDGET (test aid): as if the device had no VK_EXT_memory_budget (the free memory is not measured)
++        vk_instance.device_supports_membudget.push_back(membudget_supported && getenv("GGML_VK_DISABLE_MEMORY_BUDGET") == nullptr);
+ 
+         bool host_buffer_import = false;
+         if (external_memory_host_supported) {
+@@ -16474,6 +16475,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
      if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
          return (void *) ggml_backend_vk_fusion_set_enabled;
      }
@@ -2063,7 +2234,7 @@ index 988b178..1ad90e3 100644
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3eda87a..f428bbe 100644
+index 3eda87a..16a1b5b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,6 +9,12 @@
@@ -2088,7 +2259,7 @@ index 3eda87a..f428bbe 100644
  #include <cstring>
  #include <limits>
  #include <stdexcept>
-@@ -178,6 +186,45 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+@@ -178,6 +186,48 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -2098,6 +2269,9 @@ index 3eda87a..f428bbe 100644
 +    llama_kv_cache * kv = nullptr;
 +    std::vector<std::pair<const char *, llama_memory_i *>> fixed;
 +};
++
++// the kernel's free VRAM of the card (amdgpu sysfs), below
++static bool zones_sysfs_free(size_t total, size_t & free_out);
 +
 +static zones_mem_parts zones_parts(llama_memory_i * mem) {
 +    zones_mem_parts res;
@@ -2134,7 +2308,7 @@ index 3eda87a..f428bbe 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -194,6 +241,38 @@ llama_context::llama_context(
+@@ -194,6 +244,38 @@ llama_context::llama_context(
      t_start_us = model.t_start_us;
      t_load_us  = model.t_load_us;
  
@@ -2173,7 +2347,7 @@ index 3eda87a..f428bbe 100644
      const auto & hparams = model.hparams;
  
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
-@@ -534,6 +613,7 @@ llama_context::llama_context(
+@@ -534,6 +616,7 @@ llama_context::llama_context(
      }
  
      // init the memory module
@@ -2181,7 +2355,7 @@ index 3eda87a..f428bbe 100644
      if (!hparams.vocab_only) {
          llama_memory_params params_mem = {
              /*.type_k    =*/ params.type_k,
-@@ -544,7 +624,52 @@ llama_context::llama_context(
+@@ -544,7 +627,52 @@ llama_context::llama_context(
              /*.no_alloc  =*/ model.no_alloc(),
          };
  
@@ -2235,7 +2409,7 @@ index 3eda87a..f428bbe 100644
      }
  
      // init backends
-@@ -784,10 +909,492 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -784,10 +912,562 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
  
@@ -2378,7 +2552,13 @@ index 3eda87a..f428bbe 100644
 +    if (rule && !zones_headroom_set) {
 +        zones_headroom_set = true;
 +        size_t dev_free = 0, dev_total = 0;
-+        ggml_backend_dev_memory(model.flex_gpu_dev(model.flex_layers().front()), &dev_free, &dev_total);
++        ggml_backend_dev_t zdev = model.flex_gpu_dev(model.flex_layers().front());
++        ggml_backend_dev_memory(zdev, &dev_free, &dev_total);
++        if (!zones_mem_measured(zdev)) {
++            // not measured by the backend: the kernel's figure if there is one, else the booking
++            size_t sys_free = 0;
++            dev_free = zones_sysfs_free(dev_total, sys_free) ? sys_free : zones_booked_free(zdev);
++        }
 +        zones_headroom = (int64_t) dev_free - (int64_t) zones_vram_margin;
 +        if (const char * env = getenv("LLAMA_ZONES_HEADROOM_MIB")) { // test aid
 +            zones_headroom = (int64_t) atoll(env) * 1024 * 1024;
@@ -2564,12 +2744,18 @@ index 3eda87a..f428bbe 100644
 +    // the kernel's own figure where there is one: the booked free memory is checked against it, the lower one counts
 +    size_t sys_free = 0;
 +    const bool sys = zones_sysfs_free(dev_total, sys_free);
++    // a backend that does not measure (the free memory it reports is the total): the driver figure does not count
++    const bool drv = zones_mem_measured(dev);
++    if (!drv && !sys) {
++        // nothing measures the device: the budget follows the booking only
++        return zones_booked_free(dev);
++    }
 +    const int64_t booked = zones_headroom + (int64_t) zones_vram_margin;
 +    if (!rest && sys && std::llabs(booked - (int64_t) sys_free) > (int64_t) zones_vram_margin/2) {
 +        LLAMA_LOG_WARN("%s: zones: the booked free memory (%.0f MiB) is off from the device: driver %.0f MiB, sysfs %.0f MiB\n", __func__,
 +            booked / 1048576.0, dev_free / 1048576.0, sys_free / 1048576.0);
 +    }
-+    const size_t free_real = sys ? std::min(dev_free, sys_free) : dev_free;
++    const size_t free_real = sys ? (drv ? std::min(dev_free, sys_free) : sys_free) : dev_free;
 +    const int64_t real = (int64_t) free_real - (int64_t) zones_vram_margin;
 +    if ((real < zones_headroom || (up && real > zones_headroom)) && !getenv("LLAMA_ZONES_HEADROOM_MIB")) {
 +        // at rest only a change of 64 MiB or more is logged
@@ -2585,6 +2771,61 @@ index 3eda87a..f428bbe 100644
 +
 +llama_kv_cache * llama_context::zones_kv() const {
 +    return zones_parts(memory.get()).kv;
++}
++
++bool llama_context::zones_mem_measured(ggml_backend_dev_t dev) {
++    if (zones_measured >= 0) {
++        return zones_measured != 0;
++    }
++    // a backend tells whether ggml_backend_dev_memory measures (Vulkan without VK_EXT_memory_budget reports the heap size);
++    // without the query it is a measurement (CUDA/HIP)
++    bool measured = true;
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    auto fn = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_memory_measured") : nullptr;
++    if (fn) {
++        measured = fn(dev);
++    }
++    zones_measured = measured ? 1 : 0;
++    if (!measured) {
++        size_t sys_free = 0, dev_free = 0, dev_total = 0;
++        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
++        const bool sys = zones_sysfs_free(dev_total, sys_free);
++        LLAMA_LOG_WARN("%s: zones: %s does not measure its free memory (no memory budget): the budget follows %s\n", __func__,
++            ggml_backend_dev_name(dev), sys ? "the kernel's sysfs figure" : "the booking only (the device total minus the model weights, the K/V and the compute buffers on it)");
++    }
++    return measured;
++}
++
++size_t llama_context::zones_booked_free(ggml_backend_dev_t dev) const {
++    size_t dev_free = 0, dev_total = 0;
++    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
++    size_t used = 0;
++    for (const auto & [buft, size] : model.memory_breakdown()) {
++        if (ggml_backend_buft_get_device(buft) == dev && !ggml_backend_buft_is_host(buft)) {
++            used += size;
++        }
++    }
++    const auto parts = zones_parts(memory.get());
++    std::vector<const llama_kv_cache *> kvs;
++    if (parts.kv) {
++        kvs.push_back(parts.kv);
++    }
++    for (const auto & [name, part] : parts.fixed) {
++        if (const auto * kv = dynamic_cast<const llama_kv_cache *>(part)) {
++            kvs.push_back(kv);
++        }
++    }
++    for (const auto * kv : kvs) {
++        used += (size_t) kv->get_size() * kv->cell_bytes(true);
++    }
++    if (sched) {
++        for (const auto & b : backends) {
++            if (ggml_backend_get_device(b.get()) == dev) {
++                used += ggml_backend_sched_get_buffer_size(sched.get(), b.get());
++            }
++        }
++    }
++    return dev_total > used ? dev_total - used : 0;
 +}
 +
 +size_t llama_context::zones_layer_kv_bytes(int il) const {
@@ -2660,21 +2901,24 @@ index 3eda87a..f428bbe 100644
 +    }
 +
 +    size_t dev_free = 0, dev_total = 0;
++    bool drv = true;
 +    if (ggml_backend_dev_t dev = zones_dev()) {
 +        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
++        drv = zones_mem_measured(dev);
 +    }
 +    size_t sys_free = 0;
 +    const bool sys = zones_sysfs_free(dev_total, sys_free);
-+    // no budget yet (static KV): booked and budget are not known
++    // no budget yet (static KV): booked and budget are not known; a driver that does not measure: "-"
 +    const std::string booked = zones_headroom_set ? std::to_string((zones_headroom + (int64_t) zones_vram_margin) >> 20) : "-";
 +    const std::string budget = zones_headroom_set ? std::to_string(zones_headroom / 1048576) : "-";
++    const std::string drv_free = drv ? format("%.0f", dev_free / 1048576.0) : "-";
 +    LLAMA_LOG_INFO("%s: zones_state (%s): weights GPU %.0f MiB (%.0f%%), CPU %.0f MiB; flex %d/%zu layers on the GPU%s%s%s%s; "
-+        "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %.0f, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
++        "KV %u cells (%u used, %.0f MiB on the device)%s; device free: booked %s, driver %s, sysfs %s MiB (budget %s MiB, margin %.0f MiB)\n",
 +        __func__, what,
 +        w_gpu / 1048576.0, w_all > 0 ? 100.0*w_gpu/w_all : 0.0, (w_all - w_gpu) / 1048576.0, n_flex_on, flex.size(),
 +        off.empty() ? "" : ", off: ", off.c_str(), exps.empty() ? "" : ", experts off: ", exps.c_str(), kv ? kv->get_size() : 0, kv ? kv->used_cells() : 0,
 +        kv ? kv->get_size()*kv->cell_bytes(true) / 1048576.0 : 0.0, fixed.c_str(), booked.c_str(),
-+        dev_free / 1048576.0, sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
++        drv_free.c_str(), sys ? std::to_string(sys_free >> 20).c_str() : "-", budget.c_str(),
 +        zones_vram_margin / 1048576.0);
 +}
 +
@@ -2728,7 +2972,7 @@ index 3eda87a..f428bbe 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -942,6 +1549,8 @@ void llama_context::sched_reserve() {
+@@ -942,6 +1622,8 @@ void llama_context::sched_reserve() {
  
      LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
              __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -2737,7 +2981,7 @@ index 3eda87a..f428bbe 100644
  }
  
  void llama_context::synchronize() {
-@@ -2003,6 +2612,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2003,6 +2685,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          return encode(batch_inp);
      }
  
@@ -2753,7 +2997,7 @@ index 3eda87a..f428bbe 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -2089,6 +2707,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2089,6 +2780,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -2790,7 +3034,7 @@ index 3eda87a..f428bbe 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -2097,8 +2745,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2097,8 +2818,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -2799,7 +3043,7 @@ index 3eda87a..f428bbe 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -4273,6 +4919,8 @@ llama_context_params llama_context_default_params() {
+@@ -4273,6 +4992,8 @@ llama_context_params llama_context_default_params() {
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.moe_cache_size              =*/ 0,
@@ -2808,7 +3052,7 @@ index 3eda87a..f428bbe 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4758,6 +5406,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4758,6 +5479,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  
@@ -2946,7 +3190,7 @@ index 3eda87a..f428bbe 100644
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index cf2949a..5e82c30 100644
+index cf2949a..369f7e1 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -19,6 +19,7 @@
@@ -2957,7 +3201,7 @@ index cf2949a..5e82c30 100644
  
  class llama_io_read_i;
  class llama_io_write_i;
-@@ -379,6 +380,85 @@ private:
+@@ -379,6 +380,89 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -3022,6 +3266,10 @@ index cf2949a..5e82c30 100644
 +    // runtime holds back, are not booked); up: also raised to it (after a shrink, when the memory is back); returns the measured free bytes
 +    // rest: the KV is empty at its initial size, the budget is measured again (no check against the booking)
 +    size_t   zones_clamp(bool up = false, bool rest = false);
++    // whether the device's free memory is measured (else the booking: the device total minus what the model and context hold on it)
++    bool     zones_mem_measured(ggml_backend_dev_t dev);
++    size_t   zones_booked_free(ggml_backend_dev_t dev) const;
++    int      zones_measured = -1; // -1 = not asked yet
 +    // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
 +    void     zones_log_state(const char * what);
 +    ggml_backend_dev_t zones_dev() const; // the device the budget is for
