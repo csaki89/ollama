@@ -249,7 +249,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	s.loadedMu.Lock()
 	runner := s.loaded[key]
 	s.loadedMu.Unlock()
-	if runner != nil && !runner.needsReload(c, req) {
+	if runner != nil && !runner.needsReload(c, req) && !dualbufNeedsUnpark(runner, req) {
 		req.useLoadedRunner(runner, s.finishedReqCh)
 	} else {
 		select {
@@ -296,7 +296,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				pendingKey := schedulerModelKey(pending.model)
 				s.loadedMu.Lock()
 				runner := s.loaded[pendingKey]
-				loadedCount := len(s.loaded)
+				loadedCount := len(s.loaded) - s.dualbufParkedCountLocked()
 				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
 				for _, r := range s.loaded {
 					runnersSnapshot = append(runnersSnapshot, r)
@@ -307,6 +307,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					if runner.needsReload(ctx, pending) {
 						slog.Debug("reloading", "runner", runner)
 						runnerToExpire = runner
+					} else if v, wait := s.dualbufUnparkFor(ctx, pending, runner); wait {
+						runnerToExpire = v
 					} else {
 						// Runner is usable, return it
 						logutil.Trace("using existing loaded runner", "model", pendingKey)
@@ -384,6 +386,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					// While we were performing load calculations, the loaded runner(s) unloaded in parallel
 					// so findRunnerToUnload returned no runners.  We'll try again and the loadedCount should be zero
 					slog.Debug("runner to expire was nil, retrying")
+					continue
+				}
+				// dual-buffer fork: an idle victim on the device is parked in process, the loop then checks the room again
+				if s.dualbufTryPark(runnerToExpire) {
 					continue
 				}
 				// Trigger an expiration to unload once it's done

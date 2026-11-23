@@ -26,6 +26,7 @@ type dualbufLoad struct {
 	launch      multimodel.Launch
 	placement   string // config device name, "" = Ollama places the model
 	firstDevice string // the first present device of the model's list
+	viaParked   bool   // a CPU request served by the parked GPU instance of the model (no unpark, no CPU instance)
 }
 
 func newDualbufManager() *multimodel.Manager {
@@ -111,7 +112,16 @@ func (s *Scheduler) dualbufPrepare(ctx context.Context, m *Model, requestOpts ma
 			db.placement = g.Device
 			db.firstDevice = devices[0]
 			if g.Device == multimodel.DeviceCPU {
-				opts.NumGPU = 0
+				if pr := s.dualbufParkedFor(m); pr != nil {
+					// the parked GPU instance runs it on the CPU, without a reload
+					if lm := pr.model.Load(); lm != nil && lm.dualbuf != nil {
+						db.placement = lm.dualbuf.placement
+						db.viaParked = true
+						slog.Info("dualbuf: the CPU request runs on the parked instance", "model", name, "instance", db.placement)
+					}
+				} else {
+					opts.NumGPU = 0
+				}
 			}
 		}
 	}
@@ -184,6 +194,10 @@ func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServer
 	}
 	config.ArgOverrides = db.launch.Args
 	config.KVCacheType = db.launch.KVType
+	if db.cfg.SwapEnabled() && db.cfg.Swap.KeepInRAM == multimodel.KeepInRAMPinned && db.placement != multimodel.DeviceCPU {
+		// in-process swap: pinned GPU-format copies of the GPU weights (llama-server POST /park, /unpark)
+		config.ExtraEnv["LLAMA_ARG_PARK"] = "1"
+	}
 	if db.eff.KVSave.V || (db.cfg.SwapEnabled() && db.cfg.SwapSaveKV()) {
 		dir := multimodel.RAMDir()
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -242,6 +256,8 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	}
 	need = s.dualbuf.HostEstimate(key, need)
 	ram := multimodel.PlanRAM(db.cfg, systemInfo.TotalMemory, systemInfo.FreeMemory)
+	// a reserve like the llama-server RAM guard: the eviction comes before the cgroup limit is reached
+	need += multimodel.RAMReserve(ram.Limit)
 
 	var cands []multimodel.Candidate
 	for _, p := range s.dualbuf.ParkedList() {
@@ -269,7 +285,9 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 			continue
 		}
 		kind := multimodel.KindIdle
-		if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && lm.dualbuf.placement == multimodel.DeviceCPU && lm.dualbuf.firstDevice != multimodel.DeviceCPU {
+		if runnerParked(r) {
+			kind = multimodel.KindParked
+		} else if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && lm.dualbuf.placement == multimodel.DeviceCPU && lm.dualbuf.firstDevice != multimodel.DeviceCPU {
 			kind = multimodel.KindCPUFallback
 		}
 		cands = append(cands, multimodel.Candidate{Key: r.modelKey, Model: r.modelPath, Kind: kind, LastUsed: time.Unix(0, r.dualbufLastUsed.Load()), Forever: forever, Bytes: host, Ref: r})
@@ -309,7 +327,7 @@ func (s *Scheduler) dualbufVictim(req *LlmRequest) *runnerRef {
 	s.loadedMu.Lock()
 	var same []*runnerRef
 	for _, r := range s.loaded {
-		if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && lm.dualbuf.placement == db.placement {
+		if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && lm.dualbuf.placement == db.placement && !runnerParked(r) {
 			same = append(same, r)
 		}
 	}
@@ -491,4 +509,173 @@ func (s *Scheduler) dualbufDropParked(model *Model) {
 			s.dualbuf.Drop(p.Key)
 		}
 	}
+}
+
+// in-process park (llama-server --park): the process stays, its device memory is freed; see docs/MULTIMODEL-DESIGN.md 4.
+
+type parker interface {
+	CanPark() bool
+	ParkRefused() bool
+	Parked() bool
+	ParkedVRAM() uint64
+	Park(ctx context.Context) (time.Duration, error)
+	Unpark(ctx context.Context) (time.Duration, error)
+}
+
+func runnerParker(r *runnerRef) (parker, bool) {
+	if r == nil || r.llama == nil {
+		return nil, false
+	}
+	p, ok := r.llama.(parker)
+	return p, ok
+}
+
+func runnerParked(r *runnerRef) bool {
+	p, ok := runnerParker(r)
+	return ok && p.Parked()
+}
+
+// dualbufParkedCountLocked: the parked runners hold no device memory, they do not count for OLLAMA_MAX_LOADED_MODELS
+// (the RAM budget limits them). Called with loadedMu held.
+func (s *Scheduler) dualbufParkedCountLocked() int {
+	n := 0
+	for _, r := range s.loaded {
+		if runnerParked(r) {
+			n++
+		}
+	}
+	return n
+}
+
+// dualbufParkedFor is a parked GPU instance of the model (for a request placed on the CPU: it runs there without a reload).
+func (s *Scheduler) dualbufParkedFor(m *Model) *runnerRef {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	for _, r := range s.loaded {
+		if lm := r.model.Load(); lm != nil && lm.ModelPath == m.ModelPath && lm.dualbuf != nil && lm.dualbuf.placement != multimodel.DeviceCPU && runnerParked(r) {
+			return r
+		}
+	}
+	return nil
+}
+
+// dualbufNeedsUnpark: the request wants the device of a parked runner (not a CPU request served by the parked process).
+func dualbufNeedsUnpark(r *runnerRef, req *LlmRequest) bool {
+	if !runnerParked(r) {
+		return false
+	}
+	return req.model.dualbuf == nil || !req.model.dualbuf.viaParked
+}
+
+// dualbufTryPark parks a victim in process; false if it cannot (no park copies, busy, already parked, the park failed),
+// then the scheduler expires it (with the process-level park of dualbufBeforeUnload when swap is on).
+func (s *Scheduler) dualbufTryPark(r *runnerRef) bool {
+	if r == nil || !r.dualbufPark.Load() {
+		return false
+	}
+	p, ok := runnerParker(r)
+	if !ok || p.Parked() {
+		return false
+	}
+	name := r.modelPath
+	if lm := r.model.Load(); lm != nil {
+		name = dualbufModelName(lm)
+	}
+	if !p.CanPark() {
+		if p.ParkRefused() {
+			slog.Warn("dualbuf: no in-process park (the pinned copies of the GPU weights did not fit the RAM budget at the load), the swap restarts the process", "model", name)
+		}
+		return false
+	}
+	r.refMu.Lock()
+	defer r.refMu.Unlock()
+	if r.refCount > 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	took, err := p.Park(ctx)
+	if err != nil {
+		slog.Warn("dualbuf: in-process park failed, the model is unloaded instead", "model", name, "error", err)
+		return false
+	}
+	r.dualbufPark.Store(false)
+	slog.Info("dualbuf: model parked in process", "model", name, "duration", took.Round(time.Millisecond), "vram_before", format.HumanBytes2(p.ParkedVRAM()))
+	return true
+}
+
+// dualbufUnparkFor brings a parked runner back for a request that wants its device. It returns the runner to expire (or
+// to park) first when the device has no room for it (wait = true); else the runner is unparked and usable.
+func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *runnerRef) (*runnerRef, bool) {
+	if !dualbufNeedsUnpark(r, req) {
+		return nil, false
+	}
+	p, _ := runnerParker(r)
+	need := p.ParkedVRAM()
+	s.loadedMu.Lock()
+	snapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
+	for _, x := range s.loaded {
+		snapshot = append(snapshot, x)
+	}
+	s.loadedMu.Unlock()
+	gpus := s.getGpuFn(ctx, snapshot)
+	s.updateFreeSpace(gpus)
+	var free uint64
+	found := false
+	for _, g := range gpus {
+		for _, id := range r.gpus {
+			if g.DeviceID == id {
+				free += g.FreeMemory
+				found = true
+			}
+		}
+	}
+	if found && need > free {
+		// room on the device first: the least recently used idle model there (parked in process when it can)
+		if v := s.dualbufVictimExcept(req, r); v != nil {
+			slog.Info("dualbuf: room for an unpark", "model", r.modelPath, "need", format.HumanBytes2(need), "free", format.HumanBytes2(free), "victim", v.modelPath)
+			return v, true
+		}
+	}
+	r.refMu.Lock()
+	uctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	took, err := p.Unpark(uctx)
+	cancel()
+	r.refMu.Unlock()
+	if err != nil {
+		slog.Warn("dualbuf: unpark failed, the model is loaded again", "model", r.modelPath, "error", err)
+		return r, true
+	}
+	slog.Info("dualbuf: model unparked", "model", r.modelPath, "duration", took.Round(time.Millisecond), "vram", format.HumanBytes2(need))
+	return nil, false
+}
+
+// dualbufVictimExcept is the same device victim of dualbufVictim, not the runner being unparked and not a parked one.
+func (s *Scheduler) dualbufVictimExcept(req *LlmRequest, except *runnerRef) *runnerRef {
+	db := req.model.dualbuf
+	if db == nil || db.placement == "" || db.placement == multimodel.DeviceCPU {
+		return nil
+	}
+	s.loadedMu.Lock()
+	var pick *runnerRef
+	for _, r := range s.loaded {
+		if r == except || runnerParked(r) {
+			continue
+		}
+		lm := r.model.Load()
+		if lm == nil || lm.dualbuf == nil || lm.dualbuf.placement != db.placement {
+			continue
+		}
+		r.refMu.Lock()
+		idle := r.refCount == 0
+		r.refMu.Unlock()
+		if idle && (pick == nil || r.dualbufLastUsed.Load() < pick.dualbufLastUsed.Load()) {
+			pick = r
+		}
+	}
+	s.loadedMu.Unlock()
+	if pick != nil && db.cfg.SwapEnabled() {
+		pick.dualbufPark.Store(true)
+	}
+	return pick
 }

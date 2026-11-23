@@ -134,3 +134,8 @@ func PlanRAM(cfg *Config, systemTotal, systemFree uint64) RAM {
 	}
 	return r
 }
+
+// RAMReserve is kept free besides a load: max(1 GiB, 5% of the limit), the same as the llama-server RAM guard.
+func RAMReserve(limit uint64) uint64 {
+	return max(uint64(1)<<30, limit/20)
+}

@@ -196,8 +196,9 @@ type llamaServerRunner struct {
 	output                  *memoryParsingWriter
 	mmprojOffloadOOMRetried bool
 
-	// dual-buffer fork: the live device memory from the zones_state lines
+	// dual-buffer fork: the live device memory from the zones_state lines, the in-process park state
 	dualbufZones zonesLive
+	dualbufPark  dualbufParkState
 }
 
 type llamaServerLaunchConfig struct {
@@ -2989,6 +2990,7 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 					w.runner.gpuLayerOverflow += int(overflowing)
 				}
 			}
+			w.runner.parseParkLocked(b)
 			if w.runner.parseZonesStateLocked(b) && w.buffers != nil {
 				w.updateRunnerMemoryLocked()
 			}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Dual-buffer fork (multimodel): per model llama-server settings and what the scheduler reads back.
@@ -186,8 +187,117 @@ func (s *llamaServerRunner) applyZonesStateLocked(buffers map[memoryBufferKey]me
 			other += b.bytes
 		}
 	}
+	if s.dualbufPark.parked {
+		other = 0 // parked: the compute buffers of the load are freed too
+	}
 	live := z.weights + z.kv + z.fixed + other
 	old := s.vramByDevice[dev]
 	s.vramByDevice[dev] = live
 	s.memGPU = s.memGPU - min(s.memGPU, old) + live
+}
+
+// in-process park (llama-server --park, POST /park and /unpark): the process stays, the device memory is freed
+
+var (
+	parkCopiesRegex = regexp.MustCompile(`park: \d+ GPU weights in \d+ groups have a pinned GPU-format copy`)
+	parkNoRegex     = regexp.MustCompile(`park: .*no in-process park|park: --park requires`)
+)
+
+// parseParkLocked notes from the load log whether the instance can park in process.
+func (s *llamaServerRunner) parseParkLocked(b []byte) {
+	if parkCopiesRegex.Match(b) {
+		s.dualbufPark.copies = true
+	}
+	if parkNoRegex.Match(b) {
+		s.dualbufPark.refused = true
+	}
+}
+
+// dualbufParkState is the in-process park state of a runner.
+type dualbufParkState struct {
+	copies  bool   // the load made the pinned copies
+	refused bool   // --park was asked, the copies did not fit
+	parked  bool   // POST /park succeeded, no /unpark since
+	vram    uint64 // the device memory before the park (to check the room for the unpark)
+}
+
+// CanPark reports whether the runner was loaded with park copies.
+func (s *llamaServerRunner) CanPark() bool {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.copies && !s.dualbufPark.refused
+}
+
+// ParkRefused reports whether --park was asked and the pinned copies did not fit the RAM.
+func (s *llamaServerRunner) ParkRefused() bool {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.refused
+}
+
+// Parked reports whether the runner is parked.
+func (s *llamaServerRunner) Parked() bool {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.parked
+}
+
+// ParkedVRAM is the device memory the runner had before its park.
+func (s *llamaServerRunner) ParkedVRAM() uint64 {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.vram
+}
+
+// Park frees the device memory of the instance (POST /park); the process stays and can still run on the CPU.
+func (s *llamaServerRunner) Park(ctx context.Context) (time.Duration, error) {
+	return s.parkAction(ctx, true)
+}
+
+// Unpark loads the weights and the K/V back to the device (POST /unpark).
+func (s *llamaServerRunner) Unpark(ctx context.Context) (time.Duration, error) {
+	return s.parkAction(ctx, false)
+}
+
+func (s *llamaServerRunner) parkAction(ctx context.Context, park bool) (time.Duration, error) {
+	path := "unpark"
+	if park {
+		path = "park"
+	}
+	var vram uint64
+	if park {
+		s.memoryMu.RLock()
+		vram = s.memGPU
+		s.memoryMu.RUnlock()
+	}
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/%s", s.port, path), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var r struct {
+		Success bool `json:"success"`
+		Parked  bool `json:"parked"`
+	}
+	_ = json.Unmarshal(data, &r)
+	took := time.Since(start)
+	s.memoryMu.Lock()
+	s.dualbufPark.parked = r.Parked
+	if park && r.Parked {
+		s.dualbufPark.vram = vram
+	}
+	if s.output != nil && s.output.buffers != nil {
+		s.output.updateRunnerMemoryLocked()
+	}
+	s.memoryMu.Unlock()
+	if resp.StatusCode != http.StatusOK || !r.Success {
+		return took, fmt.Errorf("%s: %s: %s", path, resp.Status, strings.TrimSpace(string(data)))
+	}
+	return took, nil
 }

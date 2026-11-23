@@ -45,3 +45,9 @@
 - Kód: `multimodel/` (config, feloldás, koordinátor, RAM, kirakás, KV-fájlok, zárolás), `server/sched_dualbuf.go` (+ horgok: `sched.go`, `routes.go`, `images.go`), `llm/llama_server_dualbuf.go` (+ horgok: `server.go`, `llama_server.go`).
 - Példa-config: `docs/dualbuf.example.yaml`; laptopos config és szkriptek: `tools/dualbuf/multimodel/`.
 - Image/compose: `Dockerfile` (`rocm-vulkan`, `EXTRA_APT_PACKAGES`, `LLAMA_SERVER_VULKAN_TARGETS`), `.github/workflows/dualbuf-image.yaml` (a `multimodel` ág, `[skip image]`), `.github/workflows/multimodel-ci.yaml`, `docker-compose.multimodel.yaml`.
+
+## 2. kör (folyamatban, a használati keret miatt megszakítva)
+- **Kész, laptopon mérve (llama-server, Iris Xe):** Vulkan sparse KV (28/28 réteg helyben nő és zsugorodik, 0 másolás; a meghajtó szerinti szabad memória +490 MiB / 560 MiB felszabadítás); folyamaton belüli park/unpark (3 kör, azonos kimenet, KV megmarad; park: súly 111–162 ms, unpark 189–384 ms / 935 MiB; flex sávval is azonos); `--no-zones-flex`; a RAM-védelem elutasítja a pinned példányokat, ha nem férnek el (naplósor). Forrás: csaki89/llama.cpp `multimodel` (a45647ddb, 79ba3cd13), szkriptek: `tools/dualbuf/park.sh`, `vk-sparse-grow.sh`.
+- **Patch 003 frissítve** (tiszta b12177 + 001 fán felmegy, 004 utána is).
+- **Ollama-horgok megírva, nem tesztelve:** `LLAMA_ARG_PARK`, folyamaton belüli park áldozatnál, unpark a kérésnél, CPU-kérés a parkolt példányon, `MAX_LOADED_MODELS` a parkoltakat nem számolja, RAM-tartalék. A CI-futás és a laptopos Ollama-teszt hátra van.
+- **Hátra:** a `zones`/`dynamic_kv` szétválasztása az Ollama-configban (`LLAMA_ARG_ZONES_FLEX`), NAS-TESTS kiegészítése (X080 csereidő, RX 550 sparse), a parkolt példány VRAM-maradéka diszkrét GPU-n, a projektor (mmproj) és a rekurrens állapot parkolása (ma a helyén marad) → OPEN-QUESTIONS.
