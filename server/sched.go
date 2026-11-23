@@ -315,7 +315,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					}
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
-					runnerToExpire = s.findRunnerToUnload()
+					runnerToExpire = s.dualbufVictim(pending)
 				} else {
 					// Either no models are loaded or below envconfig.MaxRunners
 					// Get a refreshed GPU list
