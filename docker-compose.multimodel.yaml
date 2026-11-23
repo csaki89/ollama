@@ -1,0 +1,62 @@
+# TrueNAS SCALE custom app for the multimodel branch (Ollama 0.40.16 + dual-buffer + the multi-model rules of
+# /models/dualbuf.yaml, ROCm + Vulkan). A test instance next to the others: port 30071.
+#
+# - Image: the moving tag :multimodel (every "dualbuf-image" build of the multimodel branch overwrites it; the
+#   workflow also prints a fixed <version>-dualbuf-<commit> tag). Pull by hand for a newer build, then restart.
+# - The config: /mnt/nvme/ollama/models/dualbuf.yaml (example: docs/dualbuf.example.yaml). Only this image reads it.
+#   Fill the devices section from the log line "dualbuf devices" / "inference compute" (PCI address or name).
+# - The other Ollama instances share the model directory: run one of them at a time on the GPU (docs/NAS-TESTS.md).
+services:
+  ollama-multimodel:
+    image: ghcr.io/csaki89/ollama-dualbuf:multimodel
+    container_name: ollama-multimodel
+    restart: unless-stopped
+    ports:
+      - "30071:11434"
+    devices:
+      - /dev/kfd:/dev/kfd
+      # the ROCm card (today the RX 6700); for the X080 add/replace its render node
+      - /dev/dri/renderD129:/dev/dri/renderD129
+      # the Vulkan card (RX 550): its render node, see `ls -l /dev/dri/by-path` on the NAS (renderD128 is an assumption)
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - video
+      - render
+    ulimits:
+      # pinned host buffers and keep_in_ram: pinned (mlock of the parked model files)
+      memlock: -1
+    # the KV of a swapped (parked) model is kept in /dev/shm: Docker gives 64 MB by default. It counts against the
+    # memory limit while used (the scheduler's RAM budget sees it)
+    shm_size: "32gb"
+    deploy:
+      resources:
+        limits:
+          cpus: "60"
+          memory: 100G
+    healthcheck:
+      test: ["CMD", "/bin/ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+      LLAMA_ARG_LOAD_MODE: "none"
+      # the defaults below are the env level: dualbuf.yaml defaults and model sections override them
+      LLAMA_ARG_DUAL_BUFFER: "1"
+      LLAMA_ARG_AUTO_ZONES: "1"
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_KEEP_ALIVE: "30m"
+      # several models loaded at once (GPU, Vulkan card, CPU instances); the RAM budget and the swap rule decide
+      OLLAMA_MAX_LOADED_MODELS: "6"
+      OLLAMA_NOPRUNE: "1"
+      OLLAMA_MODELS: /models
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - /mnt/nvme/ollama/models:/models

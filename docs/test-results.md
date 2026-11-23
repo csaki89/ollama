@@ -82,3 +82,9 @@ Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is v
 | RAM-hiány, parkoló, keep_alive -1 | `ram_limit: 1GiB`: `parked model dropped from RAM` (qwen25), a `keep_alive: -1`-es embedding betöltve marad (`ollama ps`: `Forever`) |
 
 Nem tesztelt a laptopon: a VRAM-hiány miatti csere (az iGPU szabad memóriája nem változik, ezért a `MAX_LOADED_MODELS` váltotta ki; ugyanaz az áldozatválasztás fut), két GPU, a GPU+CPU megosztott modell CPU-helye (egységteszt: `TestCoordAlsoCPU`), a fájlzárolás (Linux), ROCm. Ezek a `NAS-TESTS.md`-ben.
+
+## Dinamikus KV Vulkanon az Ollamán át (laptop, Iris Xe), 2026-11-23
+`qwen25:1.5b`, config: `max_context: 8192`, `dynamic_kv: true` (defaults). 7128 tokenes prompt („What color is the frog?”).
+- Dinamikus KV: `set_dynamic: dynamic KV: 4096 -> 8192 cells ... 28 by copy`, a promptnál `relayout: KV 4096 -> 8192 cells (... 28 new by copy) 160.4 ms: alloc 119.7, copy 36.3, free 4.0`, `zones_state ... KV 8192 cells (224 MiB on the device)`. Válasz: „The color of the frog is green.”
+- Ugyanez a kérés `options.dynamic_kv: false`-szal: a naplósor `dynamic_kv=false(request)`, az ujjlenyomat eltér, újratöltés; az új folyamatban nincs `auto zones`/`set_dynamic` sor (statikus KV). Válasz: ugyanaz.
+- Következtetés: a dinamikus KV Vulkanon a másolásos úton működik (a helyben növelés, VMM/sparse, csak CUDA/HIP-en van).
