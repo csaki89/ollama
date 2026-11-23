@@ -83,6 +83,12 @@ type LlamaServerConfig struct {
 	ManifestDigest       string
 	DraftModelPath       string
 	DraftModelShardPaths []string
+
+	// Dual-buffer fork, per model settings (multimodel): extra llama-server environment, command line flags
+	// to replace or add, and the KV cache type instead of OLLAMA_KV_CACHE_TYPE. Empty: no change.
+	ExtraEnv     map[string]string
+	ArgOverrides map[string][]string
+	KVCacheType  string
 }
 
 // IsLlamaCPP reports whether the server is backed by the llama.cpp
@@ -114,6 +120,9 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	}
 
 	kvct := strings.ToLower(envconfig.KvCacheType())
+	if config.KVCacheType != "" {
+		kvct = strings.ToLower(config.KVCacheType)
+	}
 	return NewLlamaServerRunner(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvct, config)
 }
 

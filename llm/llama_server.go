@@ -454,6 +454,8 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
 
+	params = applyArgOverrides(params, launch.config.ArgOverrides)
+
 	// Set up library paths for GPU backend discovery
 	cmd = exec.Command(exe, params...)
 
@@ -983,6 +985,9 @@ func NewLlamaServerRunner(
 		serverEnvs[k] = v
 	}
 	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
+	for k, v := range config.ExtraEnv {
+		serverEnvs[k] = v
+	}
 
 	launch := llamaServerLaunchConfig{
 		modelPath:    splitModel.modelPath,
