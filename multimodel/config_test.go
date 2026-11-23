@@ -328,3 +328,14 @@ func TestParseBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestExampleFileParses(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "docs", "dualbuf.example.yaml"))
+	if err != nil {
+		t.Skip(err)
+	}
+	c := mustParse(t, string(data))
+	if len(c.Devices) != 3 || len(c.Models) != 3 || !c.SwapEnabled() {
+		t.Fatalf("example: %+v", c)
+	}
+}

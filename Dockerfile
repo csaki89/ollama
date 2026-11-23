@@ -184,13 +184,15 @@ FROM scratch AS publish-llama-server-rocm_v7_2
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama/
 
 FROM vulkan-deps AS llama-server-vulkan
+# Optional build targets (empty = all; only ggml-vulkan is installed). Used by the dual-buffer fork image.
+ARG LLAMA_SERVER_VULKAN_TARGETS=
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
 COPY cmake cmake
 RUN --mount=type=cache,target=/root/.ccache \
     cmake -S llama/server --preset vulkan \
-        && cmake --build build/llama-server-vulkan -- -l $(nproc) \
+        && cmake --build build/llama-server-vulkan ${LLAMA_SERVER_VULKAN_TARGETS:+--target $LLAMA_SERVER_VULKAN_TARGETS} -- -l $(nproc) \
         && cmake --install build/llama-server-vulkan --component llama-server --strip
 
 FROM scratch AS publish-llama-server-vulkan
@@ -343,6 +345,10 @@ FROM scratch AS rocm
 COPY --from=llama-server-cpu  dist/lib/ollama /lib/ollama
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama
 
+# dual-buffer fork: ROCm and Vulkan (e.g. a second, older AMD card that ROCm does not support)
+FROM rocm AS rocm-vulkan
+COPY --from=llama-server-vulkan dist/lib/ollama /lib/ollama
+
 FROM --platform=linux/amd64 scratch AS amd64-archive
 COPY --from=amd64 /lib/ollama /lib/ollama/
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama/
@@ -361,12 +367,14 @@ COPY --from=build /go/src/github.com/ollama/ollama/build/go-license/lib/ollama/G
 FROM ubuntu:24.04
 ARG APT_MIRROR=http://archive.ubuntu.com/ubuntu
 ARG APT_PORTS_MIRROR=http://ports.ubuntu.com/ubuntu-ports
+# dual-buffer fork: extra packages of the final image (e.g. mesa-vulkan-drivers for RADV), empty upstream
+ARG EXTRA_APT_PACKAGES=
 RUN sed -i \
         -e "s|http://archive.ubuntu.com/ubuntu|$APT_MIRROR|g" \
         -e "s|http://ports.ubuntu.com/ubuntu-ports|$APT_PORTS_MIRROR|g" \
         /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
-    && apt-get install -y ca-certificates libvulkan1 libopenblas0 \
+    && apt-get install -y ca-certificates libvulkan1 libopenblas0 ${EXTRA_APT_PACKAGES} \
     && sed -i \
         -e "s|$APT_MIRROR|http://archive.ubuntu.com/ubuntu|g" \
         -e "s|$APT_PORTS_MIRROR|http://ports.ubuntu.com/ubuntu-ports|g" \

@@ -1,0 +1,64 @@
+# Fork-only workflow (multimodel branch): Go vet/tests of the packages the multi-model work touches (the
+# server package needs cgo, which the Windows laptop does not have), and a Windows ollama.exe for the laptop
+# tests (downloaded as an artifact, run with the locally built llama-server).
+name: multimodel-ci
+
+on:
+  push:
+    branches: [multimodel]
+  workflow_dispatch:
+
+concurrency:
+  group: multimodel-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    if: github.repository_owner != 'ollama'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: go vet
+        run: go vet ./multimodel/ ./llm/ ./server/
+      - name: go test (multimodel, llm)
+        run: go test -race -count=1 ./multimodel/ ./llm/
+      - name: go test (server)
+        run: go test -race -count=1 ./server/
+
+  windows-ollama:
+    if: github.repository_owner != 'ollama'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build ollama.exe
+        shell: bash
+        run: |
+          git fetch --quiet --no-tags https://github.com/ollama/ollama.git '+refs/tags/v*:refs/tags/v*'
+          ver="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
+          ver="${ver#v}"
+          go build -trimpath -ldflags "-w -s -X=github.com/ollama/ollama/version.Version=${ver}-mm-$(git rev-parse --short=7 HEAD)" -o dist/ollama.exe .
+          ./dist/ollama.exe --version || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ollama-windows-amd64
+          path: dist/ollama.exe
+          retention-days: 7

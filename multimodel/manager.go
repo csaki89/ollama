@@ -134,6 +134,21 @@ func (m *Manager) Park(p *Parked) {
 	slog.Info("dualbuf: model parked", "model", p.Model, "placement", p.Placement, "kv", p.Prefix != "", "pinned", p.Pinned != nil, "ram", p.Bytes)
 }
 
+// SetPinned attaches the pinned model file to a parked record; if the model is no longer parked, the pin is released.
+func (m *Manager) SetPinned(key string, pin *Pinned) {
+	m.mu.Lock()
+	p := m.parked[key]
+	if p != nil && p.Pinned == nil {
+		p.Pinned = pin
+		p.Bytes += pin.Bytes
+		m.mu.Unlock()
+		slog.Info("dualbuf: model file pinned in RAM", "model", p.Model, "bytes", pin.Bytes)
+		return
+	}
+	m.mu.Unlock()
+	pin.Release()
+}
+
 // Unpark takes the record of a key (the model is being loaded again); nil if it was not parked.
 func (m *Manager) Unpark(key string) *Parked {
 	m.mu.Lock()
@@ -149,7 +164,8 @@ func (m *Manager) ParkedList() []*Parked {
 	defer m.mu.Unlock()
 	out := make([]*Parked, 0, len(m.parked))
 	for _, p := range m.parked {
-		out = append(out, p)
+		c := *p
+		out = append(out, &c)
 	}
 	return out
 }

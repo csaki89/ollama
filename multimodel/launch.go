@@ -16,7 +16,8 @@ type Launch struct {
 	Notes    []string            // log notes on values that had to be adjusted
 }
 
-func fromConfig(src string) bool {
+// FromConfig reports whether a value came from the config file or the request (not builtin or env).
+func FromConfig(src string) bool {
 	return src != "" && src != SrcBuiltin && src != SrcEnv
 }
 
@@ -29,31 +30,31 @@ func (e Effective) AutoZones() bool {
 // Launch maps the effective settings to the llama-server start.
 func (e Effective) Launch() Launch {
 	l := Launch{Env: map[string]string{}, Args: map[string][]string{}}
-	if fromConfig(e.DualBuffer.Src) {
+	if FromConfig(e.DualBuffer.Src) {
 		l.Env["LLAMA_ARG_DUAL_BUFFER"] = boolEnv(e.DualBuffer.V)
 	}
-	if fromConfig(e.DynamicKV.Src) || fromConfig(e.Zones.Src) {
+	if FromConfig(e.DynamicKV.Src) || FromConfig(e.Zones.Src) {
 		l.Env["LLAMA_ARG_AUTO_ZONES"] = boolEnv(e.AutoZones())
 		if e.DynamicKV.V && e.Zones.V == ZonesOff {
 			l.Notes = append(l.Notes, "zones: off turns the dynamic KV off as well (they are one switch, --auto-zones)")
 		}
 	}
-	if fromConfig(e.KVType.Src) {
+	if FromConfig(e.KVType.Src) {
 		l.KVType = e.KVType.V
 	}
-	if fromConfig(e.Parallel.Src) {
+	if FromConfig(e.Parallel.Src) {
 		l.Parallel = e.Parallel.V
 	}
-	if fromConfig(e.NUbatch.Src) && e.NUbatch.V > 0 {
+	if FromConfig(e.NUbatch.Src) && e.NUbatch.V > 0 {
 		l.Args["-ub"] = []string{strconv.Itoa(e.NUbatch.V)}
 	}
-	if fromConfig(e.FlashAttention.Src) {
+	if FromConfig(e.FlashAttention.Src) {
 		l.Args["--flash-attn"] = []string{e.FlashAttention.V}
 		if e.FlashAttention.V == "off" && e.AutoZones() {
 			l.Notes = append(l.Notes, "flash_attention: off keeps the V cache transposed, the dynamic KV stays off")
 		}
 	}
-	if fromConfig(e.OnBusy.Src) && e.OnBusy.V == OnBusyNext && fromConfig(e.WaitTimeout.Src) {
+	if FromConfig(e.OnBusy.Src) && e.OnBusy.V == OnBusyNext && FromConfig(e.WaitTimeout.Src) {
 		l.Notes = append(l.Notes, "on_busy: next ignores wait_timeout")
 	}
 	return l

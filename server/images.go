@@ -97,6 +97,9 @@ type Model struct {
 	// runnerSelection is empty when the platform's default preference selected
 	// the manifest, or the explicitly requested runner otherwise.
 	runnerSelection string
+
+	// dual-buffer fork: the request's multi-model settings and placed device (sched_dualbuf.go)
+	dualbuf *dualbufLoad
 }
 
 func (m *Model) IsMLX() bool {

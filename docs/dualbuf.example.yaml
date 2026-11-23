@@ -1,0 +1,45 @@
+# Example /models/dualbuf.yaml (next to the models; OLLAMA_DUALBUF_CONFIG overrides the path).
+# Read at every model load; a change applies from the next load of a model, a running model keeps the
+# settings it was loaded with. A broken file: the last valid version is used, with an ERROR line in the log.
+#
+# Precedence per field: env < defaults < Modelfile PARAMETER < the model's section < the request options.
+# Model keys: name:tag, or a pattern (path.Match: *, ?, [..]); the exact name wins, then the longest pattern.
+
+defaults:
+  dual_buffer: true      # LLAMA_ARG_DUAL_BUFFER
+  dynamic_kv: true       # with zones (default auto): LLAMA_ARG_AUTO_ZONES (they are one switch in the fork)
+  kv_type: f16           # OLLAMA_KV_CACHE_TYPE
+  keep_alive: 30m        # OLLAMA_KEEP_ALIVE; -1 = forever (never fully unloaded for RAM)
+
+devices:
+  # match: a PCI address (two cards of the same type need it) or a part of the name; backend: rocm, vulkan, cuda
+  x080:  { backend: rocm,   match: "0000:03:00.0", max_running: 1 }
+  rx550: { backend: vulkan, match: "RX 550",       max_running: 1 }
+  cpu:   { max_running: 1 }
+
+models:
+  qwen3-coder:30b:
+    devices: [x080, cpu]   # the first free device wins, for every request
+    on_busy: wait          # wait for the first device up to wait_timeout, then go on
+    wait_timeout: 120s
+    zones: auto            # auto | off (off also turns the dynamic KV off); the flex band size is computed
+    max_context: 131072    # num_ctx
+  qwen3-vl:8b:
+    devices: [x080, cpu]
+    on_busy: next          # go on at once (wait_timeout ignored)
+    max_context: 16384
+  qwen3-embedding:*:
+    devices: [rx550, cpu]
+    dual_buffer: false
+    max_context: 4096
+    keep_alive: -1
+    # also: parallel, threads, n_batch, n_ubatch, flash_attention (on|off|auto), kv_save (KV to the disk
+    # before a full unload, restored at the next load)
+
+swap:
+  enabled: true            # an idle model on the first device is parked to make room
+  keep_in_ram: pinned      # pinned: the parked model's file pages are locked in RAM (Linux, memlock); none
+  save_kv: true            # the parked model's KV is kept in RAM (tmpfs) and restored
+  # kv_dir: /models/dualbuf-kv   # where kv_save writes (default <models>/dualbuf-kv)
+
+# ram_limit: 90GiB         # plan with less than the container limit

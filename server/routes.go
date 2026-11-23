@@ -141,6 +141,11 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 	if opts.NumCtx == 0 {
 		opts.NumCtx = s.defaultNumCtx
 	}
+	// dual-buffer fork: dualbuf.yaml defaults after the environment, the model's section after the Modelfile
+	dbCfg := s.sched.dualbufConfigFor(model)
+	if err := opts.FromMap(dbCfg.DefaultsOptions()); err != nil {
+		return api.Options{}, err
+	}
 
 	// api.Options stores defaulted values, so lower layers cannot distinguish
 	// an unset draft_num_predict from the default. Track that while we still
@@ -152,6 +157,9 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 			return api.Options{}, err
 		}
 		if err := opts.FromMap(model.Options); err != nil {
+			return api.Options{}, err
+		}
+		if err := opts.FromMap(dbCfg.ModelOptions(dualbufModelName(model))); err != nil {
 			return api.Options{}, err
 		}
 	}
@@ -275,10 +283,17 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
 		return nil, nil, nil, fmt.Errorf("%s %w", m.Name, err)
 	}
 
-	numCtxAuto := usesAutomaticNumCtx(m, requestOpts)
-	embeddingBatchDefault := shouldApplyEmbeddingBatchDefault(m, requestOpts)
-	numBatchAuto := usesAutomaticNumBatch(m, requestOpts) && !embeddingBatchDefault
+	dbCfg := s.sched.dualbufConfigFor(m)
+	numCtxAuto := usesAutomaticNumCtx(m, requestOpts) && !dbCfg.SetsContext(dualbufModelName(m))
+	embeddingBatchDefault := shouldApplyEmbeddingBatchDefault(m, requestOpts) && !dbCfg.SetsBatch(dualbufModelName(m))
+	numBatchAuto := usesAutomaticNumBatch(m, requestOpts) && !embeddingBatchDefault && !dbCfg.SetsBatch(dualbufModelName(m))
 	opts, err := s.modelOptionsWithEmbeddingBatchDefault(m, requestOpts, embeddingBatchDefault)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// dual-buffer fork: the request's device place (it may wait for it) and the model's settings
+	m, keepAlive, grant, err := s.sched.dualbufPrepare(ctx, m, requestOpts, keepAlive, &opts)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -288,8 +303,10 @@ func (s *Server) scheduleRunnerForModel(ctx context.Context, m *Model, caps []mo
 	select {
 	case runner = <-runnerCh:
 	case err = <-errCh:
+		grant.Release()
 		return nil, nil, nil, err
 	}
+	s.sched.dualbufStarted(ctx, m, runner.llama, grant)
 
 	return runner.llama, m, &opts, nil
 }

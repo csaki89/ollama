@@ -26,6 +26,7 @@ import (
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/mlxrunner"
+	"github.com/ollama/ollama/multimodel"
 	"github.com/ollama/ollama/types/model"
 )
 
@@ -58,6 +59,9 @@ type LlmRequest struct {
 	// request-level shift option before scheduling.
 	contextShift bool
 	shift        *bool
+
+	// dual-buffer fork: the runner to expire for this request's RAM room (sched_dualbuf.go)
+	dualbufVictim *runnerRef
 }
 
 type Scheduler struct {
@@ -81,6 +85,9 @@ type Scheduler struct {
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
 	getSystemInfoFn func() ml.SystemInfo
 	waitForRecovery time.Duration
+
+	// dual-buffer fork: the multi-model rules (dualbuf.yaml), nil-safe
+	dualbuf *multimodel.Manager
 }
 
 // loadedModelsForName returns models still owned by loaded runners. The models
@@ -134,16 +141,17 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		getGpuFn:        discover.GPUDevices,
 		getSystemInfoFn: discover.GetSystemInfo,
 		waitForRecovery: 5 * time.Second,
+		dualbuf:         newDualbufManager(),
 	}
 	sched.loadFn = sched.load
 	return sched
 }
 
-// schedulerModelKey returns the scheduler map key for a model.
+// schedulerModelKeyBase returns the scheduler map key for a model.
 // GGUF-backed models use ModelPath; safetensors/image models without a
 // ModelPath use the selected manifest digest so distinct child manifests don't
-// collide.
-func schedulerModelKey(m *Model) string {
+// collide. schedulerModelKey (sched_dualbuf.go) adds the placed device.
+func schedulerModelKeyBase(m *Model) string {
 	if m == nil {
 		return ""
 	}
@@ -317,6 +325,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else {
 						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
 						gpus = s.getGpuFn(ctx, runnersSnapshot)
+						s.dualbuf.NoteDevices(gpus)
 					}
 					logutil.Trace("refreshing system information", "model", pending.model.ModelPath)
 					systemInfo := s.getSystemInfoFn()
@@ -368,7 +377,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						continue
 					}
 
-					runnerToExpire = s.findRunnerToUnload()
+					runnerToExpire = s.dualbufVictim(pending)
 				}
 
 				if runnerToExpire == nil {
@@ -469,6 +478,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				continue
 			}
 
+			s.dualbufBeforeUnload(runner)
 			s.loadedMu.Lock()
 			slog.Debug("got lock to unload expired event", "runner", runner)
 			runnerToUnload := s.loaded[runner.modelKey]
@@ -526,6 +536,7 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	if pending.sessionDuration != nil {
 		runner.sessionDuration = pending.sessionDuration.Duration
 	}
+	runner.dualbufLastUsed.Store(time.Now().UnixNano())
 	pending.successCh <- runner
 	go func() {
 		<-pending.ctx.Done()
@@ -537,6 +548,9 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
+	if s.dualbufRoom(req, systemInfo, gpus) {
+		return true
+	}
 	numParallel := max(int(envconfig.NumParallel()), 1)
 	completion := req.model.CheckCapabilities(model.CapabilityCompletion) == nil
 
@@ -544,6 +558,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	if !completion {
 		numParallel = 1
 	}
+	numParallel = dualbufNumParallel(req, numParallel, completion)
 
 	sessionDuration := envconfig.KeepAlive()
 	if req.sessionDuration != nil {
@@ -570,7 +585,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+			if req.model.dualbuf != nil && req.model.dualbuf.placement != "" {
+				loadGpus, launchOpts = s.dualbufPlacementGPUs(req, systemInfo, gpus, predicted)
+			} else {
+				loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+			}
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
@@ -612,6 +631,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			config := llamaServerConfigForModel(req.model)
 			config.ContextShift = req.contextShift
+			s.dualbufServerConfig(req, &config)
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -790,6 +810,7 @@ iGPUScan:
 		}
 		runner.refCount++
 		runner.loading = false
+		s.dualbufAfterLoad(runner)
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
@@ -1396,6 +1417,10 @@ type runnerRef struct {
 	contextShift bool
 	trainContext int
 	*api.Options
+
+	// dual-buffer fork: last use (unix ns, for the LRU) and whether the next unload parks the model
+	dualbufLastUsed atomic.Int64
+	dualbufPark     atomic.Bool
 }
 
 // The refMu must already be held when calling unload
@@ -1456,6 +1481,9 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	loaded := runner.model.Load()
+	if loaded != nil && dualbufFingerprint(loaded) != dualbufFingerprint(req.model) {
+		return true
+	}
 	if loaded == nil ||
 		!reflect.DeepEqual(loaded.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(loaded.ProjectorPaths, req.model.ProjectorPaths) || // have the projectors changed?
@@ -1748,12 +1776,14 @@ func (s *Scheduler) unloadAllRunners() {
 	for model, runner := range s.loaded {
 		if runner.llama != nil {
 			slog.Debug("shutting down runner", "model", model)
+			s.dualbufBeforeUnload(runner)
 			runner.llama.Close()
 		}
 	}
 }
 
 func (s *Scheduler) expireRunner(model *Model) {
+	s.dualbufDropParked(model)
 	modelKey := schedulerModelKey(model)
 	var runners []*runnerRef
 

@@ -8,7 +8,8 @@ name: dualbuf-image
 on:
   push:
     # dual-buffer-0.40.16: the update to Ollama v0.40.16 (llama.cpp b12177), built before it replaces dual-buffer
-    branches: [dual-buffer, dual-buffer-0.40.16]
+    # multimodel: the multi-model work (ROCm + Vulkan image), its own moving tag :multimodel
+    branches: [dual-buffer, dual-buffer-0.40.16, multimodel]
   workflow_dispatch:
     inputs:
       cold:
@@ -33,7 +34,8 @@ env:
 
 jobs:
   image:
-    if: github.repository_owner != 'ollama'
+    # "[skip image]" in the head commit message: no image build (the other workflows still run)
+    if: github.repository_owner != 'ollama' && !contains(github.event.head_commit.message, '[skip image]')
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -117,7 +119,9 @@ jobs:
           push: true
           provenance: false
           build-args: |
-            FLAVOR=rocm
+            FLAVOR=${{ github.ref_name == 'multimodel' && 'rocm-vulkan' || 'rocm' }}
+            EXTRA_APT_PACKAGES=${{ github.ref_name == 'multimodel' && 'mesa-vulkan-drivers' || '' }}
+            LLAMA_SERVER_VULKAN_TARGETS=ggml-vulkan
             GOFLAGS=${{ steps.meta.outputs.GOFLAGS }}
             LLAMA_SERVER_ROCM_CMAKE_ARGS=-DAMDGPU_TARGETS=${{ env.GPU_ARCH }}
             ROCM_KEEP_ARCH=${{ env.GPU_ARCH }}
@@ -144,6 +148,9 @@ jobs:
           docker pull "$img"
           docker image inspect "$img" --format 'size: {{.Size}} bytes'
           docker run --rm --entrypoint /bin/ollama "$img" --version
+          if [ "${{ github.ref_name }}" = multimodel ]; then
+            docker run --rm --entrypoint /bin/sh "$img" -c 'set -e; ls -la /usr/lib/ollama/vulkan; test -f /usr/lib/ollama/vulkan/libggml-vulkan.so; ls /usr/share/vulkan/icd.d/; test -f /usr/share/vulkan/icd.d/radeon_icd.x86_64.json'
+          fi
           docker run --rm --entrypoint /bin/sh "$img" -c '
             echo "== /usr/lib/ollama (sizes)"; du -sh /usr/lib/ollama /usr/lib/ollama/*/
             for d in /usr/lib/ollama/rocm*; do
