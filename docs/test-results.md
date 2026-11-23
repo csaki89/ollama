@@ -45,3 +45,19 @@ ROCm/HIP (az image csak a GitHub Actionsben épül), MoE modell (qwen3-coder:30b
 | `LLAMA_ARG_DUAL_BUFFER=1` | 313,7 | 19,3 | azonos |
 
 A napló: `flex layers 15-16: 24 weights with a CPU copy (53,72 MiB), 12 with a host copy (42,61 MiB)`; a 15. és 16. réteg súlya és K/V-je a CPU-ra ment (0,9 / 0,0 ms súly, 0,4 ms K/V), majd visszatérve a Vulkan0-ra (3,9–6,1 ms súly, 0,6–1,1 ms K/V). A RAM-védelem sora a sávra is kiírja a becslést (`flex: free RAM … flex copies 107 MiB`). Ez a mérés a portolás helyességét igazolja (a mozgatás működik, a kimenet azonos), nem teljesítménymérés. A NAS-os mérés: `tools/dualbuf/nas-flex-bench.py` (SUMMARY.md).
+
+# Többmodelles munka: laptopos tesztek (multimodel branch)
+
+## KV-mentés és -visszatöltés (llama-server slot save/restore), 2026-11-23
+Fork llama-server (b12177 + 001 + 003 + 004, CPU, `C:\b\c16`), qwen3:0.6b, `-np 1 -ngl 0 --load-mode none`, 832 tokenes prompt, 16 generált token, `temperature 0`. Mentés `-c 4096`-tal, visszatöltés új folyamatba. Szkriptek: `tools/dualbuf/multimodel/slot-restore.sh`, `slot-restore-edge.sh` (`MODEL=<gguf>`, `BIN=<llama-server>`).
+
+| visszatöltés ide | eredmény | a következő azonos kérés | kimenet |
+|---|---|---|---|
+| `-c 4096` (azonos) | 847 token, 97 MB, 42 ms | `prompt_n 1, cache_n 831` | azonos |
+| `-c 8192` (nagyobb) | 847 token, 59 ms | `prompt_n 1, cache_n 831` | azonos |
+| `-c 1024` (kisebb, a tokenek elférnek) | 847 token, 42 ms | `prompt_n 1, cache_n 831` | azonos |
+| `-c 8192`, auto zónák, a KV 512 cellával indul (`LLAMA_ARG_ZONES_CTX_INIT=512`) | 847 token, 105 ms (a dinamikus KV megnő) | `prompt_n 1, cache_n 831` | azonos |
+| `-c 512` (a tokenek nem férnek el) | **elutasítva** (`No available space in KV cache`), a kérés hibával jön, mert a prompt maga sem fér el | – | – |
+| `-c 4096`, `q8_0` KV (a mentés f16) | **elutasítva**, a következő kérés a promptot újraszámolja (`prompt_n 832`) | | azonos |
+
+Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is visszatölthető, ha a mentett tokenek elférnek; a dinamikus KV-val is (a KV a visszatöltéskor nő). Eltérő KV-típusnál a llama-server maga is elutasítja; a fork ezt előre szűri (`KVMeta.Compatible`, a fájlnévben is benne a KV-típus), hogy a hibasor el se jöjjön.
