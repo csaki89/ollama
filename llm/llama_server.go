@@ -195,6 +195,9 @@ type llamaServerRunner struct {
 	launch                  llamaServerLaunchConfig
 	output                  *memoryParsingWriter
 	mmprojOffloadOOMRetried bool
+
+	// dual-buffer fork: the live device memory from the zones_state lines
+	dualbufZones zonesLive
 }
 
 type llamaServerLaunchConfig struct {
@@ -2986,6 +2989,9 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 					w.runner.gpuLayerOverflow += int(overflowing)
 				}
 			}
+			if w.runner.parseZonesStateLocked(b) && w.buffers != nil {
+				w.updateRunnerMemoryLocked()
+			}
 			for _, match := range bufferSizeRegex.FindAllSubmatch(b, -1) {
 				backendName := string(match[2])
 				if mib, err := strconv.ParseFloat(string(match[4]), 64); err == nil {
@@ -3036,6 +3042,7 @@ func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 	w.runner.memModelFileBacked = modelFileBacked
 	w.runner.memCPUMappedModel = cpuMappedModel
 	w.runner.vramByDevice = byDevice
+	w.runner.applyZonesStateLocked(w.buffers)
 }
 
 // VRAMByGPU returns the VRAM used by this runner on the specified device.

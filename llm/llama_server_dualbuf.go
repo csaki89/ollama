@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -135,4 +137,57 @@ func (s *llamaServerRunner) slotAction(ctx context.Context, action, prefix strin
 		out = append(out, f)
 	}
 	return out, errors.Join(errs...)
+}
+
+// zonesLive is the device memory of a runner as the fork's zones report it after every change (dynamic KV growth
+// and shrink, flex layer moves): the weights on the GPU, the KV on the device and the parts of the memory that keep
+// their size. Ollama otherwise only knows the buffers of the load.
+type zonesLive struct {
+	seen    bool
+	weights uint64
+	kv      uint64
+	fixed   uint64
+}
+
+var (
+	zonesStateRegex = regexp.MustCompile(`zones_state \([^)]*\): weights GPU (\d+) MiB.*?KV \d+ cells \(\d+ used, (\d+) MiB on the device\)(?:; fixed on the device: ([^;]*))?`)
+	mibRegex        = regexp.MustCompile(`(\d+) MiB`)
+)
+
+// parseZonesStateLocked reads the last zones_state line of b; true if there was one.
+func (s *llamaServerRunner) parseZonesStateLocked(b []byte) bool {
+	all := zonesStateRegex.FindAllSubmatch(b, -1)
+	if len(all) == 0 {
+		return false
+	}
+	m := all[len(all)-1]
+	w, _ := strconv.ParseUint(string(m[1]), 10, 64)
+	kv, _ := strconv.ParseUint(string(m[2]), 10, 64)
+	var fixed uint64
+	for _, f := range mibRegex.FindAllSubmatch(m[3], -1) {
+		n, _ := strconv.ParseUint(string(f[1]), 10, 64)
+		fixed += n
+	}
+	s.dualbufZones = zonesLive{seen: true, weights: w << 20, kv: kv << 20, fixed: fixed << 20}
+	return true
+}
+
+// applyZonesStateLocked replaces the device total of a single-GPU runner with the live one: the zones' weights,
+// KV and fixed parts plus the other device buffers of the load (compute, output, inputs).
+func (s *llamaServerRunner) applyZonesStateLocked(buffers map[memoryBufferKey]memoryBuffer) {
+	z := s.dualbufZones
+	if !z.seen || len(s.gpus) != 1 {
+		return
+	}
+	dev := s.gpus[0].Name
+	var other uint64
+	for key, b := range buffers {
+		if isGPUBuffer(key.backend) && deviceName(key.backend) == dev && key.kind != "model" && key.kind != "KV" && key.kind != "RS" {
+			other += b.bytes
+		}
+	}
+	live := z.weights + z.kv + z.fixed + other
+	old := s.vramByDevice[dev]
+	s.vramByDevice[dev] = live
+	s.memGPU = s.memGPU - min(s.memGPU, old) + live
 }
