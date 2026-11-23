@@ -1,0 +1,27 @@
+defaults:
+  dual_buffer: true
+  dynamic_kv: true
+  keep_alive: 10m
+devices:
+  igpu: { backend: vulkan, match: "Iris", max_running: 1 }
+  cpu:  { max_running: 1 }
+models:
+  qwen25:1.5b:
+    devices: [igpu, cpu]
+    on_busy: wait
+    wait_timeout: 3s
+    max_context: 8192
+    kv_save: true
+  qwen3:0.6b:
+    devices: [igpu, cpu]
+    on_busy: next
+    wait_timeout: 30s
+    max_context: 4096
+  qwen3-embedding:*:
+    devices: [cpu]
+    dual_buffer: false
+    keep_alive: -1
+swap:
+  enabled: true
+  keep_in_ram: pinned
+  save_kv: true

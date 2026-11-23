@@ -61,3 +61,24 @@ Fork llama-server (b12177 + 001 + 003 + 004, CPU, `C:\b\c16`), qwen3:0.6b, `-np 
 | `-c 4096`, `q8_0` KV (a mentés f16) | **elutasítva**, a következő kérés a promptot újraszámolja (`prompt_n 832`) | | azonos |
 
 Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is visszatölthető, ha a mentett tokenek elférnek; a dinamikus KV-val is (a KV a visszatöltéskor nő). Eltérő KV-típusnál a llama-server maga is elutasítja; a fork ezt előre szűri (`KVMeta.Compatible`, a fájlnévben is benne a KV-típus), hogy a hibasor el se jöjjön.
+
+## Az Ollama a multimodel-kóddal, laptopon (Vulkan iGPU + CPU), 2026-11-23
+- Bináris: `ollama.exe` a `multimodel-ci` workflow Windows-buildjéből (`0.40.16-mm-3d5b17c`, majd `-0789900`), mellette `lib/ollama`: a fork CPU-s llama-servere (b12177 + 001 + 003 + 004, `C:\b\c16`) és a hozzá fordított `vulkan/ggml-vulkan.dll` (`C:\b\v16`). Intel Iris Xe (Vulkan0, `OLLAMA_IGPU_ENABLE=1`, Windowson PCI-cím nélkül), 16 GB RAM (a teszt alatt ~0,5–2 GB szabad).
+- Modellek (`ollama create` a GGUF-okból): `qwen25:1.5b` (Q4_K_M), `qwen3:0.6b`, `qwen3-embedding:0.6b`. Config: `tools/dualbuf/multimodel/laptop-dualbuf.yaml`; szkriptek: `serve.sh`, `gen.sh`, `busy.sh`, `swap.sh` (ugyanott).
+
+| eset | eredmény |
+|---|---|
+| config nélkül | az indítósor a gyári: `-c 4096 -np 1 ... --flash-attn auto -b 512 -ub 512 --context-shift --keep 4`; nincs `dualbuf` naplósor |
+| config megjelenése futó modell mellett | a config nélkül betöltött példány változatlanul szolgál (0,01 s „betöltés”); a config a kirakás utáni betöltéskor lép életbe |
+| erősorrend, naplósor | `dualbuf effective settings ... devices=[igpu,cpu](model:qwen25:1.5b) ... dual_buffer=true(defaults) ... max_context=8192(model:...) keep_alive=10m0s(defaults) parallel=1(builtin) ...`; a llama-server: `-c 8192`, `--split-mode none --main-gpu 0`, a naplóban `auto zones`, `dual-buffer`, `set_dynamic: dynamic KV: 4096 -> 8192 cells ... 28 by copy` (Vulkanon másolással nő) |
+| eszközazonosítás | `dualbuf devices matched="cpu=CPU, igpu=Vulkan Vulkan0 \"Intel(R) Iris(R) Xe Graphics\" no PCI id"` (név szerint) |
+| futási korlát, `on_busy: next` | A (qwen25) az igpu-n generál; B (qwen3, `next`) 0 s várakozással a CPU-ra kerül, `-ngl 0`-s CPU-s példány indul (repack) |
+| `on_busy: wait`, lejár | C (qwen25, `wait_timeout 3s`) 3,04 s után továbblép; ha a CPU is foglalt, sorba áll, és az elsőként felszabaduló eszközt kapja (`reason=queued waited=17.571s`) |
+| `on_busy: wait`, időben felszabadul | C 1,5 s várakozás után az igpu-t kapja (`reason=waited`) |
+| érkezési sorrend | D (embedding, csak cpu) C után érkezett, a CPU-t C után, a B végén kapta |
+| KV az NVMe-re (`kv_save`) | kirakáskor `KV saved to RAM ... tokens=[568] 92ms`, `KV saved to the disk 75ms` (16 MB); újratöltés után `KV restored from=disk 69ms`, a llama-server az azonos 521 tokenes promptból **1 tokent** számol, a kimenet azonos |
+| csere (park) | `OLLAMA_MAX_LOADED_MODELS=1`: `making room on the device ... park=true`, `KV saved to RAM ... 160ms`, `model parked`; visszacserénél `KV restored from=ram 28ms`, a következő kérés **1 tokent** számol, a kimenet azonos; a csere a laptopon 3–4,4 s (folyamat-újraindítás); a fájlzárolás Windowson nincs (`supported on Linux only`) |
+| RAM-hiány, CPU-tartalék | a szűk RAM miatt az embedding betöltése előtt a qwen3 CPU-s példánya rakódott ki elsőként (`kind=cpu-fallback`) |
+| RAM-hiány, parkoló, keep_alive -1 | `ram_limit: 1GiB`: `parked model dropped from RAM` (qwen25), a `keep_alive: -1`-es embedding betöltve marad (`ollama ps`: `Forever`) |
+
+Nem tesztelt a laptopon: a VRAM-hiány miatti csere (az iGPU szabad memóriája nem változik, ezért a `MAX_LOADED_MODELS` váltotta ki; ugyanaz az áldozatválasztás fut), két GPU, a GPU+CPU megosztott modell CPU-helye (egységteszt: `TestCoordAlsoCPU`), a fájlzárolás (Linux), ROCm. Ezek a `NAS-TESTS.md`-ben.
