@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -256,6 +257,12 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	}
 	need = s.dualbuf.HostEstimate(key, need)
 	ram := multimodel.PlanRAM(db.cfg, systemInfo.TotalMemory, systemInfo.FreeMemory)
+	if v := envconfig.Var("OLLAMA_DUALBUF_RAM_FREE_MIB"); v != "" {
+		// test aid (like the llama-server LLAMA_DUAL_BUFFER_FREE_MIB): the free RAM the plan assumes
+		if mib, err := strconv.ParseUint(v, 10, 64); err == nil {
+			ram.Limit, ram.Source = ram.Used+mib<<20, "env override"
+		}
+	}
 	// a reserve like the llama-server RAM guard: the eviction comes before the cgroup limit is reached
 	need += multimodel.RAMReserve(ram.Limit)
 
@@ -620,7 +627,7 @@ func (s *Scheduler) dualbufTryPark(r *runnerRef) bool {
 
 // dualbufUnparkFor brings a parked runner back for a request that wants its device. It returns the runner to expire (or
 // to park) first when the device has no room for it (wait = true); else the runner is unparked and usable.
-func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *runnerRef) (*runnerRef, bool) {
+func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *runnerRef, full bool) (*runnerRef, bool) {
 	if !dualbufNeedsUnpark(r, req) {
 		return nil, false
 	}
@@ -644,7 +651,7 @@ func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *ru
 			}
 		}
 	}
-	if found && need > free {
+	if full || (found && need > free) {
 		// room on the device first: the least recently used idle model there (parked in process when it can)
 		if v := s.dualbufVictimExcept(req, r); v != nil {
 			slog.Info("dualbuf: room for an unpark", "model", r.modelPath, "need", format.HumanBytes2(need), "free", format.HumanBytes2(free), "victim", v.modelPath)

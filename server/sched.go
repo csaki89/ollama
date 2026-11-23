@@ -296,7 +296,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				pendingKey := schedulerModelKey(pending.model)
 				s.loadedMu.Lock()
 				runner := s.loaded[pendingKey]
-				loadedCount := len(s.loaded) - s.dualbufParkedCountLocked()
+				loadedCount := len(s.loaded)
+				activeCount := loadedCount - s.dualbufParkedCountLocked() // dual-buffer fork: parked runners hold no device memory
 				runnersSnapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
 				for _, r := range s.loaded {
 					runnersSnapshot = append(runnersSnapshot, r)
@@ -307,7 +308,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					if runner.needsReload(ctx, pending) {
 						slog.Debug("reloading", "runner", runner)
 						runnerToExpire = runner
-					} else if v, wait := s.dualbufUnparkFor(ctx, pending, runner); wait {
+					} else if v, wait := s.dualbufUnparkFor(ctx, pending, runner, maxRunners > 0 && activeCount >= int(maxRunners)); wait {
 						runnerToExpire = v
 					} else {
 						// Runner is usable, return it
@@ -315,7 +316,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						pending.useLoadedRunner(runner, s.finishedReqCh)
 						break
 					}
-				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
+				} else if maxRunners > 0 && activeCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
 					runnerToExpire = s.dualbufVictim(pending)
 				} else {
