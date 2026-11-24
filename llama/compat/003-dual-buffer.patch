@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel 1cd387e1d): Vulkan sparse growable KV buffers (a range per section, rebinding when the sparse address space is short; chunk from the device: sparse block, 2 MiB alignment, measured booking and release units, allocation limit), ggml_backend_dev_memory_measured / _internal_memory / _host_memory (zones booking, RAM guards), copy fallback without the whole-KV peak, GGML_SCHED_TIMING, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
+multimodel (csaki89/llama.cpp multimodel f7dedde9b): Vulkan sparse growable KV buffers (a range per section, rebinding when the sparse address space is short; chunk from the device: sparse block, 2 MiB alignment, measured booking and release units, allocation limit), low-latency split boundaries (one submission and one spinning wait per boundary), ggml_backend_dev_memory_measured / _internal_memory / _host_memory / _async_readback (zones booking, RAM guards, scheduler readback), copy fallback without the whole-KV peak, GGML_SCHED_TIMING, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 977c3ab..dd5fafa 100644
@@ -1633,7 +1633,7 @@ index 7ea4abc..4abe2c9 100644
  
          src += (size_t) ncols * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-index cd9d074..9eaf140 100644
+index cd9d074..c22586d 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 @@ -1,6 +1,11 @@
@@ -1661,7 +1661,7 @@ index cd9d074..9eaf140 100644
      if (device->buffer_device_address) {
          const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
          buf->bda_addr = device->device.getBufferAddress(addressInfo);
-@@ -867,3 +878,773 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
+@@ -867,3 +878,777 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
      return buf;
  }
  
@@ -2392,10 +2392,14 @@ index cd9d074..9eaf140 100644
 +
 +// the scheduler reads a split's output into host memory through get_tensor_async + synchronize: a synchronous read is a
 +// command buffer, a submission and a fence wait of its own after the wait for the graph (per split boundary in a GPU/CPU
-+// split); off by default, GGML_VK_ASYNC_READBACK=1 turns it on (measured neutral on an iGPU; to be measured on a discrete card)
++// split); with it the read is recorded behind the graph and goes with its fence: one wait per boundary, as the HIP path
++// (async copy + stream synchronize). On by default; GGML_VK_ASYNC_READBACK=0 turns it off (test aid). A device without async
++// support has no get_tensor_async, the scheduler then keeps the synchronous read.
++bool ggml_vk_low_latency_sync();
++
 +static bool ggml_backend_vk_dev_async_readback(ggml_backend_dev_t dev) {
 +    GGML_UNUSED(dev);
-+    static const bool on = getenv("GGML_VK_ASYNC_READBACK") && atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0;
++    static const bool on = (!getenv("GGML_VK_ASYNC_READBACK") || atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0) && ggml_vk_low_latency_sync();
 +    return on;
 +}
 +
@@ -2449,7 +2453,7 @@ index 0af8a5c..e4adadb 100644
  // comm
  #if !defined(_WIN32)
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
-index 1299609..293e815 100644
+index 1299609..257cf84 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 @@ -1050,17 +1050,25 @@ inline void vk_command_pool::destroy(vk::Device& device) {
@@ -2478,11 +2482,35 @@ index 1299609..293e815 100644
          if (size == 0) {
              return;
          }
+@@ -1251,6 +1259,9 @@ struct ggml_backend_vk_context {
+     vk::Fence fence, almost_ready_fence;
+     bool submit_pending {};
+     bool almost_ready_fence_pending {};
++    // dual-buffer fork: the last command buffer of a small graph stays open (submitted with its fence by the next synchronize,
++    // together with a readback recorded behind it)
++    bool defer_last_submit {};
+     // Set before op_add and unset after op_rms_norm to indicate that the add should
+     // write partial sums to accumulate the square of the vector components
+     bool do_add_rms_partials_offset_calculation;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index b46cba3..4bc3060 100644
+index b46cba3..7006c2f 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -5511,7 +5511,8 @@ void ggml_vk_instance_init() {
+@@ -336,6 +336,13 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
+     return range;
+ }
+ 
++// dual-buffer fork: low-latency synchronization at split boundaries (on by default; GGML_VK_LOW_LATENCY_SYNC=0 restores the
++// upstream behaviour, test aid): no almost-ready fence for small graphs, the fence goes with the pending commands
++bool ggml_vk_low_latency_sync() {
++    static const bool on = !getenv("GGML_VK_LOW_LATENCY_SYNC") || atoi(getenv("GGML_VK_LOW_LATENCY_SYNC")) != 0;
++    return on;
++}
++
+ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
+     // during this wait.
+@@ -5511,7 +5518,8 @@ void ggml_vk_instance_init() {
              }
          }
  
@@ -2492,7 +2520,20 @@ index b46cba3..4bc3060 100644
  
          bool host_buffer_import = false;
          if (external_memory_host_supported) {
-@@ -13418,9 +13419,37 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
+@@ -13005,6 +13013,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     last_node = true;
+ #endif
+ 
++    // a small graph's last command buffer stays open: the next synchronize submits it with the fence, with what the scheduler
++    // records behind it (the readback at a split boundary): one submission and one wait, as a HIP stream
++    if (last_node && ctx->defer_last_submit) {
++        return true;
++    }
++
+     if (submit || last_node) {
+         ggml_vk_ctx_end(compute_ctx);
+ 
+@@ -13418,9 +13432,37 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
      return ctx->name.c_str();
  }
  
@@ -2530,7 +2571,84 @@ index b46cba3..4bc3060 100644
  
      ggml_vk_cleanup(ctx);
  
-@@ -15433,6 +15462,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+@@ -13610,7 +13652,9 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+         }
+ 
+         vk_context cpy_ctx;
+-        if (ctx->device->async_use_transfer_queue) {
++        // dual-buffer fork: while the graphs are small (generation, split boundaries) the input goes into the compute command
++        // buffer like a HIP copy on the compute stream: a transfer-queue copy is a submission and a semaphore wait of its own
++        if (ctx->device->async_use_transfer_queue && !ctx->defer_last_submit) {
+             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+         } else {
+             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+@@ -13628,6 +13672,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     VK_LOG_DEBUG("ggml_vk_synchronize()");
+ 
+     bool do_transfer = !ctx->compute_ctx.expired();
++    bool fence_submitted = false;
+ 
+     if (ggml_vk_submit_transfer_ctx(ctx)) {
+         ctx->submit_pending = true;
+@@ -13651,6 +13696,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+             ggml_vk_submit(compute_ctx, ctx->fence);
+             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+             ctx->device->device.resetFences({ ctx->fence });
++        } else if (ggml_vk_low_latency_sync() && !(ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value)) {
++            // dual-buffer fork: the pending commands carry the fence themselves (no empty submission for it): one submission
++            // and one wait, as a HIP stream synchronize after its async copies
++            ggml_vk_submit(compute_ctx, ctx->fence);
++            fence_submitted = true;
+         } else {
+             ggml_vk_submit(compute_ctx, {});
+         }
+@@ -13660,6 +13710,8 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     if (ctx->submit_pending) {
+         if (ctx->device->serialize_submissions) {
+             ctx->submit_pending = false;
++        } else if (fence_submitted) {
++            // the fence went with the commands above
+         } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+             vk::TimelineSemaphoreSubmitInfo tl_info{
+                 1, &ctx->transfer_semaphore.value,
+@@ -13699,6 +13751,14 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+ 
++    // dual-buffer fork: nothing recorded or submitted since the last synchronize (the scheduler syncs the split backend before
++    // every input copy): return at once, as a HIP stream synchronize on an idle stream (no command pool cleanup)
++    if (ggml_vk_low_latency_sync() && ctx->compute_ctx.expired() && ctx->transfer_ctx.expired() && !ctx->submit_pending &&
++        !ctx->almost_ready_fence_pending && ctx->gc.contexts.empty() && ctx->tensor_ctxs.empty() &&
++        (!ctx->device->async_use_transfer_queue || ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value)) {
++        return;
++    }
++
+     ggml_vk_synchronize(ctx);
+ 
+     ggml_vk_graph_cleanup(ctx);
+@@ -14545,6 +14605,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     uint64_t flops_per_submit = ctx->last_total_flops < 1'000'000'000ULL ? 0 :
+         std::clamp(ctx->last_total_flops / 40u, std::min<uint64_t>(100'000'000ULL, flops_cap), flops_cap);
+ 
++    ctx->defer_last_submit = ggml_vk_low_latency_sync() && flops_per_submit == 0 && !vk_perf_logger_enabled &&
++                             !ctx->device->serialize_submissions && ctx->device->support_async;
++
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+             try {
+@@ -14856,7 +14919,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         }
+ 
+         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
+-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
++        // dual-buffer fork: not for a small graph (under 1 GFLOP last time, flops_per_submit 0: one submission): its wait spins
++        // from the start like a HIP stream synchronize, a sleeping wait on the almost-ready fence costs a wake-up per graph (a
++        // split boundary in a GPU/CPU split generation)
++        bool almost_ready = (flops_per_submit != 0 || !ggml_vk_low_latency_sync()) && (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                       (i + ctx->num_additional_fused_ops >= last_node) ||
+@@ -15433,6 +15499,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
  
      ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
      ggml_vk_init(ctx, dev_num);
@@ -2541,7 +2659,17 @@ index b46cba3..4bc3060 100644
  
      ggml_backend_t vk_backend = new ggml_backend {
          /* .guid    = */ ggml_backend_vk_guid(),
-@@ -16474,6 +16507,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
+@@ -15443,6 +15513,9 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+ 
+     if (!ctx->device->support_async) {
+         vk_backend->iface.get_tensor_async = nullptr;
++        // the scheduler's async readback at a split boundary needs it (ggml_backend_dev_async_readback)
++        GGML_LOG_WARN("ggml_backend_vk_init: %s: no async execution (GGML_VK_DISABLE_ASYNC or the device): a GPU/CPU split boundary reads "
++            "its output synchronously (a submission and a wait of its own)\n", ctx->device->name.c_str());
+     }
+ 
+     return vk_backend;
+@@ -16474,6 +16547,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
      if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
          return (void *) ggml_backend_vk_fusion_set_enabled;
      }

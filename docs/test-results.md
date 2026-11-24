@@ -137,3 +137,17 @@ llama-server (csaki89/llama.cpp `multimodel`, f8133efac..bbd033c19), Iris Xe, qw
 | könyvelés | `FIT=6000` | `zones: backend buffers outside the ggml buffers 312 -> 0 MiB` (a 8 MiB-os darab kerekítése a 4096 cellánál; 16384 cellánál 0) |
 | host-memória | `-ngl 14 --dual-buffer` | `host memory: 0 MiB ...` (UMA: minden típus eszközlokális; Windows: nincs cgroup) |
 | split-generálás | `-ngl 99 -ot "ffn_(up\|down\|gate)=CPU"` (58 split), `GGML_SCHED_TIMING=48` | CPU input copies 25,8 ms/gráf, Vulkan compute 3,9 + final wait 14,5 ms; `GGML_VK_ASYNC_READBACK=1`: 13,9 vs 13,9 tok/s (nincs különbség) |
+
+# Vulkan split-határ (laptop, 2026-11-25)
+llama.cpp `multimodel` 1d415f877, Iris Xe, qwen2.5-1.5B Q4_K_M, `-ngl 99 -ot "ffn_(up|down|gate)=CPU,attn_(q|k|v|output)\.weight=CPU"` (a GPU-n csak kis műveletek: 282 split tokenenként, 141 GPU→CPU váltás), 96 token generálás, `GGML_SCHED_TIMING=48`, három felváltott pár (a laptop hőfüggő, ezért ugyanazzal a binárissal, `GGML_VK_LOW_LATENCY_SYNC=0/1`):
+
+| gráfonként (tokenenként) | előtte (=0) | utána (=1) |
+|---|---|---|
+| CPU input copies (várás a GPU-ra + visszaolvasás) | 34,2 ms (0,242 ms / GPU→CPU váltás) | 28,9 ms (0,205 ms / váltás) |
+| Vulkan compute calls (rögzítés + beküldés) | 4,15 ms | 2,17 ms |
+| Vulkan input copies | 0,26 ms | 0,19 ms |
+| Vulkan final wait | 11,0 ms | 12,6 ms |
+| Vulkan-részre jutó összes idő | 49,6 ms (0,176 ms / split) | 43,9 ms (0,156 ms / split) |
+| tg | 11,4 tok/s | 11,8 tok/s |
+
+A maradék váltásonkénti idő tartalmazza a GPU végrehajtását és a meghajtó beküldési késleltetését; a laptopon ezek nem választhatók szét. Kimenet: a régi és az új út (átviteli sorral is, `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1`; `-ngl 14 --dual-buffer` is) azonos (md5 `bfd5453a…`), a zónás/flex paritásfutás (hosszú, majd két rövid kérés) azonos a korábbiakkal.

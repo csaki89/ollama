@@ -70,3 +70,31 @@ Nyitva (OPEN-QUESTIONS.md): a fit költségvetés nélkül a heap teljes méret�
 | 5. hosszú kontextus | javítva ok-feltevés alapján (2 MiB-os darabigazítás, mint a HIP-en), NAS-mérés igazolja | nincs (azonos szabály) |
 | 6. betöltési margó | dokumentálva (OPEN-QUESTIONS 13) | – |
 | 7. könyvelés | javítva: a backend saját eszközpufferei és a darabkerekítés könyvelve (`ggml_backend_dev_internal_memory`) | proc (a Vulkan-backend a köztes puffereit maga foglalja) |
+
+# 3. lépés: a split-határ (GPU–CPU váltás) a két backendben
+
+## Mi történik egy váltáskor (kódból)
+A scheduler (`ggml_backend_sched_compute_splits`) splitenként: bemenetek másolása (`ggml_backend_sched_copy_input`), majd `graph_compute_async`. A CPU-split bemenete a GPU-split kimenete; a GPU-split bemenete a CPU-é.
+
+**HIP (ggml-cuda):**
+- *gráf:* a kernelek (vagy egy CUDA/HIP-gráf) a backend streamjére kerülnek, aszinkron, egy felhasználói módú parancssorba (doorbell), rendszerhívás nélkül;
+- *GPU→CPU:* `ggml_backend_synchronize(GPU)` = `hipStreamSynchronize` (az alapértelmezett ütemezés pörög/enged, alvás nélkül), utána `ggml_backend_tensor_copy` → `buffer_get_tensor` = `hipMemcpyAsync` (DMA) + `hipStreamSynchronize`;
+- *CPU→GPU:* `cpy_tensor_async` csak GPU↔GPU, ezért szinkron `buffer_set_tensor` = `hipMemcpyAsync` + `hipStreamSynchronize` – a host-forrás a CPU compute puffere (`ROCm_Host`, rögzített);
+- *várakozás:* minden várakozás pörgő stream-szinkron, a parancspufferek kezelése a HIP runtime-ban (nincs alkalmazásoldali költség).
+
+**Vulkan (ggml-vulkan, a javítás előtt):**
+- *gráf:* parancspuffer-rögzítés, és a gráf 80%-ánál egy beküldés az `almost_ready` kerítéssel, a végén egy második beküldés kerítés nélkül (`ggml_vk_compute_forward`);
+- *GPU→CPU:* `ggml_backend_vk_synchronize`: (1) egy **üres** `vkQueueSubmit` csak a kerítésért, (2) **alvó** `vkWaitForFences` az `almost_ready` kerítésre (a kernel felébresztésének késleltetése), (3) pörgés a fő kerítésen, (4) `ggml_vk_graph_cleanup` (parancspool-takarítás). Utána a szinkron `buffer_get_tensor` = `ggml_vk_buffer_read`: **új ideiglenes parancspuffer**, `vkQueueSubmit` az eszköz kerítésével, **alvó** `vkWaitForFences`, pool-takarítás;
+- *CPU→GPU:* a scheduler előbb `ggml_backend_synchronize(Vulkan)`-t hív (üresjáratban is: átviteli sor beküldése és teljes `graph_cleanup`), majd `cpy_tensor_async` a rögzített host-forrásból a compute parancspufferbe; AMD RDNA-n (`async_use_transfer_queue`) az átviteli sorra, ami a következő gráfnál **külön beküldés** + idővonal-szemafor-várakozás.
+
+**A különbség:** a HIP váltásonként egy aszinkron indítást és egy pörgő szinkront fizet (a másolás ugyanazon a streamen). A Vulkan GPU→CPU váltásonként 4 beküldést (2 a gráf, 1 üres a kerítésért, 1 a visszaolvasás) és 2 alvó várakozást, CPU→GPU váltásonként egy üresjárati szinkront takarítással, RDNA-n még egy átviteli beküldést és szemafort.
+
+## Amit a Vulkan API másképp követel
+Egy `vkQueueSubmit` rendszerhívás (a HIP felhasználói módú sorába írás nem az), és a gazda csak kerítésen vagy idővonal-szemaforon át tudja meg, hogy a GPU kész. Ezért a HIP-elv legközelebbi megfelelője: **váltásonként egy beküldés és egy pörgő kerítésvárás**, a másolás ugyanabban a parancspufferben, mint a gráf. Ennél kevesebb a Vulkan API-val nem lehetséges (a parancspuffer csak beküldéssel indul).
+
+## A javítás (alapból be, kártyafüggetlen; `GGML_VK_LOW_LATENCY_SYNC=0` a régi viselkedés, tesztkapcsoló)
+1. Kis gráfnál (az előző gráf 1 GFLOP alatt, `flops_per_submit == 0` – ugyanaz a feltétel, ami alapján a ggml-vulkan sem darabolja a beküldést) nincs `almost_ready` beküldés és alvó várakozás: a várakozás az elejétől pörög, mint a HIP stream-szinkronja.
+2. A kis gráf utolsó parancspuffere nyitva marad (`defer_last_submit`): a scheduler a visszaolvasást mögé rögzíti (`ggml_backend_dev_async_readback`, alapból be), és a szinkronizálás az egészet **egy** beküldéssel küldi, a **kerítéssel együtt** (nincs üres beküldés).
+3. Üresjárati szinkronizálás (semmi nincs rögzítve vagy beküldve az előző óta) azonnal visszatér, mint egy üres stream szinkronja.
+4. Kis gráfok alatt a CPU→GPU bemásolás a compute parancspufferbe kerül (nem az átviteli sorra), mint a HIP másolása a compute streamen.
+Tartalék: ha az eszköz nem támogatja az aszinkron végrehajtást (`GGML_VK_DISABLE_ASYNC` vagy az eszköz), nincs `get_tensor_async`, a visszaolvasás szinkron marad, napló: `ggml_backend_vk_init: ...: no async execution ...: a GPU/CPU split boundary reads its output synchronously`.
