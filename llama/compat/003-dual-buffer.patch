@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel d7e8d8d70): Vulkan sparse growable KV buffers (chunk from the device: sparse block, measured booking and release units, allocation limit), ggml_backend_dev_memory_measured / zones budget from the booking without a memory budget, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
+multimodel (csaki89/llama.cpp multimodel 1cd387e1d): Vulkan sparse growable KV buffers (a range per section, rebinding when the sparse address space is short; chunk from the device: sparse block, 2 MiB alignment, measured booking and release units, allocation limit), ggml_backend_dev_memory_measured / _internal_memory / _host_memory (zones booking, RAM guards), copy fallback without the whole-KV peak, GGML_SCHED_TIMING, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 977c3ab..dd5fafa 100644
@@ -267,10 +267,21 @@ index 8f341af..1f13709 100644
      GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 30d2f26..481d20f 100644
+index 30d2f26..6bd4ca0 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1237,6 +1237,9 @@ struct ggml_backend_sched {
+@@ -1193,6 +1193,10 @@ struct ggml_backend_sched {
+     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+     ggml_gallocr_t galloc;
+ 
++    // the backend asks for its reads into host memory through its async API, in one submission with its pending graph
++    // (ggml_backend_dev_async_readback: a synchronous read costs it a submission and a wait of its own)
++    bool async_readback[GGML_SCHED_MAX_BACKENDS];
++
+     // hash map of the nodes in the graph
+     struct ggml_hash_set  hash_set;
+     int                 * hv_tensor_backend_ids; // [hash_set.size]
+@@ -1237,6 +1241,9 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -280,7 +291,7 @@ index 30d2f26..481d20f 100644
      int debug;
  
      // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
-@@ -1374,14 +1377,28 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1374,14 +1381,28 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
              }
              if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                  int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
@@ -310,7 +321,120 @@ index 30d2f26..481d20f 100644
                  }
                  SET_CAUSE(tensor, "1.wgt%d", i);
                  return src_backend_id;
-@@ -2289,6 +2306,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2112,6 +2133,19 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++        // into host memory from a backend that asks for it: the read goes with its pending graph, one wait for both
++        const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
++        if (input_backend_id >= 0 && sched->async_readback[input_backend_id] && input_cpy->buffer && ggml_backend_buffer_is_host(input_cpy->buffer) &&
++            input->buffer && !ggml_backend_buffer_is_host(input->buffer) && input->view_src == NULL) {
++            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++            } else {
++                ggml_backend_synchronize(split_backend);
++            }
++            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
++            ggml_backend_synchronize(input_backend);
++            return;
++        }
+         ggml_backend_synchronize(input_backend);
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+@@ -2122,11 +2156,25 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     }
+ }
+ 
++// GGML_SCHED_TIMING=N (test aid): every N graphs, the time per graph in the input copies, the compute calls and the
++// final wait, per backend
++static int ggml_sched_timing_every(void) {
++    static int every = -1;
++    if (every < 0) {
++        const char * e = getenv("GGML_SCHED_TIMING");
++        every = e ? atoi(e) : 0;
++    }
++    return every;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     int prev_backend_id = -1;
++    const int timing = ggml_sched_timing_every();
++    static int64_t t_copy[GGML_SCHED_MAX_BACKENDS], t_comp[GGML_SCHED_MAX_BACKENDS], t_wait[GGML_SCHED_MAX_BACKENDS];
++    static int64_t n_graphs = 0, n_splits_acc = 0;
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+@@ -2145,6 +2193,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+         // copy the input tensors to the split backend
+         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
++        const int64_t tc0 = timing ? ggml_time_us() : 0;
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+@@ -2156,11 +2205,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        const int64_t tc1 = timing ? ggml_time_us() : 0;
++        if (timing) {
++            t_copy[split_backend_id] += tc1 - tc0;
++        }
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (timing) {
++                t_comp[split_backend_id] += ggml_time_us() - tc1;
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+@@ -2203,6 +2259,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (timing) {
++        for (int b = 0; b < sched->n_backends; b++) {
++            const int64_t tw = ggml_time_us();
++            ggml_backend_synchronize(sched->backends[b]);
++            t_wait[b] += ggml_time_us() - tw;
++        }
++        n_splits_acc += sched->n_splits;
++        if (++n_graphs % timing == 0) {
++            for (int b = 0; b < sched->n_backends; b++) {
++                GGML_LOG_INFO("%s: sched timing: %s: per graph: input copies %.3f ms, compute calls %.3f ms, final wait %.3f ms (%.1f splits per graph)\n", __func__,
++                    ggml_backend_name(sched->backends[b]), t_copy[b] / 1000.0 / timing, t_comp[b] / 1000.0 / timing, t_wait[b] / 1000.0 / timing,
++                    (double) n_splits_acc / timing);
++                t_copy[b] = t_comp[b] = t_wait[b] = 0;
++            }
++            n_splits_acc = 0;
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -2232,6 +2306,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     sched->n_backends = n_backends;
+     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+ 
++    for (int b = 0; b < n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
++        typedef bool (*async_readback_t)(ggml_backend_dev_t);
++        async_readback_t fn = reg ? (async_readback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_async_readback") : NULL;
++        sched->async_readback[b] = fn && fn(dev) && backends[b]->iface.get_tensor_async != NULL;
++    }
++
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+     sched->hash_set    = ggml_hash_set_new(graph_size);
+@@ -2289,6 +2371,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
@@ -318,7 +442,7 @@ index 30d2f26..481d20f 100644
      ggml_hash_set_free(&sched->hash_set);
      for (int i = 0; i < sched->splits_capacity; i++) {
          free(sched->splits[i].inputs);
-@@ -2467,6 +2485,14 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
+@@ -2467,6 +2550,14 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
      sched->is_reset = false;
  }
  
@@ -1509,7 +1633,7 @@ index 7ea4abc..4abe2c9 100644
  
          src += (size_t) ncols * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-index cd9d074..b6879c5 100644
+index cd9d074..9eaf140 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 @@ -1,6 +1,11 @@
@@ -1524,41 +1648,63 @@ index cd9d074..b6879c5 100644
  #include <cstdlib>
  #include <mutex>
  #include <shared_mutex>
-@@ -867,3 +872,603 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
+@@ -197,6 +202,12 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
+     buf->device = device;
+     buf->size = size;
+ 
++    // driver-allocated host memory (an imported host pointer is the caller's own memory)
++    if (!import_ptr && !(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
++        buf->host_counted = mem_req.size;
++        ggml_vk_host_alloc_bytes += (int64_t) mem_req.size;
++    }
++
+     if (device->buffer_device_address) {
+         const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+         buf->bda_addr = device->device.getBufferAddress(addressInfo);
+@@ -867,3 +878,773 @@ vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t si
      return buf;
  }
  
 +
-+// growable buffers on a sparse VkBuffer (dual-buffer fork, dynamic KV): the same interface as the ggml-cuda VMM arenas
-+// (looked up with get_proc_address). An arena is one sparse buffer sized for the max context: address range only; device
-+// memory is bound per chunk when a section grows (vkQueueBindSparse) and unbound and freed when it shrinks, so the memory
-+// comes back without a copy. Needs sparseBinding, sparseResidencyBuffer and a compute queue with sparse binding; else no
-+// arena (the KV grows by copy, with a log line naming the missing capability). GGML_VK_SPARSE=0 turns it off,
-+// GGML_VK_SPARSE_CHUNK_KIB sets the chunk (default 2 MiB), GGML_VK_SPARSE_DEBUG=1 logs every bind.
++// growable buffers on sparse VkBuffers (dual-buffer fork, dynamic KV): the same interface as the ggml-cuda VMM arenas (looked
++// up with get_proc_address). The arena holds what a relayout's sections on one device share (the chunk, the memory type, the
++// pending binds); every section (one K or V) is a sparse VkBuffer of its own: an address range only, device memory is bound
++// per chunk when it grows (vkQueueBindSparse) and unbound and freed when it shrinks, so the memory comes back without a copy.
++// The address range: the section's max size if the device's sparse address space (sparseAddressSpaceSize, maxBufferSize)
++// allows it, else what it needs now; a section that outgrows its range gets a larger one and its memory chunks are bound
++// into it (no data copy), the old range goes (the HIP arena reserves its address space per chunk with the mapping: there the
++// address space follows the mapped memory). Needs sparseBinding, sparseResidencyBuffer and a compute queue with sparse binding;
++// else no arena (the KV grows by copy, with a log line naming the missing capability). GGML_VK_SPARSE=0 turns it off,
++// GGML_VK_SPARSE_CHUNK_KIB sets the chunk, GGML_VK_SPARSE_DEBUG=1 logs every bind, GGML_VK_SPARSE_VA_MIB caps the sparse
++// address space (test aid for the rebinding).
++
++struct vk_sparse_section;
 +
 +struct vk_sparse_arena {
 +    vk_device                       device;
 +    ggml_backend_buffer_type_t      buft;
-+    vk_buffer                       buf;      // the sparse buffer, no memory of its own
 +    vk::Queue                       queue;    // the compute queue (sparse binding)
 +    vk_queue_handle *               qh = nullptr;
-+    size_t                          reserved = 0;
++    vk::BufferCreateInfo            bci;      // a sparse buffer of this device (size set per range)
 +    size_t                          chunk    = 0;
 +    uint32_t                        mem_type = 0;
-+    std::vector<vk::DeviceMemory>   mem;      // per chunk, null if unbound
-+    std::vector<size_t>             pending;  // chunks allocated, not bound and zeroed yet
++    bool                            on_demand = false; // the sections at their max size do not fit the sparse address space
++    std::vector<vk_sparse_section *> pending; // sections with chunks allocated, not bound and zeroed yet
 +    int                             refs = 1;
 +    std::mutex                      mtx;
 +};
 +
 +struct vk_sparse_section : ggml_backend_vk_buffer_context {
-+    vk_sparse_arena * arena;
-+    size_t            offset;  // in the arena
-+    size_t            section; // max bytes
-+    size_t            mapped = 0;
++    vk_sparse_arena *             arena;
++    size_t                        section;     // max bytes
++    size_t                        range = 0;   // bytes of the address range (dev_buffer)
++    size_t                        mapped = 0;  // bytes with memory
++    size_t                        logical = 0; // the ggml buffer size
++    std::vector<vk::DeviceMemory> mem;         // per chunk, null if none
++    std::vector<size_t>           pending;     // chunks allocated, not bound and zeroed yet
 +
-+    vk_sparse_section(vk_device_ref dev, vk_buffer buf, std::string & name, vk_sparse_arena * arena, size_t offset, size_t section) :
-+        ggml_backend_vk_buffer_context(dev, std::move(buf), name), arena(arena), offset(offset), section(section) {}
++    vk_sparse_section(vk_device_ref dev, vk_buffer buf, std::string & name, vk_sparse_arena * arena, size_t section) :
++        ggml_backend_vk_buffer_context(dev, std::move(buf), name), arena(arena), section(section) {}
 +};
 +
 +static bool vk_sparse_debug() {
@@ -1567,6 +1713,20 @@ index cd9d074..b6879c5 100644
 +}
 +
 +static std::atomic<int64_t> vk_sparse_stat_bound{0};
++
++// the live sections and the sparse address space they hold, per device
++static std::mutex                    vk_sparse_reg_mtx;
++static std::set<vk_sparse_section *> vk_sparse_live;
++static std::map<size_t, size_t>      vk_sparse_va; // device idx -> bytes of sparse address ranges
++
++// the sparse address space a device allows: sparseAddressSpaceSize (GGML_VK_SPARSE_VA_MIB lowers it, test aid)
++static size_t vk_sparse_va_limit(const vk_device & device) {
++    size_t lim = (size_t) device->properties.limits.sparseAddressSpaceSize;
++    if (const char * env = getenv("GGML_VK_SPARSE_VA_MIB"); env && atoll(env) > 0) {
++        lim = std::min(lim, (size_t) atoll(env) << 20);
++    }
++    return lim;
++}
 +
 +static void vk_sparse_arena_unref(vk_sparse_arena * a) {
 +    int left;
@@ -1577,32 +1737,24 @@ index cd9d074..b6879c5 100644
 +    if (left > 0) {
 +        return;
 +    }
-+    a->device->device.waitIdle();
-+    for (auto & m : a->mem) {
-+        if (m) {
-+            a->device->device.freeMemory(m);
-+            vk_sparse_stat_bound -= (int64_t) a->chunk;
-+            m = nullptr;
-+        }
-+    }
 +    if (vk_sparse_debug()) {
-+        GGML_LOG_INFO("%s: arena of %zu bytes freed\n", __func__, a->reserved);
++        GGML_LOG_INFO("%s: arena freed\n", __func__);
 +    }
-+    a->buf.reset();
 +    delete a;
 +}
 +
-+// bind (with their memory) or unbind the chunks idx of an arena, and wait for it
-+static bool vk_sparse_bind(vk_sparse_arena * a, const std::vector<size_t> & idx, bool bind) {
++// bind (with their memory) or unbind the chunks idx of a section in its range buf, and wait for it
++static bool vk_sparse_bind(vk_sparse_section * s, const vk_buffer & buf, const std::vector<size_t> & idx, bool bind) {
 +    if (idx.empty()) {
 +        return true;
 +    }
++    vk_sparse_arena * a = s->arena;
 +    std::vector<vk::SparseMemoryBind> binds;
 +    binds.reserve(idx.size());
 +    for (size_t i : idx) {
-+        binds.push_back(vk::SparseMemoryBind(i * a->chunk, a->chunk, bind ? a->mem[i] : vk::DeviceMemory(), 0));
++        binds.push_back(vk::SparseMemoryBind(i * a->chunk, a->chunk, bind ? s->mem[i] : vk::DeviceMemory(), 0));
 +    }
-+    vk::SparseBufferMemoryBindInfo buf_bind(a->buf->buffer, (uint32_t) binds.size(), binds.data());
++    vk::SparseBufferMemoryBindInfo buf_bind(buf->buffer, (uint32_t) binds.size(), binds.data());
 +    vk::BindSparseInfo info;
 +    info.setBufferBinds(buf_bind);
 +    vk::Fence fence = a->device->device.createFence({});
@@ -1627,6 +1779,52 @@ index cd9d074..b6879c5 100644
 +    }
 +    a->device->device.destroyFence(fence);
 +    return ok;
++}
++
++// a sparse address range of bytes (no memory), booked in the device's sparse address space; nullptr if the device does not
++// allow it (the limit, maxBufferSize, or the creation fails). extra: bytes of a range that is about to be given back
++static vk_buffer vk_sparse_range_new(vk_sparse_arena * a, size_t bytes, std::string * why) {
++    const vk_device & device = a->device;
++    {
++        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++        const size_t used = vk_sparse_va[device->idx];
++        if (bytes > device->max_buffer_size || used + bytes > vk_sparse_va_limit(device)) {
++            if (why) {
++                *why = "sparse address space: " + std::to_string(used >> 20) + " MiB in use + " + std::to_string(bytes >> 20) + " MiB > " +
++                    std::to_string(vk_sparse_va_limit(device) >> 20) + " MiB (sparseAddressSpaceSize), max buffer " + std::to_string(device->max_buffer_size >> 20) + " MiB";
++            }
++            return nullptr;
++        }
++        vk_sparse_va[device->idx] = used + bytes;
++    }
++    vk::BufferCreateInfo bci = a->bci;
++    bci.size = bytes;
++    vk::Buffer vkbuf;
++    try {
++        vkbuf = device->device.createBuffer(bci);
++    } catch (const vk::SystemError & e) {
++        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++        vk_sparse_va[device->idx] -= bytes;
++        if (why) {
++            *why = std::string("creating a sparse buffer of ") + std::to_string(bytes) + " bytes failed: " + e.what();
++        }
++        return nullptr;
++    }
++    auto buf = std::make_shared<vk_buffer_struct>();
++    buf->buffer = vkbuf;
++    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
++    buf->ptr    = nullptr;
++    buf->size   = bytes;
++    buf->device = device;
++    if (device->buffer_device_address) {
++        buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(vkbuf));
++    }
++    return buf;
++}
++
++static void vk_sparse_range_release(const vk_device & device, size_t bytes) {
++    std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++    vk_sparse_va[device->idx] -= std::min(vk_sparse_va[device->idx], bytes);
 +}
 +
 +// the heap usage of a memory type by the memory budget (VK_EXT_memory_budget); false without it
@@ -1792,16 +1990,19 @@ index cd9d074..b6879c5 100644
 +    if (probe_type < 0) {
 +        return no("no device local memory type for a sparse buffer");
 +    }
-+    // the chunk, from the device like the ggml-cuda VMM: the sparse block (the alignment), the unit the driver books an allocation with
-+    // (measured: the memory budget's heap usage before and after one block allocation, twice) and the allocation count limit (the
-+    // chunks of one KV arena use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
++    // the chunk, by the rule of the ggml-cuda VMM: the sparse block (the granularity), the 2 MiB section alignment (as
++    // GGML_CUDA_VMM_MIN_ALIGN: whole large-page fragments for the K/V reads), the unit the driver books an allocation with
++    // (measured: the memory budget's heap usage before and after one allocation, twice; at most 32 alignments); then the
++    // Vulkan-only bounds: the release unit (a freed chunk must give its memory back) and the allocation count limit (the
++    // chunks of one KV use at most a quarter of maxMemoryAllocationCount); GGML_VK_SPARSE_CHUNK_KIB overrides it (test aid)
++    static constexpr size_t min_align = 2ull << 20;
++    const size_t align = block * ((std::max(block, min_align) + block - 1) / block);
 +    std::string unit_note;
 +    const size_t unit = vk_sparse_booking_unit(device, (uint32_t) probe_type, block, unit_note);
-+    size_t chunk = block;
-+    if (unit > 0 && std::lcm(block, unit) <= 32*block) {
-+        chunk = std::lcm(block, unit);
++    size_t chunk = align;
++    if (unit > 0 && std::lcm(align, unit) <= 32*align) {
++        chunk = std::lcm(align, unit);
 +    }
-+    // a chunk the driver gives back when it is freed (the shrink must return the memory)
 +    std::string release_note;
 +    const size_t release = vk_sparse_release_unit(device, (uint32_t) probe_type, chunk, release_note);
 +    chunk = std::max(chunk, release);
@@ -1818,33 +2019,10 @@ index cd9d074..b6879c5 100644
 +    {
 +        std::lock_guard<std::mutex> lock(log_mtx);
 +        if (logged.insert(device->name + "/chunk").second) {
-+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s\n",
-+                device->name.c_str(), block, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk, env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "");
++            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse block %zu; section alignment %zu; driver booking unit %zu%s; release unit %zu%s; allocation limit %u (chunk >= %zu for this arena); chunk %zu%s; sparse address space %zu MiB, max buffer %zu MiB\n",
++                device->name.c_str(), block, align, unit, unit_note.c_str(), release, release_note.c_str(), alloc_limit, count_min, chunk,
++                env_chunk ? " (GGML_VK_SPARSE_CHUNK_KIB)" : "", vk_sparse_va_limit(device) >> 20, (size_t) (device->max_buffer_size >> 20));
 +        }
-+    }
-+    const size_t reserved = chunk * ((std::max<size_t>(size, 1) + chunk - 1) / chunk);
-+    if (reserved > device->physical_device.getProperties().limits.sparseAddressSpaceSize) {
-+        return no("the KV (" + std::to_string(reserved) + " bytes) is larger than sparseAddressSpaceSize");
-+    }
-+    bci.size = reserved;
-+    vk::Buffer vkbuf;
-+    try {
-+        vkbuf = device->device.createBuffer(bci);
-+    } catch (const vk::SystemError & e) {
-+        return no(std::string("creating a sparse buffer of ") + std::to_string(reserved) + " bytes failed: " + e.what());
-+    }
-+    req = device->device.getBufferMemoryRequirements(vkbuf);
-+    const vk::PhysicalDeviceMemoryProperties mp = device->physical_device.getMemoryProperties();
-+    int mem_type = -1;
-+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
-+            mem_type = (int) i;
-+            break;
-+        }
-+    }
-+    if (mem_type < 0) {
-+        device->device.destroyBuffer(vkbuf);
-+        return no("no device local memory type for a sparse buffer");
 +    }
 +
 +    auto * a = new vk_sparse_arena;
@@ -1852,28 +2030,32 @@ index cd9d074..b6879c5 100644
 +    a->buft     = buft;
 +    a->queue    = device->compute_queue->handle->queue;
 +    a->qh       = device->compute_queue->handle.get();
-+    a->reserved = reserved;
++    a->bci      = bci;
 +    a->chunk    = chunk;
-+    a->mem_type = (uint32_t) mem_type;
-+    a->mem.assign(reserved / chunk, nullptr);
-+    a->buf = std::make_shared<vk_buffer_struct>();
-+    a->buf->buffer = vkbuf;
-+    a->buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
-+    a->buf->ptr    = nullptr;
-+    a->buf->size   = reserved;
-+    a->buf->device = device;
-+    if (device->buffer_device_address) {
-+        a->buf->bda_addr = device->device.getBufferAddress(vk::BufferDeviceAddressInfo(vkbuf));
++    a->mem_type = (uint32_t) probe_type;
++    // size is the K/V of the arena's sections at the max context (with room for the alignment): if the sparse address space
++    // cannot hold it, every section gets the range it needs now and grows by rebinding (not the first ones all of it)
++    {
++        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++        a->on_demand = vk_sparse_va[device->idx] + size > vk_sparse_va_limit(device);
++    }
++    if (a->on_demand) {
++        std::lock_guard<std::mutex> lock(log_mtx);
++        if (logged.insert(device->name + "/va").second) {
++            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: the K/V sections at the max context (%zu MiB) do not fit the sparse address space (%zu MiB): "
++                "a section gets the range it needs and grows by binding its memory into a larger range (no copy)\n", device->name.c_str(), size >> 20,
++                vk_sparse_va_limit(device) >> 20);
++        }
 +    }
 +    {
 +        std::lock_guard<std::mutex> lock(log_mtx);
 +        if (logged.insert(device->name + "/ok").second) {
-+            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse KV buffers: block %zu, chunk %zu bytes, memory type %d\n", device->name.c_str(),
-+                (size_t) req.alignment, chunk, mem_type);
++            GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: %s: sparse KV buffers: block %zu, chunk %zu bytes, memory type %d, a sparse range per section\n", device->name.c_str(),
++                block, chunk, probe_type);
 +        }
 +    }
 +    if (vk_sparse_debug()) {
-+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: arena of %zu bytes (%zu chunks)\n", reserved, reserved / chunk);
++        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_new: arena for %zu bytes of sections\n", size);
 +    }
 +    return a;
 +}
@@ -1911,13 +2093,52 @@ index cd9d074..b6879c5 100644
 +    return buffer && buffer->iface.free_buffer == ggml_backend_vk_sparse_free_buffer ? (vk_sparse_section *) buffer->context : nullptr;
 +}
 +
-+// allocate the memory of the chunks up to size (bound and zeroed by the next commit)
++// a larger address range for a section that outgrows its own: the bound chunks are bound into the new range (no data copy),
++// then the old range goes; the device is idle meanwhile (nothing may use the old range)
++static bool vk_sparse_rebind(vk_sparse_section * s, size_t want) {
++    vk_sparse_arena * a = s->arena;
++    std::string why;
++    // the max size if the address space holds every section at it (no more rebinding), else what it needs
++    size_t range = a->on_demand ? want : s->section;
++    vk_buffer nb = vk_sparse_range_new(a, range, nullptr);
++    if (!nb && want < s->section) {
++        range = want;
++        nb = vk_sparse_range_new(a, range, &why);
++    }
++    if (!nb) {
++        GGML_LOG_WARN("ggml_backend_vk_buffer_grow: a K/V section needs %zu MiB of address range: %s; it grows by copy\n", want >> 20, why.c_str());
++        return false;
++    }
++    std::vector<size_t> bound;
++    for (size_t i = 0; i < s->mem.size(); ++i) {
++        if (s->mem[i] && std::find(s->pending.begin(), s->pending.end(), i) == s->pending.end()) {
++            bound.push_back(i);
++        }
++    }
++    a->device->device.waitIdle();
++    if (!vk_sparse_bind(s, nb, bound, true)) {
++        vk_sparse_range_release(a->device, range);
++        return false;
++    }
++    if (vk_sparse_debug()) {
++        GGML_LOG_INFO("vk_sparse_rebind: section of %zu bytes: range %zu -> %zu bytes, %zu chunks bound into it\n", s->section, s->range, range, bound.size());
++    }
++    vk_sparse_range_release(a->device, s->range);
++    s->dev_buffer = nb; // the old range goes with its last reference (the descriptor caches see the destroy)
++    s->range = range;
++    return true;
++}
++
++// allocate the memory of the chunks up to size (bound and zeroed by the next commit); a larger range first if needed
 +static bool vk_sparse_map_to(vk_sparse_section * s, size_t size) {
 +    vk_sparse_arena * a = s->arena;
 +    const size_t want = std::min(s->section, a->chunk * ((size + a->chunk - 1) / a->chunk));
++    if (want > s->range && !vk_sparse_rebind(s, want)) {
++        return false;
++    }
 +    std::lock_guard<std::mutex> lock(a->mtx);
 +    while (s->mapped < want) {
-+        const size_t i = (s->offset + s->mapped) / a->chunk;
++        const size_t i = s->mapped / a->chunk;
 +        try {
 +            vk::MemoryAllocateInfo mai(a->chunk, a->mem_type);
 +            vk::MemoryAllocateFlagsInfo flags_info;
@@ -1925,7 +2146,7 @@ index cd9d074..b6879c5 100644
 +                flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
 +                mai.setPNext(&flags_info);
 +            }
-+            a->mem[i] = a->device->device.allocateMemory(mai);
++            s->mem[i] = a->device->device.allocateMemory(mai);
 +        } catch (const vk::SystemError & e) {
 +            if (vk_sparse_debug()) {
 +                GGML_LOG_INFO("vk_sparse_map_to: chunk %zu: allocation failed: %s\n", i, e.what());
@@ -1933,7 +2154,10 @@ index cd9d074..b6879c5 100644
 +            return false;
 +        }
 +        vk_sparse_stat_bound += (int64_t) a->chunk;
-+        a->pending.push_back(i);
++        if (s->pending.empty()) {
++            a->pending.push_back(s);
++        }
++        s->pending.push_back(i);
 +        s->mapped += a->chunk;
 +    }
 +    return true;
@@ -1942,45 +2166,75 @@ index cd9d074..b6879c5 100644
 +// bind the pending chunks and zero them; nothing may access them before
 +static bool ggml_backend_vk_vmm_arena_commit(void * arena) {
 +    vk_sparse_arena * a = (vk_sparse_arena *) arena;
-+    std::vector<size_t> idx;
++    std::vector<std::pair<vk_sparse_section *, std::vector<size_t>>> todo;
 +    {
 +        std::lock_guard<std::mutex> lock(a->mtx);
-+        idx.swap(a->pending);
++        for (vk_sparse_section * s : a->pending) {
++            todo.emplace_back(s, std::move(s->pending));
++            s->pending.clear();
++        }
++        a->pending.clear();
 +    }
-+    if (idx.empty()) {
++    if (todo.empty()) {
 +        return true;
 +    }
 +    const int64_t t0 = ggml_time_us();
-+    if (!vk_sparse_bind(a, idx, true)) {
-+        return false;
++    size_t n = 0;
++    for (auto & [s, idx] : todo) {
++        if (!vk_sparse_bind(s, s->dev_buffer, idx, true)) {
++            return false;
++        }
++        n += idx.size();
 +    }
 +    const int64_t t1 = ggml_time_us();
-+    for (size_t i : idx) {
-+        ggml_vk_buffer_memset(a->buf, i * a->chunk, 0, a->chunk);
++    for (auto & [s, idx] : todo) {
++        for (size_t i : idx) {
++            ggml_vk_buffer_memset(s->dev_buffer, i * a->chunk, 0, a->chunk);
++        }
 +    }
 +    if (vk_sparse_debug()) {
-+        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_commit: %zu chunks bound (%.2f ms) and zeroed (%.2f ms)\n", idx.size(), (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
++        GGML_LOG_INFO("ggml_backend_vk_vmm_arena_commit: %zu chunks of %zu sections bound (%.2f ms) and zeroed (%.2f ms)\n", n, todo.size(),
++            (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
 +    }
 +    return true;
 +}
 +
 +static ggml_backend_buffer_t ggml_backend_vk_vmm_arena_buffer(void * arena, size_t offset, size_t size, size_t max_size) {
++    GGML_UNUSED(offset); // a range of its own per section
 +    vk_sparse_arena * a = (vk_sparse_arena *) arena;
 +    const size_t section = a->chunk * ((std::max(size, max_size) + a->chunk - 1) / a->chunk);
-+    if (offset % a->chunk != 0 || offset + section > a->reserved) {
-+        return nullptr;
++    const size_t now     = a->chunk * ((std::max<size_t>(size, 1) + a->chunk - 1) / a->chunk);
++    // the range: the max size if the device's sparse address space allows it, else what the section needs now (it grows by
++    // binding its memory into a larger range)
++    size_t range = a->on_demand ? now : section;
++    vk_buffer buf = vk_sparse_range_new(a, range, nullptr);
++    if (!buf) {
++        std::string why;
++        range = now;
++        buf = vk_sparse_range_new(a, range, &why);
++        if (!buf) {
++            GGML_LOG_WARN("ggml_backend_vk_vmm_arena_buffer: %s: no address range for a K/V section of %zu MiB: %s\n", a->device->name.c_str(), now >> 20, why.c_str());
++            return nullptr;
++        }
 +    }
 +    auto * btctx = (ggml_backend_vk_buffer_type_context *) a->buft->context;
 +    {
 +        std::lock_guard<std::mutex> lock(a->mtx);
 +        a->refs++;
 +    }
-+    auto * s = new vk_sparse_section(a->device, a->buf, btctx->name, a, offset, section);
++    auto * s = new vk_sparse_section(a->device, buf, btctx->name, a, section);
++    s->range = range;
++    s->mem.assign(section / a->chunk, nullptr);
++    {
++        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++        vk_sparse_live.insert(s);
++    }
 +    if (!vk_sparse_map_to(s, std::max<size_t>(size, 1))) {
 +        ggml_backend_buffer_t tmp = ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, 0);
 +        ggml_backend_buffer_free(tmp);
 +        return nullptr;
 +    }
++    s->logical = size;
 +    return ggml_backend_buffer_init(a->buft, ggml_backend_vk_sparse_interface, s, size);
 +}
 +
@@ -1996,6 +2250,7 @@ index cd9d074..b6879c5 100644
 +        return false;
 +    }
 +    buffer->size = size;
++    s->logical   = size;
 +    return true;
 +}
 +
@@ -2013,9 +2268,9 @@ index cd9d074..b6879c5 100644
 +    {
 +        std::lock_guard<std::mutex> lock(a->mtx);
 +        for (size_t m = keep; m < s->mapped; m += a->chunk) {
-+            const size_t i = (s->offset + m) / a->chunk;
++            const size_t i = m / a->chunk;
 +            all.push_back(i);
-+            if (std::find(a->pending.begin(), a->pending.end(), i) == a->pending.end()) {
++            if (std::find(s->pending.begin(), s->pending.end(), i) == s->pending.end()) {
 +                bound.push_back(i); // pending chunks were never bound
 +            }
 +        }
@@ -2025,16 +2280,19 @@ index cd9d074..b6879c5 100644
 +    }
 +    if (!bound.empty()) {
 +        a->device->device.waitIdle(); // no queue may use a chunk when it is unbound
-+        if (!vk_sparse_bind(a, bound, false)) {
++        if (!vk_sparse_bind(s, s->dev_buffer, bound, false)) {
 +            return false;
 +        }
 +    }
 +    std::lock_guard<std::mutex> lock(a->mtx);
 +    for (size_t i : all) {
-+        a->pending.erase(std::remove(a->pending.begin(), a->pending.end(), i), a->pending.end());
-+        a->device->device.freeMemory(a->mem[i]);
-+        a->mem[i] = nullptr;
++        s->pending.erase(std::remove(s->pending.begin(), s->pending.end(), i), s->pending.end());
++        a->device->device.freeMemory(s->mem[i]);
++        s->mem[i] = nullptr;
 +        vk_sparse_stat_bound -= (int64_t) a->chunk;
++    }
++    if (s->pending.empty()) {
++        a->pending.erase(std::remove(a->pending.begin(), a->pending.end(), s), a->pending.end());
 +    }
 +    s->mapped = keep;
 +    return true;
@@ -2053,8 +2311,9 @@ index cd9d074..b6879c5 100644
 +        return false;
 +    }
 +    buffer->size = size;
++    s->logical   = size;
 +    if (vk_sparse_debug()) {
-+        GGML_LOG_INFO("ggml_backend_vk_buffer_shrink: section at %zu: %zu -> %zu bytes bound\n", s->offset, old, s->mapped);
++        GGML_LOG_INFO("ggml_backend_vk_buffer_shrink: section of %zu bytes: %zu -> %zu bytes bound\n", s->section, old, s->mapped);
 +    }
 +    return true;
 +}
@@ -2081,20 +2340,38 @@ index cd9d074..b6879c5 100644
 +static void ggml_backend_vk_sparse_free_buffer(ggml_backend_buffer_t buffer) {
 +    vk_sparse_section * s = (vk_sparse_section *) buffer->context;
 +    vk_sparse_unmap_from(s, 0);
++    {
++        std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++        vk_sparse_live.erase(s);
++    }
++    vk_sparse_range_release(s->arena->device, s->range);
 +    vk_sparse_arena * a = s->arena;
 +    delete s;
 +    vk_sparse_arena_unref(a);
 +}
 +
 +static void * ggml_backend_vk_sparse_get_base(ggml_backend_buffer_t buffer) {
-+    return (uint8_t *) vk_ptr_base + ((vk_sparse_section *) buffer->context)->offset;
++    GGML_UNUSED(buffer);
++    return vk_ptr_base; // a range of its own: the tensors start at offset 0
 +}
 +
 +static void ggml_backend_vk_sparse_clear(ggml_backend_buffer_t buffer, uint8_t value) {
 +    vk_sparse_section * s = (vk_sparse_section *) buffer->context;
 +    if (buffer->size > 0) {
-+        ggml_vk_buffer_memset(s->dev_buffer, s->offset, (uint32_t) value * 0x01010101, buffer->size);
++        ggml_vk_buffer_memset(s->dev_buffer, 0, (uint32_t) value * 0x01010101, buffer->size);
 +    }
++}
++
++// device memory of the sparse K/V sections above their ggml buffer size (whole chunks), per device
++size_t ggml_vk_sparse_unbooked(size_t device_idx) {
++    std::lock_guard<std::mutex> lock(vk_sparse_reg_mtx);
++    size_t res = 0;
++    for (const vk_sparse_section * s : vk_sparse_live) {
++        if (s->arena->device->idx == device_idx && s->mapped > s->logical) {
++            res += s->mapped - s->logical;
++        }
++    }
++    return res;
 +}
 +
 +// true if ggml_backend_dev_memory measures the free memory (VK_EXT_memory_budget); without it the free memory is the heap size
@@ -2113,7 +2390,37 @@ index cd9d074..b6879c5 100644
 +    return measured;
 +}
 +
++// the scheduler reads a split's output into host memory through get_tensor_async + synchronize: a synchronous read is a
++// command buffer, a submission and a fence wait of its own after the wait for the graph (per split boundary in a GPU/CPU
++// split); off by default, GGML_VK_ASYNC_READBACK=1 turns it on (measured neutral on an iGPU; to be measured on a discrete card)
++static bool ggml_backend_vk_dev_async_readback(ggml_backend_dev_t dev) {
++    GGML_UNUSED(dev);
++    static const bool on = getenv("GGML_VK_ASYNC_READBACK") && atoi(getenv("GGML_VK_ASYNC_READBACK")) != 0;
++    return on;
++}
++
++size_t ggml_vk_internal_device_bytes(size_t device_idx);
++
++// device memory the backend holds outside the ggml buffers' sizes (its own graph buffers, the sparse chunk rounding): the
++// zones booking adds it to the compute buffers, so the booked free memory follows the measured one
++static size_t ggml_backend_vk_dev_internal_memory(ggml_backend_dev_t dev) {
++    const auto * ctx = (const ggml_backend_vk_device_context *) dev->context;
++    return ctx ? ggml_vk_internal_device_bytes((size_t) ctx->device) : 0;
++}
++
++std::atomic<int64_t> ggml_vk_host_alloc_bytes{0};
++
++// host memory the backend allocated through the driver (the Vulkan_Host buffers, staging, pinned copies); the caller measures
++// whether the process' cgroup sees it (a driver allocation, e.g. the GTT of a discrete card, need not be charged there)
++static size_t ggml_backend_vk_dev_host_memory(ggml_backend_dev_t dev) {
++    GGML_UNUSED(dev);
++    return (size_t) std::max<int64_t>(0, ggml_vk_host_alloc_bytes.load());
++}
++
 +void * ggml_vk_sparse_proc_address(const char * name) {
++    if (strcmp(name, "ggml_backend_dev_host_memory") == 0)       { return (void *) ggml_backend_vk_dev_host_memory; }
++    if (strcmp(name, "ggml_backend_dev_internal_memory") == 0)   { return (void *) ggml_backend_vk_dev_internal_memory; }
++    if (strcmp(name, "ggml_backend_dev_async_readback") == 0)   { return (void *) ggml_backend_vk_dev_async_readback; }
 +    if (strcmp(name, "ggml_backend_dev_memory_measured") == 0)  { return (void *) ggml_backend_vk_dev_memory_measured; }
 +    if (strcmp(name, "ggml_backend_vmm_arena_new") == 0)          { return (void *) ggml_backend_vk_vmm_arena_new; }
 +    if (strcmp(name, "ggml_backend_vmm_arena_alignment") == 0)    { return (void *) ggml_backend_vk_vmm_arena_alignment; }
@@ -2141,8 +2448,38 @@ index 0af8a5c..e4adadb 100644
  
  // comm
  #if !defined(_WIN32)
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 1299609..293e815 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1050,17 +1050,25 @@ inline void vk_command_pool::destroy(vk::Device& device) {
+     cmd_buffers.clear();
+ }
+ 
++// bytes of host memory (not device-local) the backend allocated through the driver (dual-buffer fork: the RAM accounting adds
++// what the process' cgroup does not see of it)
++extern std::atomic<int64_t> ggml_vk_host_alloc_bytes;
++
+ struct vk_buffer_struct {
+     vk::Buffer buffer = VK_NULL_HANDLE;
+     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
+     vk::MemoryPropertyFlags memory_property_flags;
+     void * ptr;
+     size_t size = 0;
++    size_t host_counted = 0; // in ggml_vk_host_alloc_bytes
+     vk::DeviceAddress bda_addr {};
+ 
+     vk_device device;
+ 
+     ~vk_buffer_struct() {
++        if (host_counted > 0) {
++            ggml_vk_host_alloc_bytes -= (int64_t) host_counted;
++        }
+         if (size == 0) {
+             return;
+         }
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index b46cba3..aea8e01 100644
+index b46cba3..4bc3060 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -5511,7 +5511,8 @@ void ggml_vk_instance_init() {
@@ -2155,7 +2492,56 @@ index b46cba3..aea8e01 100644
  
          bool host_buffer_import = false;
          if (external_memory_host_supported) {
-@@ -16474,6 +16475,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
+@@ -13418,9 +13419,37 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
+     return ctx->name.c_str();
+ }
+ 
++// the live backend contexts (dual-buffer fork): their own device buffers are reported to the zones booking
++static std::mutex                           vk_ctx_live_mtx;
++static std::set<ggml_backend_vk_context *> vk_ctx_live;
++
++size_t ggml_vk_sparse_unbooked(size_t device_idx);
++
++// device memory the backend holds outside the ggml buffers' sizes: the buffers it allocates itself while a graph runs
++// (prealloc_x/y/split_k/add_rms_partials) and the whole-chunk rounding of the sparse K/V sections
++size_t ggml_vk_internal_device_bytes(size_t device_idx) {
++    size_t res = ggml_vk_sparse_unbooked(device_idx);
++    std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
++    for (const ggml_backend_vk_context * ctx : vk_ctx_live) {
++        if (ctx->device->idx != device_idx) {
++            continue;
++        }
++        for (const vk_buffer * b : { &ctx->prealloc_x, &ctx->prealloc_y, &ctx->prealloc_split_k, &ctx->prealloc_add_rms_partials }) {
++            if (*b && ((*b)->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
++                res += (*b)->size;
++            }
++        }
++    }
++    return res;
++}
++
+ void ggml_backend_vk_free(ggml_backend_t backend) {
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
++    {
++        std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
++        vk_ctx_live.erase(ctx);
++    }
+ 
+     ggml_vk_cleanup(ctx);
+ 
+@@ -15433,6 +15462,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+ 
+     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
+     ggml_vk_init(ctx, dev_num);
++    {
++        std::lock_guard<std::mutex> lock(vk_ctx_live_mtx);
++        vk_ctx_live.insert(ctx);
++    }
+ 
+     ggml_backend_t vk_backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_vk_guid(),
+@@ -16474,6 +16507,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
      if (strcmp(name, "ggml_backend_fusion_set_enabled") == 0) {
          return (void *) ggml_backend_vk_fusion_set_enabled;
      }
@@ -2166,7 +2552,7 @@ index b46cba3..aea8e01 100644
  }
  
 diff --git a/include/llama.h b/include/llama.h
-index 988b178..1ad90e3 100644
+index 988b178..6953d40 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -348,11 +348,28 @@ extern "C" {
@@ -2210,7 +2596,7 @@ index 988b178..1ad90e3 100644
          // Abort callback
          // if it returns true, execution of llama_decode() will be aborted
          // currently works only with CPU execution
-@@ -821,6 +843,22 @@ extern "C" {
+@@ -821,6 +843,29 @@ extern "C" {
      // Check if the memory supports shifting
      LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
  
@@ -2230,11 +2616,18 @@ index 988b178..1ad90e3 100644
 +    LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
 +    LLAMA_API size_t llama_park_demoted_bytes(const struct llama_context * ctx);
 +
++    // Host memory the backends allocated through their drivers (ggml_backend_dev_host_memory, e.g. the Vulkan host buffers) that
++    // the process' memory cgroup does not see (measured once: a host buffer allocated and cleared, the cgroup usage before and
++    // after). The RAM guards add it to the cgroup's usage; 0 without a cgroup or without the query (CUDA/HIP).
++    LLAMA_API size_t llama_backend_host_uncharged(void);
++    // all host memory those backends allocated through their drivers (seen by the cgroup or not)
++    LLAMA_API size_t llama_backend_host_allocated(void);
++
      //
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3eda87a..16a1b5b 100644
+index 3eda87a..e6aa712 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -9,6 +9,12 @@
@@ -2409,7 +2802,7 @@ index 3eda87a..16a1b5b 100644
      }
  
      // init backends
-@@ -784,10 +912,562 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -784,10 +912,592 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
  
@@ -2549,6 +2942,9 @@ index 3eda87a..16a1b5b 100644
 +
 +    // zone rule (DESIGN-3zone.md 6.3): device memory budget, booked from the first step on
 +    const bool rule = !model.flex_layers().empty();
++    if (rule) {
++        zones_internal_booked(); // the backend's own buffers grew or shrank in the last graphs
++    }
 +    if (rule && !zones_headroom_set) {
 +        zones_headroom_set = true;
 +        size_t dev_free = 0, dev_total = 0;
@@ -2691,6 +3087,7 @@ index 3eda87a..16a1b5b 100644
 +        zones_retry_put_back = delta < 0;
 +    }
 +    zones_compute_bytes = bytes;
++    zones_internal_booked();
 +}
 +
 +// the free VRAM by the kernel driver (amdgpu sysfs: mem_info_vram_total - mem_info_vram_used) of the card whose total is closest
@@ -2825,7 +3222,33 @@ index 3eda87a..16a1b5b 100644
 +            }
 +        }
 +    }
++    used += zones_internal_query(dev);
 +    return dev_total > used ? dev_total - used : 0;
++}
++
++// device memory the backend holds outside the ggml buffers' sizes (ggml_backend_dev_internal_memory: Vulkan's own graph
++// buffers and the sparse chunk rounding); 0 without the query (CUDA/HIP)
++size_t llama_context::zones_internal_query(ggml_backend_dev_t dev) {
++    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++    auto fn = reg ? (size_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_internal_memory") : nullptr;
++    return fn ? fn(dev) : 0;
++}
++
++// the change of that memory is booked like the compute buffer (a smaller one is memory back: the flex steps are tried again)
++void llama_context::zones_internal_booked() {
++    const size_t bytes = zones_internal_query(zones_dev());
++    if (zones_headroom_set && bytes != zones_internal_bytes) {
++        const int64_t delta = (int64_t) bytes - (int64_t) zones_internal_bytes;
++        zones_headroom -= delta;
++        if (std::llabs(delta) >= ((int64_t) 16 << 20)) {
++            LLAMA_LOG_INFO("%s: zones: backend buffers outside the ggml buffers %.0f -> %.0f MiB, budget %.0f MiB\n", __func__,
++                zones_internal_bytes / 1048576.0, bytes / 1048576.0, zones_headroom / 1048576.0);
++        }
++        if (delta < 0) {
++            zones_retry_put_back = true;
++        }
++    }
++    zones_internal_bytes = bytes;
 +}
 +
 +size_t llama_context::zones_layer_kv_bytes(int il) const {
@@ -2972,7 +3395,7 @@ index 3eda87a..16a1b5b 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -942,6 +1622,8 @@ void llama_context::sched_reserve() {
+@@ -942,6 +1652,8 @@ void llama_context::sched_reserve() {
  
      LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
              __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -2981,7 +3404,7 @@ index 3eda87a..16a1b5b 100644
  }
  
  void llama_context::synchronize() {
-@@ -2003,6 +2685,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2003,6 +2715,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          return encode(batch_inp);
      }
  
@@ -2997,7 +3420,7 @@ index 3eda87a..16a1b5b 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -2089,6 +2780,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2089,6 +2810,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -3034,7 +3457,7 @@ index 3eda87a..16a1b5b 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -2097,8 +2818,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2097,8 +2848,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -3043,7 +3466,7 @@ index 3eda87a..16a1b5b 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -4273,6 +4992,8 @@ llama_context_params llama_context_default_params() {
+@@ -4273,6 +5022,8 @@ llama_context_params llama_context_default_params() {
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.moe_cache_size              =*/ 0,
@@ -3052,7 +3475,7 @@ index 3eda87a..16a1b5b 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4758,6 +5479,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4758,6 +5509,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  
@@ -3190,7 +3613,7 @@ index 3eda87a..16a1b5b 100644
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index cf2949a..369f7e1 100644
+index cf2949a..e3612c1 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -19,6 +19,7 @@
@@ -3201,7 +3624,7 @@ index cf2949a..369f7e1 100644
  
  class llama_io_read_i;
  class llama_io_write_i;
-@@ -379,6 +380,89 @@ private:
+@@ -379,6 +380,92 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -3260,6 +3683,7 @@ index cf2949a..369f7e1 100644
 +    int64_t  zones_t_batch_us  = 0;     // the start of the last batch
 +    int64_t  zones_t_shrink_us = 0;     // the last check whether a shrink lets flex steps back
 +    size_t   zones_compute_bytes = 0;   // the compute buffer on the device, booked in the budget
++    size_t   zones_internal_bytes = 0;  // the backend's own device buffers outside the ggml buffers, booked in the budget
 +    bool     zones_retry_put_back = false; // the compute buffer got smaller: try the flex steps that are off after the reservation
 +
 +    // the budget never above the measured free device memory minus the margin (the compute pools and buffers, and memory the
@@ -3269,6 +3693,8 @@ index cf2949a..369f7e1 100644
 +    // whether the device's free memory is measured (else the booking: the device total minus what the model and context hold on it)
 +    bool     zones_mem_measured(ggml_backend_dev_t dev);
 +    size_t   zones_booked_free(ggml_backend_dev_t dev) const;
++    static size_t zones_internal_query(ggml_backend_dev_t dev);
++    void     zones_internal_booked();
 +    int      zones_measured = -1; // -1 = not asked yet
 +    // one summary line after a change of the zone state: weights on the GPU/CPU, flex layers, KV size, measured free memory
 +    void     zones_log_state(const char * what);
@@ -3292,7 +3718,7 @@ index cf2949a..369f7e1 100644
      // true until then, because the first output_reserve() runs before any graph is reserved
      bool graph_has_logits = true;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 0a8bf37..d3034e9 100644
+index 0a8bf37..0fb6650 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -3364,7 +3790,7 @@ index 0a8bf37..d3034e9 100644
          slot_info sinfo;
  
          bool res = true;
-@@ -2944,6 +2983,801 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
+@@ -2944,6 +2983,848 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
      }
  }
  
@@ -3950,10 +4376,56 @@ index 0a8bf37..d3034e9 100644
 +        t_alloc += ggml_time_us() - t1;
 +    }
 +
++    const uint32_t n_rows = std::min(n_used, n);
++
++    // the copy fallback (no arena on the device) from a device buffer shared by several layers (the K/V as loaded): the used
++    // rows of its layers go to the host and the shared buffer is freed before the new buffers, so the device holds one layer's
++    // new K/V at a time on top of the rest instead of the whole old and the whole new K/V (the arena path is unchanged)
++    std::vector<uint8_t> staged_shared(layers.size(), 0);
++    size_t n_staged_bufs = 0;
++    if (n_stream == 1) {
++        for (size_t ib = 0; ib < ctxs_bufs.bufs.size(); ++ib) {
++            const ggml_backend_buffer_t b = ctxs_bufs.bufs[ib].second.get();
++            if (!b || n_owners[ib] <= 1 || ggml_backend_buffer_is_host(b)) {
++                continue;
++            }
++            std::vector<size_t> own;
++            bool all = true;
++            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
++                if (layers[ikv].k->buffer != b && !(layers[ikv].v && layers[ikv].v->buffer == b)) {
++                    continue;
++                }
++                own.push_back(ikv);
++                if (grown[ikv] || !bufs_section[ikv].empty() || arenas.count(buft_of[ikv]) > 0 || via_host[ikv] || on_host[ikv]) {
++                    all = false;
++                }
++            }
++            if (!all || own.empty()) {
++                continue;
++            }
++            for (size_t ikv : own) {
++                int i = 0;
++                for (ggml_tensor * t : { layers[ikv].k, layers[ikv].v }) {
++                    auto & h = staged[2*ikv + i++];
++                    if (t && n_rows > 0) {
++                        h.resize(t->nb[1]*n_rows);
++                        ggml_backend_tensor_get(t, h.data(), 0, h.size());
++                    }
++                }
++                staged_shared[ikv] = 1;
++            }
++            ctxs_bufs.bufs[ib].second.reset();
++            n_staged_bufs++;
++        }
++        if (n_staged_bufs > 0) {
++            LLAMA_LOG_INFO("%s: copy fallback: %zu shared K/V buffers freed first (%u used rows of their layers through the host)\n", __func__,
++                n_staged_bufs, n_rows);
++        }
++    }
++
 +    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
 +    bufs_new.reserve(2*layers.size());
 +    size_t n_copied = 0;
-+    const uint32_t n_rows = std::min(n_used, n);
 +    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
 +        auto & layer = layers[ikv];
 +        ggml_backend_buffer_type_t buft = buft_of[ikv];
@@ -4057,10 +4529,11 @@ index 0a8bf37..d3034e9 100644
 +        dyn_vmm[ikv] = !bufs_layer.empty();
 +        if (bufs_layer.empty()) {
 +            ggml_backend_buffer_ptr b(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-+            if (via_host[ikv]) {
-+                // the old K/V is gone (its range was freed): an ordinary device buffer, else the CPU; stop only if both fail
++            if (via_host[ikv] || staged_shared[ikv]) {
++                // the old K/V is gone (its range or the shared buffer was freed): an ordinary device buffer, else the CPU; stop
++                // only if both fail
 +                if (b) {
-+                    n_lost_vmm++;
++                    n_lost_vmm += via_host[ikv];
 +                } else {
 +                    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 +                    ggml_backend_buffer_type_t buft_cpu = cpu ? ggml_backend_dev_buffer_type(cpu) : nullptr;
@@ -4093,7 +4566,7 @@ index 0a8bf37..d3034e9 100644
 +                continue;
 +            }
 +            // the arena was freed above: the used rows come back from the host
-+            if (via_host[ikv]) {
++            if (via_host[ikv] || staged_shared[ikv]) {
 +                const auto & h = staged[2*ikv + i];
 +                if (!h.empty()) {
 +                    ggml_backend_tensor_set(dst, h.data(), 0, h.size());
@@ -4166,7 +4639,7 @@ index 0a8bf37..d3034e9 100644
  //
  // llama_kv_cache_context
  //
-@@ -3096,3 +3930,58 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+@@ -3096,3 +3977,58 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
  void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
      kv->get_prev_tokens(ubatch, n, res);
  }
@@ -4557,18 +5030,21 @@ index 2348cc1..5d17a28 100644
      size_t n_tensors_moved = 0;
      std::string first_tensor_moved_name;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index cab5669..ea8dcf2 100644
+index cab5669..51e802d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -31,6 +31,7 @@
+@@ -31,8 +31,10 @@
  #include <cstdint>
  #include <cstring>
  #include <cmath>
 +#include <fstream>
  #include <functional>
  #include <map>
++#include <mutex>
  #include <numeric>
-@@ -1224,8 +1225,74 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
+ #include <regex>
+ #include <sstream>
+@@ -1224,8 +1226,170 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
      return fallback;
  }
  
@@ -4638,13 +5114,109 @@ index cab5669..ea8dcf2 100644
 +    return found;
 +}
 +
++// the memory usage of the process' own (leaf) memory cgroup: v2 memory.current, v1 memory.usage_in_bytes
++static bool get_cgroup_self_usage(uint64_t & use, const std::string & root = "/sys/fs/cgroup", const std::string & self = "/proc/self/cgroup") {
++    std::ifstream f(self);
++    std::string line;
++    while (std::getline(f, line)) {
++        const size_t p1 = line.find(':');
++        const size_t p2 = p1 == std::string::npos ? p1 : line.find(':', p1 + 1);
++        if (p2 == std::string::npos) {
++            continue;
++        }
++        const std::string ctrl = line.substr(p1 + 1, p2 - p1 - 1);
++        const bool v2 = ctrl.empty();
++        if (!v2 && (',' + ctrl + ',').find(",memory,") == std::string::npos) {
++            continue;
++        }
++        const std::string dir = root + (v2 ? "" : "/memory") + line.substr(p2 + 1);
++        if (read_cgroup_u64(dir + (v2 ? "/memory.current" : "/memory.usage_in_bytes"), use)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// the backends' driver-allocated host memory (ggml_backend_dev_host_memory), and a device that has the query
++static size_t backend_host_allocated(ggml_backend_dev_t * probe) {
++    size_t total = 0;
++    std::vector<ggml_backend_reg_t> seen;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++        if (!reg || std::find(seen.begin(), seen.end(), reg) != seen.end()) {
++            continue;
++        }
++        seen.push_back(reg);
++        auto fn = (size_t (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_host_memory");
++        if (fn) {
++            total += fn(dev);
++            if (probe && !*probe) {
++                *probe = dev;
++            }
++        }
++    }
++    return total;
++}
++
++size_t llama_backend_host_allocated(void) {
++    return backend_host_allocated(nullptr);
++}
++
++size_t llama_backend_host_uncharged(void) {
++    static std::mutex mtx;
++    static int charged = -1; // measured once per process: 1 the cgroup sees the driver's host allocations, 0 it does not
++    std::lock_guard<std::mutex> lock(mtx);
++    ggml_backend_dev_t probe = nullptr;
++    const size_t total = backend_host_allocated(&probe);
++    uint64_t u0 = 0, u1 = 0;
++    if (!probe || !get_cgroup_self_usage(u0)) {
++        return 0; // no backend with the query, or no cgroup: the system's free memory sees the driver's allocations
++    }
++    if (charged < 0) {
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(probe);
++        const size_t bytes = (size_t) 64 << 20;
++        const size_t h0 = backend_host_allocated(nullptr);
++        ggml_backend_buffer_t buf = buft ? ggml_backend_buft_alloc_buffer(buft, bytes) : nullptr;
++        const size_t h1 = backend_host_allocated(nullptr);
++        if (!buf || h1 < h0 + bytes/2) {
++            // no host buffer of the device, or it is not a driver allocation (an imported malloc): nothing to measure
++            if (buf) {
++                ggml_backend_buffer_free(buf);
++            }
++            charged = 1;
++            LLAMA_LOG_INFO("%s: RAM: the host buffers of %s are not driver allocations here: the cgroup sees them\n", __func__, ggml_backend_dev_name(probe));
++        } else {
++            get_cgroup_self_usage(u0);
++            ggml_backend_buffer_clear(buf, 1); // the pages are allocated on the first touch
++            get_cgroup_self_usage(u1);
++            ggml_backend_buffer_free(buf);
++            charged = u1 >= u0 + bytes/2 ? 1 : 0;
++            LLAMA_LOG_INFO("%s: RAM: the host buffers %s allocates through its driver are %s by the memory cgroup (measured: %+.0f MiB of usage for a %zu MiB buffer)%s\n",
++                __func__, ggml_backend_dev_name(probe), charged ? "seen" : "not seen", ((double) u1 - (double) u0) / 1048576.0, bytes >> 20,
++                charged ? "" : ": the RAM guards add them to the cgroup's usage");
++        }
++    }
++    return charged ? 0 : total;
++}
++
++// the RAM the guards subtract from the cgroup's free memory besides its own usage: this process' uncharged driver host memory and
++// the other processes' (LLAMA_ARG_RAM_UNCHARGED_MIB, from the caller that runs several, e.g. ollama-dualbuf)
++static size_t ram_uncharged_all() {
++    size_t res = llama_backend_host_uncharged();
++    if (const char * env = getenv("LLAMA_ARG_RAM_UNCHARGED_MIB")) {
++        res += (size_t) std::max(0LL, atoll(env)) << 20;
++    }
++    return res;
++}
++
  // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 -static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
 +static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, bool host_after_extra = false) {
      buft_list_t buft_list;
  
      // add ACCEL buffer types
-@@ -1246,7 +1313,11 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+@@ -1246,7 +1410,11 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
      // generally, this will be done using the first device in the list
      // a better approach would be to handle this on a weight-by-weight basis using the offload_op
      // function of the device to determine if it would benefit from being stored in a host buffer
@@ -4657,7 +5229,7 @@ index cab5669..ea8dcf2 100644
          for (const auto & dev : devices) {
              ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
              if (buft) {
-@@ -1254,6 +1325,9 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+@@ -1254,6 +1422,9 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
                  break;
              }
          }
@@ -4667,7 +5239,7 @@ index cab5669..ea8dcf2 100644
      }
  
      // add extra buffer types
-@@ -1275,6 +1349,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+@@ -1275,6 +1446,10 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
          }
      }
  
@@ -4678,7 +5250,7 @@ index cab5669..ea8dcf2 100644
      // add the CPU buffer type
      for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
          ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-@@ -1360,6 +1438,28 @@ struct llama_model::impl {
+@@ -1360,6 +1535,28 @@ struct llama_model::impl {
      buft_list_t cpu_buft_list;
      std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
  
@@ -4707,7 +5279,7 @@ index cab5669..ea8dcf2 100644
      struct layer_dev {
          ggml_backend_dev_t dev;
          buft_list_t * buft_list;
-@@ -1714,8 +1814,179 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1714,8 +1911,181 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
          __func__, load_mode_name);
  
@@ -4752,9 +5324,11 @@ index cab5669..ea8dcf2 100644
 +        }
 +        // a cgroup memory limit applies instead of the system memory
 +        if (get_cgroup_free(cg_free, cg_limit)) {
-+            ram_free  = cg_free;
++            // the driver host memory the cgroup does not see (Vulkan host buffers) is used all the same
++            const size_t unch = ram_uncharged_all();
++            ram_free  = cg_free > unch ? cg_free - unch : 0;
 +            ram_total = cg_limit;
-+            ram_src   = "cgroup limit";
++            ram_src   = unch > 0 ? "cgroup limit + uncharged driver host memory" : "cgroup limit";
 +        }
 +        if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
 +            ram_free  = (size_t) atoll(env) * 1024 * 1024;
@@ -4888,7 +5462,7 @@ index cab5669..ea8dcf2 100644
      for (const auto & dev : devices) {
          buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
          // add CPU buffer types as a fallback
-@@ -1763,6 +2034,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1763,6 +2133,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
      const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
@@ -4912,7 +5486,7 @@ index cab5669..ea8dcf2 100644
      auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
          const bool is_swa = il < n_layer_all && hparams.is_swa(il);
          if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
-@@ -1975,10 +2263,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1975,10 +2362,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              (output_s || output_in_s)) {
          throw std::runtime_error("output scales require a separate output weight");
      }
@@ -4948,7 +5522,7 @@ index cab5669..ea8dcf2 100644
          }
      }
  
-@@ -2088,6 +2400,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2088,6 +2499,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              buf_ptrs.emplace_back(buf.get());
          }
  
@@ -4958,7 +5532,7 @@ index cab5669..ea8dcf2 100644
          pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
  
          ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
-@@ -2144,6 +2459,462 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2144,6 +2558,463 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -5203,9 +5777,10 @@ index cab5669..ea8dcf2 100644
 +        ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
 +    }
 +    if (get_cgroup_free(cg_free, cg_limit)) {
-+        ram_free  = cg_free;
++        const size_t unch = ram_uncharged_all();
++        ram_free  = cg_free > unch ? cg_free - unch : 0;
 +        ram_total = cg_limit;
-+        src       = "cgroup limit";
++        src       = unch > 0 ? "cgroup limit + uncharged driver host memory" : "cgroup limit";
 +    }
 +    if (const char * env = getenv("LLAMA_DUAL_BUFFER_FREE_MIB")) { // test aid
 +        ram_free  = (size_t) atoll(env) * 1024 * 1024;
@@ -5421,7 +5996,7 @@ index cab5669..ea8dcf2 100644
      return true;
  }
  
-@@ -2783,6 +3554,15 @@ void llama_model::print_info() const {
+@@ -2783,6 +3654,15 @@ void llama_model::print_info() const {
  }
  
  ggml_backend_dev_t llama_model::dev_layer(int il) const {
@@ -5437,7 +6012,7 @@ index cab5669..ea8dcf2 100644
      return pimpl->dev_layer.at(il).dev;
  }
  
-@@ -3525,10 +4305,17 @@ llama_model_params llama_model_default_params() {
+@@ -3525,10 +4405,17 @@ llama_model_params llama_model_default_params() {
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
@@ -5524,7 +6099,7 @@ index e6768ca..35841dd 100644
  
      struct impl;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5f7e67b..a36ce48 100644
+index 5f7e67b..205be38 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -330,6 +330,7 @@ struct server_slot {
@@ -5567,7 +6142,7 @@ index 5f7e67b..a36ce48 100644
              SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
  
              init_opt.video_params.fps_target = params_base.video_fps;
-@@ -3178,6 +3190,61 @@ private:
+@@ -3178,6 +3190,62 @@ private:
                  {
                      // do nothing
                  } break;
@@ -5594,6 +6169,7 @@ index 5f7e67b..a36ce48 100644
 +                        const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
 +                        res->success = llama_park(ctx_tgt, to_park);
 +                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
++                        res->host_uncharged = llama_backend_host_uncharged();
 +                        // the projector on the device: loaded again on the CPU while parked, back on the device after
 +                        if (res->success && mctx && mparams_park_set && mparams_park.use_gpu) {
 +                            mtmd_context_params p = mparams_park;
@@ -5629,7 +6205,7 @@ index 5f7e67b..a36ce48 100644
              case SERVER_TASK_TYPE_METRICS:
                  {
                      int n_processing_slots = 0;
-@@ -4341,6 +4408,7 @@ private:
+@@ -4341,6 +4409,7 @@ private:
                          metrics.add_prompt_cached(n_past);
  
                          slot.prompt.tokens.keep_first(n_past);
@@ -5637,7 +6213,7 @@ index 5f7e67b..a36ce48 100644
  
                          // this is to signal the client that the request has started processing
                          if (slot.task->params.stream) {
-@@ -4372,6 +4440,12 @@ private:
+@@ -4372,6 +4441,12 @@ private:
  
                      slot.mem.seq_rm(slot.id, p0, -1);
  
@@ -5650,7 +6226,7 @@ index 5f7e67b..a36ce48 100644
                      // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                      bool wait_shared = false;
                      if (slot.task->n_tokens_shared > 0) {
-@@ -5858,6 +5932,33 @@ void server_routes::init_routes() {
+@@ -5858,6 +5933,33 @@ void server_routes::init_routes() {
          return res;
      };
  
@@ -5699,7 +6275,7 @@ index 53b7e25..a95379e 100644
      server_http_context::handler_t post_props;
      server_http_context::handler_t post_infill;
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9455816..f0a320f 100644
+index 9455816..e6e6d2a 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -32,6 +32,9 @@ enum server_task_type {
@@ -5712,7 +6288,7 @@ index 9455816..f0a320f 100644
  };
  
  // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
-@@ -649,6 +652,18 @@ struct server_task_result_slot_save_load : server_task_result {
+@@ -649,6 +652,19 @@ struct server_task_result_slot_save_load : server_task_result {
      virtual json to_json() override;
  };
  
@@ -5722,9 +6298,10 @@ index 9455816..f0a320f 100644
 +    bool   parked  = false;
 +    double t_ms    = 0.0;
 +    size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
++    size_t host_uncharged = 0; // driver host memory the memory cgroup does not see (llama_backend_host_uncharged)
 +
 +    virtual json to_json() override {
-+        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "timings", { { "ms", t_ms } } } };
++        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
 +    }
 +};
 +
@@ -5732,7 +6309,7 @@ index 9455816..f0a320f 100644
      size_t n_erased;
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index b625ad5..f096dae 100644
+index b625ad5..f37c85d 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
 @@ -212,6 +212,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
@@ -5745,3 +6322,12 @@ index b625ad5..f096dae 100644
  
      // Google Cloud Platform (Vertex AI) compat
      ctx_http.register_gcp_compat();
+@@ -680,6 +683,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
+     ctx_http.is_ready.store(true);
+ 
+     SRV_INF("%s", "model loaded\n");
++    // the driver host memory the memory cgroup does not see (Vulkan host buffers): the caller adds it to its RAM accounting
++    SRV_INF("host memory: %.0f MiB in backend host buffers, %.0f MiB not charged to the cgroup\n", llama_backend_host_allocated() / 1048576.0, llama_backend_host_uncharged() / 1048576.0);
+ 
+     shutdown_handler = [&](int) {
+         mcp_mgr.shutdown();

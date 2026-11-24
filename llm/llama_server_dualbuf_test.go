@@ -80,3 +80,15 @@ func TestZonesStateLiveVRAM(t *testing.T) {
 		t.Fatalf("after another buffer line %d want %d", got, want)
 	}
 }
+
+func TestHostUnchargedFromLog(t *testing.T) {
+	s := &llamaServerRunner{}
+	s.parseParkLocked([]byte("srv  server_run_i: host memory: 3120 MiB in backend host buffers, 3120 MiB not charged to the cgroup\n"))
+	if got := s.HostUncharged(); got != 3120<<20 {
+		t.Fatalf("got %d want %d", got, uint64(3120)<<20)
+	}
+	s.parseParkLocked([]byte("srv  server_run_i: host memory: 900 MiB in backend host buffers, 0 MiB not charged to the cgroup\n"))
+	if got := s.HostUncharged(); got != 0 {
+		t.Fatalf("a charged (ROCm) report must give 0, got %d", got)
+	}
+}

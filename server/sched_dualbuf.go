@@ -184,6 +184,28 @@ func dualbufNumParallel(req *LlmRequest, numParallel int, completion bool) int {
 }
 
 // dualbufServerConfig adds the per model llama-server settings and logs the effective ones.
+// dualbufHostUncharged sums the driver host memory of the loaded runners that the memory cgroup does not see
+// (llama-server: "host memory: ... not charged to the cgroup"), except the runner except.
+func (s *Scheduler) dualbufHostUncharged(except *runnerRef) uint64 {
+	type uncharged interface{ HostUncharged() uint64 }
+	s.loadedMu.Lock()
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, r := range s.loaded {
+		runners = append(runners, r)
+	}
+	s.loadedMu.Unlock()
+	var sum uint64
+	for _, r := range runners {
+		if r == except || r.llama == nil {
+			continue
+		}
+		if u, ok := r.llama.(uncharged); ok {
+			sum += u.HostUncharged()
+		}
+	}
+	return sum
+}
+
 func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServerConfig) {
 	db := req.model.dualbuf
 	if db == nil {
@@ -192,6 +214,10 @@ func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServer
 	config.ExtraEnv = map[string]string{}
 	for k, v := range db.launch.Env {
 		config.ExtraEnv[k] = v
+	}
+	// the other runners' uncharged driver host memory for the llama-server RAM guard (its own it measures itself)
+	if unch := s.dualbufHostUncharged(nil); unch > 0 {
+		config.ExtraEnv["LLAMA_ARG_RAM_UNCHARGED_MIB"] = strconv.FormatUint(unch>>20, 10)
 	}
 	config.ArgOverrides = db.launch.Args
 	config.KVCacheType = db.launch.KVType
@@ -257,6 +283,11 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	}
 	need = s.dualbuf.HostEstimate(key, need)
 	ram := multimodel.PlanRAM(db.cfg, systemInfo.TotalMemory, systemInfo.FreeMemory)
+	// the runners' driver host memory the cgroup does not see (Vulkan host buffers) is used all the same
+	if unch := s.dualbufHostUncharged(nil); unch > 0 && ram.Source != "system" && ram.Source != "none" {
+		ram.Used += unch
+		ram.Source += " + uncharged driver host memory"
+	}
 	if v := envconfig.Var("OLLAMA_DUALBUF_RAM_FREE_MIB"); v != "" {
 		// test aid (like the llama-server LLAMA_DUAL_BUFFER_FREE_MIB): the free RAM the plan assumes
 		if mib, err := strconv.ParseUint(v, 10, 64); err == nil {

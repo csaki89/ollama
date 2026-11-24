@@ -124,3 +124,16 @@ llama-server közvetlenül (csaki89/llama.cpp `multimodel` e795e5860), Intel Iri
 | ret / ret_copy | `-c 65536 --fit-target 3000` (nincs flex sáv), ~21 000 token | sparse: `release unit 8388608 (measured ...)`, `chunk 8388608`; KV 4096 → 36864 → 4096 cella, 1008 → 112 MiB, **a meghajtó szerint 4883 → 5694 MiB szabad (+811 / 896 MiB, 90,5%)**; másolásos: 602 → 112 MiB, +443 / 490 MiB (90,4%) | azonos |
 
 A darab mért visszaadási egysége előtt (64 KiB-os darab) a zsugorítás 196 MiB-ból csak 72 MiB-ot adott vissza: ezért került a darabválasztásba (`release unit`).
+
+# Vulkan, 2. lépés (laptop, 2026-11-24, csak célzott ellenőrzés)
+llama-server (csaki89/llama.cpp `multimodel`, f8133efac..bbd033c19), Iris Xe, qwen2.5-1.5B Q4_K_M, `vk-parity.sh` (egy ~11 000 tokenes, majd két rövid kérés); minden kimenet bájtra egyezik a `--auto-zones` nélküli referenciával.
+
+| ellenőrzés | beállítás | eredmény |
+|---|---|---|
+| szakaszonkénti sparse tartomány | `FIT=6000` | `section alignment 2097152`, `26/28 layers in place`, `grown/shrunk in place`; = ref |
+| átkötéses növelés kevés címtérnél | `GGML_VK_SPARSE_VA_MIB=460 GGML_VK_SPARSE_CHUNK_KIB=2048` | `do not fit the sparse address space (460 MiB)`, 56 `vk_sparse_rebind` (2 → 6 MiB), `28/28 grown in place`, nincs `grows by copy`; = ref |
+| túl kevés címtér | `GGML_VK_SPARSE_VA_MIB=300` (a 4096 cellás K/V sem fér el) | a nem férő szakaszok `no address range ... grows by copy`, a többi helyben; = ref |
+| másolásos tartalék | `GGML_VK_SPARSE=0` | `copy fallback: 1 shared K/V buffers freed first`; = ref |
+| könyvelés | `FIT=6000` | `zones: backend buffers outside the ggml buffers 312 -> 0 MiB` (a 8 MiB-os darab kerekítése a 4096 cellánál; 16384 cellánál 0) |
+| host-memória | `-ngl 14 --dual-buffer` | `host memory: 0 MiB ...` (UMA: minden típus eszközlokális; Windows: nincs cgroup) |
+| split-generálás | `-ngl 99 -ot "ffn_(up\|down\|gate)=CPU"` (58 split), `GGML_SCHED_TIMING=48` | CPU input copies 25,8 ms/gráf, Vulkan compute 3,9 + final wait 14,5 ms; `GGML_VK_ASYNC_READBACK=1`: 13,9 vs 13,9 tok/s (nincs különbség) |

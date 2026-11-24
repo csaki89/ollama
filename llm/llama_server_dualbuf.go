@@ -203,6 +203,7 @@ var (
 	parkNoRegex     = regexp.MustCompile(`park: .*no in-process park|park: --park requires`)
 	demotedRegex    = regexp.MustCompile(`park: demoted ([\d.]+) MiB`)
 	droppedRegex    = regexp.MustCompile(`park: the demoted \(repacked\) copies were dropped`)
+	hostMemRegex    = regexp.MustCompile(`host memory: [\d.]+ MiB in backend host buffers, ([\d.]+) MiB not charged to the cgroup`)
 )
 
 // parseParkLocked notes from the log whether the instance can park in process, and the RAM of its demoted copies.
@@ -221,6 +222,11 @@ func (s *llamaServerRunner) parseParkLocked(b []byte) {
 	if droppedRegex.Match(b) {
 		s.dualbufPark.demoted = 0
 	}
+	if all := hostMemRegex.FindAllSubmatch(b, -1); len(all) > 0 {
+		if mib, err := strconv.ParseFloat(string(all[len(all)-1][1]), 64); err == nil {
+			s.dualbufPark.hostUncharged = uint64(mib * 1024 * 1024)
+		}
+	}
 }
 
 // dualbufParkState is the in-process park state of a runner.
@@ -230,6 +236,16 @@ type dualbufParkState struct {
 	parked  bool   // POST /park succeeded, no /unpark since
 	vram    uint64 // the device memory before the park (to check the room for the unpark)
 	demoted uint64 // bytes of the repacked (demoted) copies the instance holds, from the last park/unpark/drop answer
+	// driver host memory the memory cgroup does not see (Vulkan host buffers): from the load log and the park answers
+	hostUncharged uint64
+}
+
+// HostUncharged is the RAM the runner holds in driver host allocations that the cgroup's usage does not show (the
+// llama-server measures it; 0 for ROCm/CUDA, whose pinned host memory the cgroup sees).
+func (s *llamaServerRunner) HostUncharged() uint64 {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.dualbufPark.hostUncharged
 }
 
 // DemotedBytes is the RAM of the repacked copies the parked model made for the CPU (0: none).
@@ -325,15 +341,19 @@ func (s *llamaServerRunner) parkAction(ctx context.Context, park bool) (time.Dur
 	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	var r struct {
-		Success bool   `json:"success"`
-		Parked  bool   `json:"parked"`
-		Demoted uint64 `json:"demoted_bytes"`
+		Success  bool    `json:"success"`
+		Parked   bool    `json:"parked"`
+		Demoted  uint64  `json:"demoted_bytes"`
+		HostUnch *uint64 `json:"host_uncharged_bytes"`
 	}
 	_ = json.Unmarshal(data, &r)
 	took := time.Since(start)
 	s.memoryMu.Lock()
 	s.dualbufPark.parked = r.Parked
 	s.dualbufPark.demoted = r.Demoted
+	if r.HostUnch != nil {
+		s.dualbufPark.hostUncharged = *r.HostUnch
+	}
 	if park && r.Parked {
 		s.dualbufPark.vram = vram
 	}
