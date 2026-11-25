@@ -14,6 +14,9 @@ type RAM struct {
 	Limit  uint64 // bytes, 0 = no limit known
 	Used   uint64 // bytes
 	Source string // "cgroup", "ram_limit", "system", "none"
+	// UsedFrom is where Used was read: "cgroup" (the driver host memory the cgroup does not see is missing from it) or
+	// "system" (the system's used memory has every allocation)
+	UsedFrom string
 }
 
 // Free is Limit - Used (0 when over).
@@ -102,7 +105,7 @@ func CgroupRAM() (RAM, bool) {
 				} else {
 					use = 0
 				}
-				r := RAM{Limit: lim, Used: use, Source: "cgroup"}
+				r := RAM{Limit: lim, Used: use, Source: "cgroup", UsedFrom: "cgroup"}
 				if !found || r.Free() < best.Free() {
 					best = r
 				}
@@ -125,7 +128,7 @@ func PlanRAM(cfg *Config, systemTotal, systemFree uint64) RAM {
 	if !ok {
 		r = RAM{Source: "none"}
 		if systemTotal > 0 {
-			r = RAM{Limit: systemTotal, Used: systemTotal - min(systemFree, systemTotal), Source: "system"}
+			r = RAM{Limit: systemTotal, Used: systemTotal - min(systemFree, systemTotal), Source: "system", UsedFrom: "system"}
 		}
 	}
 	if l := cfg.RAMLimitBytes(); l > 0 && (r.Limit == 0 || l < r.Limit) {

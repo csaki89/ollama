@@ -283,8 +283,9 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	}
 	need = s.dualbuf.HostEstimate(key, need)
 	ram := multimodel.PlanRAM(db.cfg, systemInfo.TotalMemory, systemInfo.FreeMemory)
-	// the runners' driver host memory the cgroup does not see (Vulkan host buffers) is used all the same
-	if unch := s.dualbufHostUncharged(nil); unch > 0 && ram.Source != "system" && ram.Source != "none" {
+	// the runners' driver host memory the cgroup does not see (Vulkan host buffers) is used all the same; a system reading has
+	// it already (also under a ram_limit: the limit replaces the cgroup's, not the usage)
+	if unch := s.dualbufHostUncharged(nil); unch > 0 && ram.UsedFrom == "cgroup" {
 		ram.Used += unch
 		ram.Source += " + uncharged driver host memory"
 	}

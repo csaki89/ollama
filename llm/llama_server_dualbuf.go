@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -225,6 +226,8 @@ func (s *llamaServerRunner) parseParkLocked(b []byte) {
 	if all := hostMemRegex.FindAllSubmatch(b, -1); len(all) > 0 {
 		if mib, err := strconv.ParseFloat(string(all[len(all)-1][1]), 64); err == nil {
 			s.dualbufPark.hostUncharged = uint64(mib * 1024 * 1024)
+			// the RAM plan adds this to the cgroup's usage (it is in the system's used memory already)
+			slog.Info("dualbuf: runner driver host memory not seen by the memory cgroup", "uncharged_mib", int64(mib))
 		}
 	}
 }

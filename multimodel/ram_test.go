@@ -35,7 +35,7 @@ func TestCgroupRAMv2(t *testing.T) {
 		t.Fatalf("v2: %+v %v", r, ok)
 	}
 	c := mustParse(t, "ram_limit: 50GiB\n")
-	if p := PlanRAM(c, 0, 0); p.Limit != 50<<30 || p.Source != "ram_limit" || p.Used != 20<<30 {
+	if p := PlanRAM(c, 0, 0); p.Limit != 50<<30 || p.Source != "ram_limit" || p.Used != 20<<30 || p.UsedFrom != "cgroup" {
 		t.Fatalf("ram_limit: %+v", p)
 	}
 	if p := PlanRAM(nil, 0, 0); p.Limit != 100<<30 || p.Source != "cgroup" {
@@ -60,7 +60,12 @@ func TestCgroupRAMv1AndNone(t *testing.T) {
 	if _, ok := CgroupRAM(); ok {
 		t.Fatal("no cgroup file")
 	}
-	if p := PlanRAM(nil, 1000, 300); p.Source != "system" || p.Free() != 300 {
+	if p := PlanRAM(nil, 1000, 300); p.Source != "system" || p.Free() != 300 || p.UsedFrom != "system" {
 		t.Fatalf("system: %+v", p)
+	}
+	// a ram_limit over the system reading: the usage is still the system's (it has the driver host memory already)
+	c := mustParse(t, "ram_limit: 800B\n")
+	if p := PlanRAM(c, 1000, 300); p.Source != "ram_limit" || p.Limit != 800 || p.UsedFrom != "system" {
+		t.Fatalf("ram_limit over system: %+v", p)
 	}
 }
