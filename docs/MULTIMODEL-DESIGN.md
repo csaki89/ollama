@@ -64,6 +64,7 @@ Mezőnként: környezeti változó < `defaults` < Modelfile `PARAMETER` < a mode
 
 ### 2.9 Vulkan
 - Image: a `rocm` cél a `llama-server-vulkan` stage-et is másolja, és a végső stage-be egy build-argumentummal (`EXTRA_APT_PACKAGES`, alap üres) a `mesa-vulkan-drivers` kerül (a fork workflow-ja adja át). Az upstream build ugyanaz marad.
+- A Vulkan-konténernek (és a közös konténernek) a render node mellett a `/dev/kfd` is kell: a Vulkan-backend AMD-kártyán egy üres KFD compute-sorral kéri a compute-teljesítményállapotot, amit a ROCm-folyamat automatikusan kap (DECISIONS 95–96); nélküle a modell fut, de a GPU split-generálás közben alacsony órajelen marad.
 - Dinamikus KV Vulkanon: ma másolással nő (backend-független út). Helyben növelés: a ggml-vulkan bővítése sparse-binding pufferrel (a fork llama.cpp `multimodel` branchén, a VMM-es utat követő API-val), ha az eszköz jelzi (`sparseBinding` + `sparseResidencyBuffer` + sparse sor); különben a másolásos út marad, egy naplósorral. (Ha a másolásos út sem megy, a fix KV a tartalék, a terv szerint.)
 
 ## 3. A horgok listája (rebase-felület)

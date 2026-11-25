@@ -14,6 +14,8 @@ services:
     ports:
       - "30071:11434"
     devices:
+      # /dev/kfd: the ROCm backend needs it, and the Vulkan backend uses it for the compute power state of an AMD card
+      # (an empty KFD compute queue while a model is loaded: without it the GPU stays at low clocks in a GPU/CPU split)
       - /dev/kfd:/dev/kfd
       # the ROCm card (today the RX 6700); for the X080 add/replace its render node
       - /dev/dri/renderD129:/dev/dri/renderD129
