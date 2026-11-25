@@ -85,7 +85,7 @@ Image: `ghcr.io/csaki89/ollama-dualbuf:multimodel` (a 2. kör első buildje: `0.
 ## 12. Vulkan–ROCm egyezés a diszkrét Vulkan-kártyán (RX 550) — llama.cpp `multimodel` e795e5860+ (20 perc)
 A llama-servert közvetlenül futtasd az image-ből (a Vulkan-backenddel), hogy az Ollama ütemezője ne szóljon bele:
 ```
-docker run --rm -it --device /dev/dri/renderD128 --group-add video --group-add render -v /mnt/nvme/ollama/models:/models:ro \
+docker run --rm -it --device /dev/kfd --device /dev/dri/renderD128 --group-add video --group-add render -v /mnt/nvme/ollama/models:/models:ro \
   --entrypoint /usr/lib/ollama/llama-server ghcr.io/csaki89/ollama-dualbuf:multimodel \
   -m /models/blobs/<egy kis modell GGUF-ja, pl. qwen3:0.6b> -c 16384 -np 1 --load-mode none --auto-zones --dual-buffer -fa on \
   --log-verbosity 4 --fit-target <a RX 550 szabad memóriájának kb. 85%-a MiB-ban> --port 8080
@@ -145,3 +145,12 @@ A 16. pont beállításaival (közvetlenül az image-ből indított llama-server
 5. **CPU-rész:** a CPU sor `compute calls` értéke gráfonként (1)-ben és (2)-ben. **Várt:** 5%-on belül egyezik. Ha a Vulkané érdemben nagyobb, az a GTT-leképezésből jön (OPEN-QUESTIONS 27).
 6. **Helyesség:** (2) és (3) kimenete bájtra azonos (mindkét modellen).
 7. **Memória az OS-ből:** `free -m` és `docker stats` a betöltés után (2)-ben és (1)-ben. Várt: a `used` mindkettőnél ~30 GB körül nő; a konténer cgroupja Vulkanon ~15 GB-tal kevesebbet mutat (a GTT), és ez a különbség egyezik a 2. pont X értékével.
+
+## 18. Vulkan 6. lépés: compute-teljesítményállapot a KFD-n át — llama.cpp `multimodel` 8010c7221+ (30 perc)
+A 16. pont parancsával (közvetlenül az image-ből indított llama-server, Vulkan-backend, `-v`), **`--device /dev/kfd`-del** (a 16. pont parancsában már benne van). Futások: (a) Vulkan, (b) Vulkan `-e GGML_VK_KFD_COMPUTE_PROFILE=0`, (c) Vulkan `/dev/kfd` nélkül; coder és gpt-oss, 256 token, `temperature 0`, kétszer. Más ROCm-folyamat ne fusson a kártyán (az Ollama-konténerek állnak).
+1. **Naplósor** (a): `ggml_vulkan: <RX 6700 neve>: compute power state active: an empty KFD compute queue on the device (gpu_id N, PCI 0000:xx:00.0, renderD12x, gfx_target_version 100301)`; a folyamat végén (vagy a modell kiürítésekor) `compute power state released (KFD compute queue destroyed)`. (b): `no compute power state: turned off (GGML_VK_KFD_COMPUTE_PROFILE=0); ...`. (c): `no compute power state: cannot open /dev/kfd: No such file or directory (not passed to the container, or no access); ...`. Ha (a)-ban `KFD CREATE_QUEUE failed: Invalid argument` jön, a `dmesg | grep -i kfd` kimenetét küldd vissza (OPEN-QUESTIONS 30).
+2. **Órajel generálás közben** (csak olvasás, a gazdán): `watch -n 0.5 cat /sys/class/drm/card<N>/device/pp_dpm_sclk` (a `*` jelzi az aktuálisat). **Várt:** (a) ~2670 MHz generálás közben; (b) és (c) 500–630 MHz, mint eddig. Betöltés után, kérés nélkül (a) a compute profil miatt magasabb szinten maradhat, mint (b) – ez a ROCm-folyamattal azonos viselkedés.
+3. **Sebesség** (`eval time`). **Várt (a):** coder ~38 tok/s, gpt-oss ~41 tok/s; (b), (c): ~25,5 és ~30, mint eddig.
+4. **Helyesség:** (a) kimenete bájtra azonos a (b)-ével és a korábbi Vulkan-futásokéval (és a ROCm-éval, a 94. döntés szerint).
+5. **Ollamán át** (a multimodel compose, `/dev/kfd`-vel): a Vulkanra tett modell betöltésekor a fenti `compute power state active` sor a llama-server naplójában; a modell kiürítése (keep_alive lejárta) után a `pp_dpm_sclk` visszaesik.
+6. **RX 550 (gfx803), ha Vulkan-eszközként fut:** vagy `compute power state active` (KFD-csomóponttal), vagy `no compute power state: the device has no KFD node ...` (PCIe atomics nélkül); mindkét esetben a modell működik.

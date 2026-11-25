@@ -206,3 +206,14 @@ A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögz
 ## RAM-könyvelés
 - A `ggml_backend_dev_host_memory` (Vulkan: a nem eszközlokális meghajtós foglalások összege) és a cgroup-mérés (DECISIONS 75) megmaradt. **Új betöltési naplósor** (közös kód, csak ha a backend ad ilyen memóriát; ROCm-on nincs sor): `load_tensors: RAM: driver host memory X MiB (backend host buffers), not seen by the memory cgroup: where a cgroup limit bounds the RAM, the RAM guards and the RAM plan add +X MiB to the cgroup's usage`, illetve `..., in the memory cgroup's usage already: +0 MiB` / `no memory cgroup: in the system's used memory already: +0 MiB`.
 - Ollama: a `host memory:` sorból kiolvasott értékről naplósor (`dualbuf: runner driver host memory not seen by the memory cgroup uncharged_mib=...`), és javítva a dupla számolás: ha a `ram_limit` egy rendszer-olvasást ír felül (nincs cgroup-korlát), a használat a rendszeré, abban a GTT már benne van; eddig ilyenkor is hozzáadódott. Most csak cgroup-ból olvasott használathoz adódik (`RAM.UsedFrom`).
+
+# 6. lépés: a GPU órajele (compute-teljesítményállapot)
+**Mérés (NAS, RX 6700, image 679b2aa):** azonos elrendezés mellett ROCm 38,4–39,4, Vulkan 25,5, csak CPU ~24,6 tok/s (coder); generálás közben a GPU órajele ROCm alatt 2670 MHz, Vulkan alatt 500–630 MHz. Egy mellette futó ROCm-folyamattal a Vulkan is 2670 MHz-en fut: 38,99 tok/s. A különbség tehát nem a Vulkan-útban volt (az 2–3 ms tokenenként), hanem a meghajtó energiaprofiljában: az amdgpu aktív KFD-sor mellett vált compute profilra.
+
+| | ROCm | Vulkan előtte | Vulkan most |
+|---|---|---|---|
+| compute profil | a HIP-runtime KFD-sorai váltják ki | nincs (a Vulkan-munka amdgpu CS) | egy üres KFD compute-sor, amíg a backend él (DECISIONS 95) |
+| feltétel | `/dev/kfd` | – | `/dev/kfd` a konténerben, AMD-eszköz KFD-csomóponttal |
+| KFD nélkül | nem fut | – | a régi viselkedés + figyelmeztető sor (DECISIONS 96) |
+
+Eltérés a ROCm-tól: a ROCm a sorait munkára használja, itt a sor üres, csak a compute-állapotot tartja; a sor pufferei rendszermemóriában vannak (néhány MiB, a context save area méretétől függően).
