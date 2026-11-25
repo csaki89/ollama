@@ -154,3 +154,55 @@ ROCm-oldal: a kódból (ggml-cuda és a scheduler) levezetve; Vulkan-oldal: a k�
 | ugyanez, új út | **31,8** | 15,9 ms | 0,6 µs, mind előreolvasásból |
 | qwen2.5-1.5B sűrű, FFN a CPU-n (a bemenet nem nézet: aszinkron visszaolvasás, 2. lépés) | 13,3–13,7 régi / 12,6–13,8 új | – | nincs szinkron olvasás |
 A laptopon a split lassabb a csak-CPU-snál (granite 45,6 tok/s), mert az Iris Xe-n a GPU-s figyelés rétegenként ~0,7 ms; ez a diszkrét kártyán nem áll fenn. Kimenet: granite split új = régi (389 karakter), qwen2.5 FFN-split új = régi (751 karakter), bájtra.
+
+# 5. lépés: a maradék MoE-többlet és a host-memória (Vulkan)
+
+**Hiba (NAS, RX 6700, az előreolvasásos build):** qwen3-coder:30b, auto zónák, dual-buffer: Vulkanon ~26 tok/s, ROCm-on ~35, csak CPU-n ~21,5 (tokenenként ~10 ms többlet); gpt-oss:20b Vulkanon ~30, ROCm-on ~40–44. Az OS szerint mindkét backend ~30 GB RAM-ot foglal; Vulkanon ebből ~15 GB (`Vulkan_Host`) a GPU-meghajtón át, GTT-ként, ezt a konténer cgroupja és az RSS nem látja.
+
+## A host-pufferek memóriatípusa (kódból; a laptopon a naplósorral mérve)
+Minden puffer, amelyet a CPU olvas, a `Vulkan_Host` puffertípusból (`ggml_vk_host_malloc`) vagy egy staging pufferből jön:
+
+| puffer | ki olvassa | kért típus (sorrendben) | RADV, diszkrét kártya (NAS) | laptop (Iris Xe, Windows, naplóból) |
+|---|---|---|---|---|
+| dual-buffer eredeti formájú példány, a nem repackelhető súlyok (pl. q6_K szakértők), flex host-példány, park-példány, a CPU compute és kimeneti puffere | CPU (generálás), GPU (op offload másolás) | HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED, utána HOST_VISIBLE\|HOST_COHERENT | GTT, HOST_CACHED típus (snoopolt, gyorsítótárazott); a meghajtó foglalja, a cgroup nem látja | 2-es típus: DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED (UMA) |
+| `sync_staging` (visszaolvasás), előreolvasás staging | CPU | ugyanaz | ugyanaz | ugyanaz |
+
+A típus tehát **gyorsítótárazott és koherens** mindkét eszközön; ROCm-on a `hipHostMalloc` folyamat-RAM-ot (névtelen leképezés, KFD userptr) rögzít, ez is gyorsítótárazott. A különbség a ROCm-tól nem a gyorsítótárazás, hanem (a) a lapok a GPU-meghajtó (TTM) leképezésén át jönnek, nem a folyamat névtelen memóriájából, ezért a cgroup és az RSS nem látja őket; (b) a TTM CPU-leképezése 4 KiB-os lapokkal megy (nem mérve, OPEN-QUESTIONS 27).
+
+**Új naplósor** (betöltéskor, felhasználásonként és típusonként egyszer): `ggml_vulkan: <eszköz>: Vulkan_Host buffers (dual-buffer and flex copies, CPU compute and output buffers): memory type N (<jelzők>), heap M (<méret> MiB, system memory|device-local): cached for the CPU`; ugyanígy a `staging buffer (readbacks)` és a `read-ahead staging buffer`. Gyorsítótár nélküli típusnál WARN-szint: `NOT cached for the CPU (write-combined or uncached: slow CPU reads)`.
+
+**Változás csak gyorsítótárazott típus hiányában:** akkor a `Vulkan_Host` közönséges folyamat-RAM (gyorsítótárazott a CPU-nak), a GPU a staging pufferen át kapja (nem rögzített host-mutatóként), naplósor: `Vulkan_Host buffers: plain process RAM (cached for the CPU); the GPU reads them through the staging buffer`. RADV-n, ANV-n, NVIDIA-n van gyorsítótárazott típus, ott semmi nem változik.
+
+**Eltérés a ROCm-tól, indokkal: nem importált folyamat-RAM.** A ROCm-megfelelő a folyamat névtelen memóriája lenne `VK_EXT_external_memory_host`-tal importálva (gyorsítótárazott, a cgroup látja). A RADV-n ez amdgpu userptr-BO: a kernel CS-útja minden beküldésnél újra lekéri a userptr-BO-k lapjait (`amdgpu_ttm_tt_get_user_pages` a beküldés BO-listájának minden userptr-elemére), a RADV pedig a puffereszköz-cím (BDA) bekapcsolásakor minden BO-t minden beküldés listájába tesz (globális BO-lista). 15 GB-nál ez tokenenként ~100 beküldés mindegyikében ~4 millió lap bejárása volna. (Kódból levezetve, nem mérve.) A meghajtós GTT marad, a könyvelést a RAM-oldal kezeli (lent).
+
+## A maradék többlet részei (laptop, granite-3.1-1b-a400m MoE, szakértők a CPU-n, 200 token, `GGML_SCHED_TIMING=32`)
+A Vulkan-sor most részletesebb: `per second: R graph recordings r us, P replays p us, S synchronizes s us (B submissions b us, W GPU waits w us), ... sync reads ..., ... sync writes ...; ms per second: recording .., replay .., submission .., GPU wait .., sync reads .., sync writes ..`. Tokenenként = ms/s ÷ tok/s.
+
+| rész (tokenenként, 25 GPU-split gráf, 50 váltás) | újrajátszás nélkül | újrajátszással | ROCm-megfelelő |
+|---|---|---|---|
+| gráf-rögzítés (CPU) | 25 × 76–79 µs = **~1,9 ms** | 25 × 23–25 µs = **~0,6 ms** (aláírás + beillesztés) | kernelindítások, a GPU már fut közben |
+| beküldés (`vkQueueSubmit`) | 25 × 22–26 µs = ~0,6 ms | ugyanannyi | ajtócsengő (felhasználói módú sor) |
+| GPU-rész (beküldéstől a kerítésig) | 25 × ~440 µs = ~11 ms (Iris Xe; a diszkrét kártyán sokkal kevesebb) | ugyanannyi | a stream szinkronja |
+| visszaolvasás | ~49, mind előreolvasásból, 0,5 µs | ugyanaz | `hipMemcpy` D2H |
+| szinkron bemenetírás | ~33 × 1,2–1,4 µs (UMA: közvetlen memcpy) | ugyanaz | `hipMemcpy` H2D |
+| CPU-rész (szakértők) | ~8,4 ms gráfonként | ugyanaz | ugyanaz |
+
+A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögzítés**: a HIP a kerneleket rögtön indítja és a GPU közben dolgozik, a Vulkan előbb a teljes parancspuffert rögzíti (a GPU addig áll). A beküldés és a GPU-várás a HIP-ben is megvan (más formában). A tok/s a laptopon alig mozdul (41,8–44,6 újrajátszással, 42,3–43,6 nélküle), mert itt a GPU-rész (Iris Xe, ~11 ms) és a közös memória-sávszélesség dominál; a diszkrét kártyán a rögzítés közvetlenül a tokenidőhöz adódik.
+
+## A javítás: a változatlan split-gráfok parancspufferének újrajátszása (`vk_replay`, csak ggml-vulkan)
+1. **Mikor:** kis gráf (a 2. lépés `defer_last_submit` feltétele: < 1 GFLOP, egy beküldés), alacsony késleltetésű mód, nincs perf logger és debug marker.
+2. **Aláírás:** csomópontonként a tenzor címe, op, típus, jelzők, használatszám, op-paraméterek, `ne`/`nb`, puffer, adatcím, nézetforrás és -eltolás, ugyanez a forrásokra. Ebből következik minden, amit a rögzítés kiad (fúziók, barrierek, pipeline-ok, push constantok, kötések).
+3. **Rögzítés:** ha egy gráf második alkalommal jön ugyanazzal az aláírással, a parancsai egy saját parancspufferbe kerülnek (saját pool, nem one-time-submit), saját leíró-készlet-tartománnyal (a többi gráf a `replay_desc_reserved` fölött indul). Az előtte rögzített másolások (CPU→GPU bemenet) a saját parancspufferükben maradnak, utána új parancspuffer jön (barrierrel) a visszaolvasásnak és az előreolvasásnak. Ha a rögzítés közben beküldés, pufferfelszabadítás vagy host-másolás történt, a bejegyzés nem marad meg (a parancsok egyszer lefutnak); két ilyen után a gráf a rendes úton marad.
+4. **Újrajátszás:** azonos aláírásnál a bejegyzés parancspuffere a beküldésbe kerül (a sorrend: bemásolás → gráf → visszaolvasás, barrierekkel), rögzítés nincs. Egy parancspuffer szinkron-ablakonként egyszer kerül be.
+5. **Érvénytelenítés:** bármely eszközpuffer felszabadítása (a kezelő egy új pufferé lehet) minden bejegyzést eldob (a parancspufferek a következő gráf-takarításkor szabadulnak); az aláírás minden más változást (KV-növekedés, új gráf) lefed.
+6. **Kapcsoló:** `GGML_VK_GRAPH_REPLAY=0` (tesztkapcsoló); a `GGML_VK_LOW_LATENCY_SYNC=0` ezt is kikapcsolja.
+
+**Eredmény (laptop):** granite split: rögzítés 82–87 ms/s → újrajátszás 26–28 ms/s; 10 futás újrajátszással, 6 nélküle és 4 kényszerített rögzítési hibával: futásonként (200, ill. 120 token) a kimenet mind bájtra azonos. qwen2.5-1.5B sűrű, FFN a CPU-n: rögzítés 46 ms/s → 10 ms/s, kimenet azonos (751 karakter); teljes GPU és auto zónák (nagy gráfok, nincs újrajátszás): azonos.
+
+## Ami nem változott, és miért
+- **Szinkron bemenetírások (OPEN-QUESTIONS 22):** a laptopon UMA miatt az eszközpuffer host-látható, az írás közvetlen memcpy (1,2 µs); a diszkrét kártya útja (staging + beküldés + várás) itt nem kényszeríthető ki (az UMA-ág a `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM` előtt dönt). A RX 6700-on ReBAR-ral ugyanez a közvetlen út megy, nélküle bemenetenként egy beküldés. A halasztott írás (a következő beküldés elé) minden olvasási és beküldési utat érint; diszkrét kártya nélkül a helyessége nem ellenőrizhető, ezért nincs benne. A NAS-sor (`sync writes N us`) megmutatja, kell-e (OPEN-QUESTIONS 26).
+- **A beküldés és a kerítés-várás váltásonként:** a Vulkan API része (egy `vkQueueSubmit` és egy kerítés); a HIP felhasználói módú sora és memóriajel-alapú szinkronja ennél olcsóbb. A NAS-mérés (`submissions`, `GPU waits` átlaga a ROCm `final wait`-jéhez képest) dönti el, mennyi marad (OPEN-QUESTIONS 25).
+
+## RAM-könyvelés
+- A `ggml_backend_dev_host_memory` (Vulkan: a nem eszközlokális meghajtós foglalások összege) és a cgroup-mérés (DECISIONS 75) megmaradt. **Új betöltési naplósor** (közös kód, csak ha a backend ad ilyen memóriát; ROCm-on nincs sor): `load_tensors: RAM: driver host memory X MiB (backend host buffers), not seen by the memory cgroup: where a cgroup limit bounds the RAM, the RAM guards and the RAM plan add +X MiB to the cgroup's usage`, illetve `..., in the memory cgroup's usage already: +0 MiB` / `no memory cgroup: in the system's used memory already: +0 MiB`.
+- Ollama: a `host memory:` sorból kiolvasott értékről naplósor (`dualbuf: runner driver host memory not seen by the memory cgroup uncharged_mib=...`), és javítva a dupla számolás: ha a `ram_limit` egy rendszer-olvasást ír felül (nincs cgroup-korlát), a használat a rendszeré, abban a GTT már benne van; eddig ilyenkor is hozzáadódott. Most csak cgroup-ból olvasott használathoz adódik (`RAM.UsedFrom`).
