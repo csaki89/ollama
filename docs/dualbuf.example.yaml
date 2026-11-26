@@ -1,27 +1,50 @@
-# Example /models/dualbuf.yaml (next to the models; OLLAMA_DUALBUF_CONFIG overrides the path).
-# Read at every model load; a change applies from the next load of a model, a running model keeps the
-# settings it was loaded with. A broken file: the last valid version is used, with an ERROR line in the log.
+# Example <MODELS_DIR>/dualbuf.yaml (next to the models, /models/dualbuf.yaml in the container;
+# OLLAMA_DUALBUF_CONFIG overrides the path).
 #
-# Precedence per field: env < defaults < Modelfile PARAMETER < the model's section < the request options.
-# Model keys: name:tag, or a pattern (path.Match: *, ?, [..]); the exact name wins, then the longest pattern.
+# Read once, when the server starts; a change takes effect after a restart. A broken file (YAML error, unknown
+# key, missing default section, a device list naming a device that is not in devices, a bad value) stops the
+# start with an error line naming the file and the reason. No file: the scheduler works without these rules.
+#
+# Section of a model: the exact name:tag wins; else the first matching pattern (path.Match: *, ?, [..]) in the
+# order of this file; else the default section.
+# Precedence per field: env < default < Modelfile PARAMETER < the model's section < the request options.
 
-defaults:
+# Required: the settings of the models without their own section, and the base of the fields a model section
+# leaves out.
+default:
+  devices: [cpu]         # ordered device list: the first free device wins, for every request
   dual_buffer: true      # LLAMA_ARG_DUAL_BUFFER
   dynamic_kv: true       # LLAMA_ARG_AUTO_ZONES (the KV grows with the use)
   kv_type: f16           # OLLAMA_KV_CACHE_TYPE
-  keep_alive: 30m        # OLLAMA_KEEP_ALIVE; -1 = forever (never fully unloaded for RAM)
+  keep_alive: 30m        # OLLAMA_KEEP_ALIVE
 
+# Every device a model list names: the GPUs and the CPU. A device that is not available at run time (not in
+# the machine, not visible in the container, the driver does not see it) is skipped with a warning; the
+# models use the other devices of their list.
 devices:
-  # match: a PCI address (two cards of the same type need it) or a part of the name; backend: rocm, vulkan, cuda
-  gpu0:  { backend: rocm,   match: "0000:aa:00.0", max_running: 1 }   # your values: the "dualbuf devices" log line
-  gpu1: { backend: vulkan, match: "Test GPU B",       max_running: 1 }
-  cpu:   { max_running: 1 }
+  # a GPU: backend rocm, vulkan, cuda or metal; match: its PCI address (needed for two cards of the same
+  # type) or a part of its name, as the "dualbuf devices" / "inference compute" log lines show it
+  gpu0:
+    backend: rocm
+    match: "<PCI_ADDR>"      # e.g. 0000:aa:00.0
+    max_running: 1           # models running on it at once
+    # reserve_mib: 1024      # VRAM kept free on this GPU (fit, auto zones); default: LLAMA_ARG_FIT_TARGET
+  gpu1:
+    backend: vulkan
+    match: "<GPU_NAME>"      # a part of the device name
+    max_running: 1
+  # the CPU: the entry named cpu, backend cpu, no match
+  cpu:
+    backend: cpu
+    max_running: 1
+    # reserve_mib: 4096      # reserve of the whole RAM budget (host buffers of the GPU models, parked models);
+                             # default: max(1 GiB, 5% of the budget)
 
 models:
   qwen3-coder:30b:
-    devices: [gpu0, cpu]   # the first free device wins, for every request
-    on_busy: wait          # wait for the first device up to wait_timeout, then go on
-    wait_timeout: 120s
+    devices: [gpu0, cpu]
+    on_busy: wait          # wait for the first device up to wait_timeout, then go on down the list
+    wait_timeout: 120s     # -1: wait for the first device without a limit
     zones: auto            # auto | off (off: dynamic KV without a flex band, --no-zones-flex); the band size is computed
     max_context: 131072    # num_ctx
   qwen3-vl:8b:
@@ -32,14 +55,16 @@ models:
     devices: [gpu1, cpu]
     dual_buffer: false
     max_context: 4096
-    keep_alive: -1
+    keep_alive: -1         # never taken off the stack (never loaded again from nothing); it may still be moved
+                           # (parked, put on another device of its list)
     # also: parallel, threads, n_batch, n_ubatch, flash_attention (on|off|auto), kv_save (KV to the disk
     # before a full unload, restored at the next load)
 
 swap:
   enabled: true            # an idle model on the first device is parked to make room
-  keep_in_ram: pinned      # pinned: in-process park (--park: pinned GPU-format copies, the swap is a DMA); none: process-level swap
+  keep_in_ram: pinned      # how a park keeps the model: pinned = in process (pinned GPU-format copies, the swap is a DMA);
+                           # none = the process stops (the next load reads the file again)
   save_kv: true            # the parked model's KV is kept in RAM (tmpfs) and restored
   # kv_dir: /models/dualbuf-kv   # where kv_save writes (default <models>/dualbuf-kv)
 
-# ram_limit: 90GiB         # plan with less than the container limit
+# ram_limit: <RAM_LIMIT>   # plan with less than the container limit, e.g. 32GiB
