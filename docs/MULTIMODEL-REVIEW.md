@@ -2,6 +2,8 @@
 
 Alap: `MULTIMODEL-DESIGN.md` és a DECISIONS 50–69. pontja; a kód a `multimodel` branchen. Ez a felmérés kódmódosítás nélkül készült: minden sor azt írja le, mi van a kódban és mi nincs.
 
+**Frissítés (a config rendbetétele, DECISIONS 100–105):** a config-sorok (beolvasás, `devices`, `default`, illesztés, precedencia, `reserve_mib`) azóta a megbeszélt felépítést követik: egyszeri beolvasás induláskor, hibás confignál a szerver nem indul, kötelező `default`, a CPU is felvett eszköz, a minták a fájl sorrendjében, `reserve_mib` GPU-n (fit-cél) és CPU-n (RAM-tartalék), `wait_timeout: -1`. Az alábbi táblázat a felmérés idejét mutatja; az ütemező, a park/unpark és az LRU sorai változatlanul érvényesek.
+
 Jelölések:
 - **kész:** a megállapodás szerint működik;
 - **eltér:** van kód, de valamiben eltér a megállapodástól;
