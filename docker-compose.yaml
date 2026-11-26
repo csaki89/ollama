@@ -1,6 +1,9 @@
-# TrueNAS SCALE: Apps -> Discover Apps -> Install via YAML (custom app).
+# Docker compose app (e.g. a NAS custom app installed from YAML).
 # Test instance of the dual-buffer Ollama, next to the running ollama/ollama:0.40.2-rocm
-# (that one stays on port 30068). Test API: http://<nas>:30069
+# (on its own port). Test API: http://<host>:$OLLAMA_PORT
+#
+# Set in an .env file next to this one (or in the environment): OLLAMA_PORT, MODELS_DIR, RENDER_NODE (the GPU's render
+# node: `ls -l /dev/dri/by-path`), CPU_LIMIT, MEMORY_LIMIT.
 #
 # Before the first start:
 #  1. The image is the moving tag of the dual-buffer-0.40.16 branch: every "dualbuf-image" build of that branch overwrites it
@@ -22,22 +25,22 @@ services:
     container_name: ollama-dualbuf
     restart: unless-stopped
     ports:
-      - "30069:11434"
+      - "${OLLAMA_PORT}:11434"
     devices:
       - /dev/kfd:/dev/kfd
-      - /dev/dri/renderD129:/dev/dri/renderD129
+      - /dev/dri/${RENDER_NODE}:/dev/dri/${RENDER_NODE}
     group_add:
       - video
       - render
     ulimits:
       memlock: -1
     # cgroup limit: the dual-buffer RAM guard reads it (free RAM = memory limit - usage), so the
-    # extra host copy is sized against these 100 GB, not against the NAS total
+    # extra host copy is sized against this limit, not against the host total
     deploy:
       resources:
         limits:
-          cpus: "60"
-          memory: 100G
+          cpus: "${CPU_LIMIT}"
+          memory: ${MEMORY_LIMIT}
     healthcheck:
       test: ["CMD", "/bin/ollama", "list"]
       interval: 30s
@@ -50,7 +53,7 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
-      # RX 6700 is gfx1031, the image only contains gfx1030 code
+      # a gfx103x card other than gfx1030 needs this: the image only contains gfx1030 code
       HSA_OVERRIDE_GFX_VERSION: "10.3.0"
       # the llama.cpp dual-buffer feature (repacked CPU weights also kept in ROCm_Host for prompt op offload)
       LLAMA_ARG_DUAL_BUFFER: "1"
@@ -78,4 +81,4 @@ services:
       OLLAMA_HOST: 0.0.0.0:11434
     volumes:
       # read-write on purpose: Modelfile variants (use_mmap false) write a manifest here
-      - /mnt/nvme/ollama/models:/models
+      - ${MODELS_DIR}:/models

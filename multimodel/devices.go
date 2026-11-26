@@ -11,7 +11,7 @@ import (
 
 // Matched is a config device found among the discovered devices.
 type Matched struct {
-	Name string        // the config name (x080, rx550)
+	Name string        // the config name (gpu0, gpu1)
 	Info ml.DeviceInfo // the discovered device
 }
 
@@ -24,10 +24,10 @@ type DeviceMap struct {
 
 var pciRe = regexp.MustCompile(`^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$`)
 
-// normPCI makes "03:00.0" and "0000:03:00.0" equal.
+// normPCI makes "aa:00.0" and "0000:aa:00.0" equal.
 func normPCI(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	if len(s) == len("03:00.0") {
+	if len(s) == len("aa:00.0") {
 		s = "0000:" + s
 	}
 	return s

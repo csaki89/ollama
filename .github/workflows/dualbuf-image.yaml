@@ -28,7 +28,7 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ollama-dualbuf
   GPU_ARCH: gfx1030
-  # only the CPU variant the target (Xeon E5 v4, AVX2) loads: ggml scores haswell highest there (no AVX512 / AVX_VNNI);
+  # only the CPU variant the target (Broadwell, AVX2) loads: ggml scores haswell highest there (no AVX512 / AVX_VNNI);
   # GGML_CPU_VARIANTS is patch 004 (ggml builds every variant as a dependency of ggml otherwise)
   CPU_VARIANTS: haswell
 

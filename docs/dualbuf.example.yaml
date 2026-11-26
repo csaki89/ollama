@@ -13,23 +13,23 @@ defaults:
 
 devices:
   # match: a PCI address (two cards of the same type need it) or a part of the name; backend: rocm, vulkan, cuda
-  x080:  { backend: rocm,   match: "0000:03:00.0", max_running: 1 }
-  rx550: { backend: vulkan, match: "RX 550",       max_running: 1 }
+  gpu0:  { backend: rocm,   match: "0000:aa:00.0", max_running: 1 }   # your values: the "dualbuf devices" log line
+  gpu1: { backend: vulkan, match: "Test GPU B",       max_running: 1 }
   cpu:   { max_running: 1 }
 
 models:
   qwen3-coder:30b:
-    devices: [x080, cpu]   # the first free device wins, for every request
+    devices: [gpu0, cpu]   # the first free device wins, for every request
     on_busy: wait          # wait for the first device up to wait_timeout, then go on
     wait_timeout: 120s
     zones: auto            # auto | off (off: dynamic KV without a flex band, --no-zones-flex); the band size is computed
     max_context: 131072    # num_ctx
   qwen3-vl:8b:
-    devices: [x080, cpu]
+    devices: [gpu0, cpu]
     on_busy: next          # go on at once (wait_timeout ignored)
     max_context: 16384
   qwen3-embedding:*:
-    devices: [rx550, cpu]
+    devices: [gpu1, cpu]
     dual_buffer: false
     max_context: 4096
     keep_alive: -1

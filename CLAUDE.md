@@ -19,12 +19,12 @@ Ez egy privát fork, nem az ollama/ollama-ba szánt hozzájárulás.
 - A `CONTRIBUTING.md` az upstream PR/issue folyamatot írja le (előzetes issue nem triviális változáshoz, `<package>: <leírás>` commit cím, tesztek, kevés új függőség). Ez itt nem kötelező, mert nem nyitunk PR-t. A commit üzenetre a fenti rövid forma + `Assisted-by: Claude` érvényes. A "tesztet is írj, viselkedést tesztelj" elv jó gyakorlat marad.
 
 ## Cél
-Saját Ollama ROCm image, amelynek llama-server komponense a llama.cpp dual-buffer módosítását tartalmazza. A TrueNAS-on egy compose fájllal, egyéni appként fut.
+Saját Ollama ROCm image, amelynek llama-server komponense a llama.cpp dual-buffer módosítását tartalmazza. A NAS-on egy compose fájllal, egyéni appként fut.
 
 A dual-buffer a csaki89/llama.cpp repó `dual-buffer` branchében kész és tesztelt. Forrásként a `../llama-dualbuf` mappa szolgál (olvasható): `CLAUDE.md`, `docs/DESIGN.md`, `docs/DECISIONS.md`, `docs/SUMMARY.md`, `docs/test-results.md`. A cél: a CPU-n maradó súlyokat repackelt (generálás) és eredeti formájú host-példányban (op offload, prompt) is tartani.
 
 ## Környezet (NAS)
-- Jelenleg: `ollama/ollama:0.40.2-rocm`, AMD RX 6700 (gfx1031), `HSA_OVERRIDE_GFX_VERSION=10.3.0`, ezért a GPU-kódot gfx1030-ra kell fordítani.
+- Jelenleg: `ollama/ollama:0.40.2-rocm`, egy RDNA2-es AMD GPU (gfx103x), `HSA_OVERRIDE_GFX_VERSION=10.3.0`, ezért a GPU-kódot gfx1030-ra kell fordítani.
 - Az Ollama 0.40.2 a modelleket beépített llama-server folyamattal futtatja, és a `LLAMA_ARG_` környezeti változókat átadja neki.
 - Igazolt: a `use_mmap: false` opció (kérésben vagy Modelfile-ban) split módban is `--load-mode none`-nal indítja a llama-servert.
 

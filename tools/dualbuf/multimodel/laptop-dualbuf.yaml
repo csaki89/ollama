@@ -3,7 +3,7 @@ defaults:
   dynamic_kv: true
   keep_alive: 10m
 devices:
-  igpu: { backend: vulkan, match: "Iris", max_running: 1 }
+  igpu: { backend: vulkan, match: "Intel", max_running: 1 }
   cpu:  { max_running: 1 }
 models:
   qwen25:1.5b:

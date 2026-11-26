@@ -19,8 +19,8 @@ defaults:
   keep_alive: 30m
 
 devices:
-  x080:  { backend: rocm,   match: "0000:03:00.0", max_running: 1 }
-  rx550: { backend: vulkan, match: "RX 550", max_running: 1 }
+  gpu0:  { backend: rocm,   match: "0000:aa:00.0", max_running: 1 }
+  gpu1: { backend: vulkan, match: "Test GPU B", max_running: 1 }
   cpu:   { max_running: 1 }
 
 swap:
@@ -30,17 +30,17 @@ swap:
 
 models:
   qwen3-coder:30b:
-    devices: [x080, cpu]
+    devices: [gpu0, cpu]
     on_busy: wait
     wait_timeout: 120s
     zones: auto
     max_context: 131072
   qwen3-vl:8b:
-    devices: [x080, cpu]
+    devices: [gpu0, cpu]
     on_busy: next
     max_context: 16384
   qwen3-embedding:*:
-    devices: [rx550, cpu]
+    devices: [gpu1, cpu]
     dual_buffer: false
     max_context: 4096
     keep_alive: -1
@@ -57,8 +57,8 @@ func mustParse(t *testing.T, s string) *Config {
 
 func TestParseExample(t *testing.T) {
 	c := mustParse(t, exampleConfig)
-	if c.MaxRunning("x080") != 1 || c.MaxRunning("cpu") != 1 || c.MaxRunning("nope") != 0 {
-		t.Fatalf("max_running: %d %d", c.MaxRunning("x080"), c.MaxRunning("cpu"))
+	if c.MaxRunning("gpu0") != 1 || c.MaxRunning("cpu") != 1 || c.MaxRunning("nope") != 0 {
+		t.Fatalf("max_running: %d %d", c.MaxRunning("gpu0"), c.MaxRunning("cpu"))
 	}
 	if !c.SwapEnabled() || !c.SwapSaveKV() || c.Swap.KeepInRAM != KeepInRAMPinned {
 		t.Fatalf("swap: %+v", c.Swap)
@@ -181,11 +181,11 @@ func TestResolvePrecedence(t *testing.T) {
 	if e.Section != "qwen3-embedding:*" || e.DualBuffer.V || !e.KeepAlive.V.Forever || e.KeepAlive.V.String() != "-1" {
 		t.Fatalf("embedding: %+v %+v %+v", e.Section, e.DualBuffer, e.KeepAlive)
 	}
-	if got := strings.Join(e.Devices.V, ","); got != "rx550,cpu" {
+	if got := strings.Join(e.Devices.V, ","); got != "gpu1,cpu" {
 		t.Fatalf("devices: %s", got)
 	}
 	line := e.String()
-	for _, want := range []string{"devices=[rx550,cpu](model:qwen3-embedding:*)", "dual_buffer=false(model:qwen3-embedding:*)", "keep_alive=-1(model:qwen3-embedding:*)", "parallel=2(env)", "kv_type=f16(defaults)", "on_busy=wait(builtin)", "wait_timeout=1m0s(builtin)"} {
+	for _, want := range []string{"devices=[gpu1,cpu](model:qwen3-embedding:*)", "dual_buffer=false(model:qwen3-embedding:*)", "keep_alive=-1(model:qwen3-embedding:*)", "parallel=2(env)", "kv_type=f16(defaults)", "on_busy=wait(builtin)", "wait_timeout=1m0s(builtin)"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line misses %q: %s", want, line)
 		}
@@ -255,32 +255,32 @@ func TestLaunch(t *testing.T) {
 func TestMatchDevices(t *testing.T) {
 	c := mustParse(t, exampleConfig)
 	found := []ml.DeviceInfo{
-		{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", Description: "AMD Radeon RX 9070", PCIID: "0000:03:00.0"},
-		{DeviceID: ml.DeviceID{ID: "0", Library: "Vulkan"}, Name: "Vulkan0", Description: "AMD Radeon RX 550 / 550 Series (RADV POLARIS12)", PCIID: "0000:86:00.0"},
+		{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", Description: "AMD Radeon Test GPU A", PCIID: "0000:aa:00.0"},
+		{DeviceID: ml.DeviceID{ID: "0", Library: "Vulkan"}, Name: "Vulkan0", Description: "AMD Radeon Test GPU B (RADV)", PCIID: "0000:bb:00.0"},
 	}
 	dm := c.MatchDevices(found)
-	if dm.ByName["x080"].Info.Name != "ROCm0" || dm.ByName["rx550"].Info.Name != "Vulkan0" || !dm.Present("cpu") {
+	if dm.ByName["gpu0"].Info.Name != "ROCm0" || dm.ByName["gpu1"].Info.Name != "Vulkan0" || !dm.Present("cpu") {
 		t.Fatalf("match: %s", dm)
 	}
 	if len(dm.Missing) != 0 || len(dm.Errors) != 0 {
 		t.Fatalf("missing/errors: %v %v", dm.Missing, dm.Errors)
 	}
 
-	// the backend must agree: the RX 550 seen only by ROCm does not match a vulkan entry
+	// the backend must agree: the Vulkan card seen only by ROCm does not match a vulkan entry
 	dm = c.MatchDevices(found[:1])
-	if len(dm.Missing) != 1 || dm.Missing[0] != "rx550" {
+	if len(dm.Missing) != 1 || dm.Missing[0] != "gpu1" {
 		t.Fatalf("missing: %v", dm.Missing)
 	}
 
 	// two cards of one type: a name match is ambiguous, the PCI address is not
-	two := mustParse(t, "devices:\n  a: { backend: rocm, match: \"RX 9070\" }\n  b: { backend: rocm, match: \"04:00.0\" }\n")
-	found2 := append(found[:1:1], ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, Name: "ROCm1", Description: "AMD Radeon RX 9070", PCIID: "0000:04:00.0"})
+	two := mustParse(t, "devices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"cc:00.0\" }\n")
+	found2 := append(found[:1:1], ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, Name: "ROCm1", Description: "AMD Radeon Test GPU A", PCIID: "0000:cc:00.0"})
 	dm = two.MatchDevices(found2)
 	if len(dm.Errors) != 1 || dm.Present("a") || dm.ByName["b"].Info.Name != "ROCm1" {
 		t.Fatalf("two cards: %s %v", dm, dm.Errors)
 	}
 	// two entries for one card
-	dup := mustParse(t, "devices:\n  a: { backend: rocm, match: \"RX 9070\" }\n  b: { backend: rocm, match: \"03:00.0\" }\n")
+	dup := mustParse(t, "devices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"aa:00.0\" }\n")
 	dm = dup.MatchDevices(found[:1])
 	if len(dm.Errors) != 1 || dm.Present("a") || dm.Present("b") {
 		t.Fatalf("dup: %s %v", dm, dm.Errors)

@@ -11,6 +11,8 @@ set "PATH=%VSCMAKE%\CMake\bin;%VSCMAKE%\Ninja;%PATH%"
 if "%VULKAN_SDK%"=="" set "VULKAN_SDK=C:\VulkanSDK\1.4.363.1"
 set CMAKE_GENERATOR=Ninja
 set "ROOT=%CD%"
+rem a short Vulkan build dir (BUILD_DIR, e.g. a folder in the drive root)
+if "%BUILD_DIR%"=="" set "BUILD_DIR=%SystemDrive%\vkb"
 
 if /i "%1"=="vulkan" goto vulkan
 cmake -S llama/server --preset cpu_windows -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON || exit /b 1
@@ -19,7 +21,7 @@ cmake --install build/llama-server-cpu --component llama-server || exit /b 1
 
 :vulkan
 rem reuse the patched llama.cpp source of the CPU build (the compat/dual-buffer patches are applied idempotently)
-cmake -S llama/server --preset vulkan -B C:/b/vk -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP="%ROOT%\build\llama-server-cpu\_deps\llama_cpp-src" || exit /b 1
-cmake --build C:/b/vk --target ggml-vulkan || exit /b 1
-cmake --install C:/b/vk --component llama-server || exit /b 1
+cmake -S llama/server --preset vulkan -B %BUILD_DIR% -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP="%ROOT%\build\llama-server-cpu\_deps\llama_cpp-src" || exit /b 1
+cmake --build %BUILD_DIR% --target ggml-vulkan || exit /b 1
+cmake --install %BUILD_DIR% --component llama-server || exit /b 1
 echo BUILD-OK

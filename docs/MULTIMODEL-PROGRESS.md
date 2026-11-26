@@ -8,7 +8,7 @@
 - **Vulkan dinamikus KV helyben növeléssel** (sparse binding, a VMM-interfész Vulkan-megvalósítása); tartalék csak hiányzó képességnél, a naplósor megnevezi.
 - **`zones` és `dynamic_kv` két kapcsoló** (`--no-zones-flex` / `LLAMA_ARG_ZONES_FLEX`).
 
-**Bizonyítottan működik** (laptop, Iris Xe; részletek: `test-results.md` „2. kör”):
+**Bizonyítottan működik** (laptop, integrált Intel GPU; részletek: `test-results.md` „2. kör”):
 - llama-server: park/unpark 3× azonos kimenettel, a KV megmarad (`prompt_n=1`); flex sávval is; demote és drop; park 70–162 ms, unpark 0,19–0,53 s / 935 MiB.
 - Ollamán át: 8 csere, mind folyamaton belül (park 0,23–0,54 s, unpark 0,29–0,89 s), 2 llama-server folyamat összesen, azonos válaszok, a KV megmarad; a pinned példányok elutasításakor a folyamatszintű tartalék naplósorral; valódi RAM-hiánynál a parkolt modell LRU-kirakása; CPU-s kérés a parkolt példányon demote-tal.
 - Vulkan sparse KV: 28/28 réteg helyben nő (4096 → 24576) és zsugorodik, a felszabadított memória a meghajtó szerint visszajön (+490/560 MiB); a kimenet azonos a másolásos úttal.
@@ -16,7 +16,7 @@
 
 **Nyitva** (`OPEN-QUESTIONS.md`): a parkoló folyamat VRAM-maradéka diszkrét GPU-n (az iGPU-n nem mérhető tisztán); a rekurrens állapot (hibrid modellek) nem parkol; a projektor-park laptopon nem tesztelt (nincs vision modell); a 10 GB-os csereidő csak a NAS-on mérhető.
 
-**Reggeli NAS-sorrend** (`NAS-TESTS.md`): 0. előkészítés → 1. config nélkül azonos → 2. config/eszközök → **10. folyamaton belüli csere az X080-on** (a fő mérés: unpark-idő 10 GB-nál, cél ~1 s; VRAM-maradék sysfs-szel; összevetés `keep_in_ram: none`-nal és a hideg betöltéssel; parkolt modell a CPU-n; projektor) → **11. Vulkan sparse KV a RX 550-en** → 3. → 4. → 8. → 7. → 5. → 9.
+**Reggeli NAS-sorrend** (`NAS-TESTS.md`): 0. előkészítés → 1. config nélkül azonos → 2. config/eszközök → **10. folyamaton belüli csere a gpu0-n** (a fő mérés: unpark-idő 10 GB-nál, cél ~1 s; VRAM-maradék sysfs-szel; összevetés `keep_in_ram: none`-nal és a hideg betöltéssel; parkolt modell a CPU-n; projektor) → **11. Vulkan sparse KV a Polaris-kártyán** → 3. → 4. → 8. → 7. → 5. → 9.
 
 ## Összefoglaló, 1. kör
 
@@ -30,7 +30,7 @@
 - RAM-keret a cgroupból (vagy `ram_limit`), LRU-kirakás (CPU-tartalék → parkoló → tétlen), `keep_alive: -1` soha.
 - KV-mentés az NVMe-re teljes kirakás előtt (`kv_save`), visszatöltés a következő betöltéskor (azonos digest és KV-típus).
 - Az ütemező a fork mért memóriájával számol: a VRAM a `zones_state` sorokból futás közben is frissül.
-- Image: `rocm-vulkan` cél (ROCm + Vulkan backend + RADV), `docker-compose.multimodel.yaml` (port 30071, `shm_size`), CI (`multimodel-ci`: vet + `-race` tesztek Linuxon, Windowsos `ollama.exe`).
+- Image: `rocm-vulkan` cél (ROCm + Vulkan backend + RADV), `docker-compose.multimodel.yaml` (port <PORT_MULTIMODEL>, `shm_size`), CI (`multimodel-ci`: vet + `-race` tesztek Linuxon, Windowsos `ollama.exe`).
 
 **Bizonyítottan működik** (laptop, az Ollama-binárissal, Vulkan iGPU + CPU, `test-results.md` „Többmodelles munka”): config nélkül a gyári indítósor; a config megjelenése a futó modellt nem érinti; erősorrend és naplósor; eszközazonosítás; `on_busy: next` (0 s, CPU-példány), `on_busy: wait` lejár → tovább / időben felszabadul → `waited`; sor és érkezési sorrend; KV az NVMe-re és vissza (a visszatöltés után a llama-server 1 tokent számol, kimenet azonos); csere oda-vissza a KV-val (1 token, kimenet azonos, csere 3–4,4 s a laptopon); RAM-hiánynál a CPU-tartalék, majd a parkoló kiesik, a `keep_alive: -1` marad; dinamikus KV Vulkanon (másolással, 4096 → 8192). A slot-visszatöltés eltérő kontextusba (nagyobb, kisebb, dinamikus KV) és eltérő KV-típusnál (elutasítva) külön llama-server teszttel. Egységtesztek: `multimodel` (config, erősorrend, eszközök, koordinátor, RAM, kirakási sorrend, KV-fájlok), `llm` (kapcsoló-felülírás, `zones_state`), `server` (no-op config nélkül, elhelyezés és sor, opció-erősorrend, áldozatválasztás); a CI-ben `-race`-szel zöld. Az image lefordult a Vulkan-backenddel és a RADV-vel, a füstteszt zöld (`ghcr.io/csaki89/ollama-dualbuf:0.40.16-dualbuf-986377d`, mozgó címke: `:multimodel`).
 
@@ -38,9 +38,9 @@
 1. A csere folyamatszintű; a kért ~1 s / 10 GB-hoz a folyamaton belüli park kell (pinned GPU-formájú példány minden GPU-s súlyhoz, a pufferek elengedése/visszaépítése a llama.cpp-ben). A NAS-mérés (NAS-TESTS 6.) dönti el, kell-e.
 2. Vulkan helyben növelés (sparse binding) nincs; a dinamikus KV Vulkanon másolással megy.
 3. `zones: off` a dinamikus KV-t is kikapcsolja; a CPU-tartalék keep_alive-ja a modellé.
-4. ROCm, X080, két GPU, a fájlzárolás és a valódi modellek: csak a NAS-on.
+4. ROCm, gpu0, két GPU, a fájlzárolás és a valódi modellek: csak a NAS-on.
 
-**Reggeli NAS-sorrend** (`NAS-TESTS.md`): 0. előkészítés (render node-ok a compose-ban, `inference compute` sorok, RADV) → 1. config nélkül azonos-e a 30069-cel → 2. config, naplósor, eszközök → 3. RX 550 (embedding, Vulkan) → 6. **csere-mérés** (a legfontosabb szám: `load_duration` visszacserénél, `keep_in_ram: pinned` és `none`) → 4. futási korlát/on_busy → 8. KV az NVMe-re → 7. RAM-keret → 5. → 9. (ha van második X080).
+**Reggeli NAS-sorrend** (`NAS-TESTS.md`): 0. előkészítés (render node-ok a compose-ban, `inference compute` sorok, RADV) → 1. config nélkül azonos-e a <PORT_DUALBUF>-cel → 2. config, naplósor, eszközök → 3. Polaris-kártya (embedding, Vulkan) → 6. **csere-mérés** (a legfontosabb szám: `load_duration` visszacserénél, `keep_in_ram: pinned` és `none`) → 4. futási korlát/on_busy → 8. KV az NVMe-re → 7. RAM-keret → 5. → 9. (ha van második ugyanilyen kártya).
 
 ## Fázisok
 

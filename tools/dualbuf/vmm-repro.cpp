@@ -7,7 +7,7 @@
 //   vmm-repro d   old layout with the reservation and chunk alignment max(recommended, 2 MiB)
 // Every case then writes a pattern with a kernel and checks it with a second kernel.
 // Options: vmm-repro <case> [sections=96] [section_mib=32] [chunk_mib=4]
-// Build: hipcc -O2 --offload-arch=gfx1030 -o vmm-repro vmm-repro.cpp  (run with HSA_OVERRIDE_GFX_VERSION=10.3.0 on gfx1031)
+// Build: hipcc -O2 --offload-arch=gfx1030 -o vmm-repro vmm-repro.cpp  (run with HSA_OVERRIDE_GFX_VERSION=10.3.0 on gfx103x)
 
 #include <hip/hip_runtime.h>
 

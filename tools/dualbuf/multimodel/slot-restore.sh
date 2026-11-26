@@ -1,6 +1,6 @@
 #!/bin/bash
 # slot save in one llama-server, restore in a new one with another -c (and auto zones)
-BIN=${BIN:-/c/b/c16/bin/llama-server.exe}
+BIN=${BIN:?set BIN to the llama-server binary}
 M=${MODEL:?set MODEL to a GGUF (qwen3:0.6b)}
 D=$(pwd)/slots; mkdir -p $D
 P=18123

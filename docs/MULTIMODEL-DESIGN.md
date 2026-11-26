@@ -34,7 +34,7 @@ Mezőnként: környezeti változó < `defaults` < Modelfile `PARAMETER` < a mode
 
 ### 2.3 Eszközök (`multimodel/devices.go`)
 - `devices.<név>: {backend, match, max_running}`; a `cpu` beépített név (backend nélkül).
-- `match`: PCI-cím (pontos, kis-nagybetű független, a `0000:` tartomány elhagyható), különben a leírás (vagy a backend-név) részsztringje. A `backend` (`rocm`, `vulkan`, `cuda`) a felderített `Library`-vel egyezzen. Két találat ugyanarra a configbejegyzésre = hiba (két X080-nál PCI-cím kell); egy kártya két bejegyzésre = hiba.
+- `match`: PCI-cím (pontos, kis-nagybetű független, a `0000:` tartomány elhagyható), különben a leírás (vagy a backend-név) részsztringje. A `backend` (`rocm`, `vulkan`, `cuda`) a felderített `Library`-vel egyezzen. Két találat ugyanarra a configbejegyzésre = hiba (két gpu0-nál PCI-cím kell); egy kártya két bejegyzésre = hiba.
 - A párosítás a felderített eszközlistán (`discover.GPUDevices`) történik; a hiányzó eszköz `unavailable` (a modell listájában átugorja), egy naplósor jelzi.
 
 ### 2.4 Elhelyezés és futási korlát (`multimodel/coord.go`)
@@ -45,7 +45,7 @@ Mezőnként: környezeti változó < `defaults` < Modelfile `PARAMETER` < a mode
 - Config nélkül, vagy ha a modellnek nincs `devices` listája: nincs foglalás, a régi viselkedés.
 
 ### 2.5 Példányok eszközönként
-- Az ütemező kulcsa (`schedulerModelKey`) az elhelyezett eszközzel bővül (`<út>\x00@<eszköz>`), így ugyanaz a modell egyszerre lehet betöltve az X080-on és a CPU-n (CPU-s példány). Config nélkül a kulcs változatlan.
+- Az ütemező kulcsa (`schedulerModelKey`) az elhelyezett eszközzel bővül (`<út>\x00@<eszköz>`), így ugyanaz a modell egyszerre lehet betöltve a gpu0-n és a CPU-n (CPU-s példány). Config nélkül a kulcs változatlan.
 - GPU-s elhelyezés: a felderített eszközök közül csak a megfelelő (`selectLlamaServerPlacement` helyett), `main_gpu` 0, a fit a GPU és a CPU között oszt (zónák). CPU-s elhelyezés: `num_gpu 0`, eszközlista üres; a betöltés repackel (ez a „demote”).
 
 ### 2.6 Csere a fő GPU-n

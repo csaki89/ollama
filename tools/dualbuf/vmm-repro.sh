@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds tools/dualbuf/vmm-repro.cpp and runs the four cases, each in its own process (a GPU page fault kills the process).
 # On the NAS, from a checkout of the dual-buffer branch, in one command:
-#   docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 \
+#   docker run --rm --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 \
 #     -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-repro.sh
 # Env: ARCH (gfx1030), ARGS (extra arguments: sections section_mib chunk_mib, default 96 32 4)
 set -u

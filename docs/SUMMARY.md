@@ -6,7 +6,7 @@
 - **A dual-buffer beépítése:** `llama/compat/003-dual-buffer.patch`, az Ollama saját patch-mechanizmusával (a `001`, `002` után alkalmazódik). 11 llama.cpp-fájl, a ../llama-dualbuf diffjéből a b11351-re átültetve (4 hunk kézzel, a scheduler-regisztráció a b11351 `sched_reserve()`-jéhez igazítva; DECISIONS.md). Az Ollama Go kódja változatlan: a `LLAMA_ARG_DUAL_BUFFER` és a `LLAMA_ARG_LOAD_MODE` a környezetből átmegy a llama-serverre.
 - **Laptopos igazolás Vulkannal** (`docs/test-results.md`): a patch-elt llama-server lefordul (Ollama build-útvonal, MSVC/Ninja), a naplóban megjelenik a `dual-buffer: 87 weights also stored in Vulkan_Host (308.18 MiB)` sor és mindkét puffer; kapcsoló nélkül az eredeti viselkedés; a prompt 324,8 tok/s a host-puffer 330,3-jával szemben (98%) és 2,7x a repack 121,4-énél.
 - **GitHub Actions** (`.github/workflows/dualbuf-image.yaml`): `dual-buffer` pushra felépíti a ROCm image-et (csak gfx1030, a Dockerfile `rocm` célja, `FLAVOR=rocm`) és feltölti a `ghcr.io/csaki89/ollama-dualbuf` címre `0.40.2-dualbuf-<commit>` és `latest` címkével. Dockerfile-változás: 2 új `ARG` + 1 `RUN` (gfx1030-ra szűkítés és a többi architektúra rocBLAS/hipBLASLt-fájljainak törlése).
-- **`docker-compose.yaml`** a TrueNAS egyéni apphoz (teszt: 30069-es port).
+- **`docker-compose.yaml`** a NAS egyéni appjához (teszt: <PORT_DUALBUF>-es port).
 
 ## Ami nincs kész
 - **Az `ollama` binárissal végzett laptopos próba.** A laptopon nincs Go, a telepítés tiltott, a Go 1.26.10 MSI letöltve és hash-ellenőrizve a scratchpadben (`...\scratchpad\go-dl\go1.26.10.windows-amd64.msi`). Telepítés után: `cmake -B build . -DOLLAMA_LLAMA_BACKENDS=vulkan` (Developer PowerShell, `VULKAN_SDK` beállítva) és `cmake --build build`, majd a Modelfile (`FROM` a GGUF, `PARAMETER num_gpu 14`, `PARAMETER use_mmap false`) importja; ugyanezt a naplósort kell látni.
@@ -23,15 +23,15 @@
 
 ## Hogyan húzza le a NAS a ghcr.io image-et
 Az Actionsből, `GITHUB_TOKEN`-nel feltöltött csomag **alapból privát**.
-- **Nyilvánossá tétel (ajánlott, a GitHub felületén kell megtenni):** GitHub → Packages → `ollama-dualbuf` → Package settings → Change visibility → Public. Utána a NAS bejelentkezés nélkül húzza: `docker pull ghcr.io/csaki89/ollama-dualbuf:<címke>`, a TrueNAS is tudja. Az image nem tartalmaz titkot (Ollama és llama.cpp, mindkettő MIT), a hátránya csak az, hogy bárki letöltheti.
-- **Privát marad:** a NAS shellben (root) `docker login ghcr.io -u csaki89`, jelszónak egy személyes hozzáférési token (classic, `read:packages` jogosultság). A token a NAS-on a Docker konfigurációs fájljában (`config.json`) tárolódik, lejárhat (akkor a frissítés/újratelepítés elhasal), és a TrueNAS rendszerfrissítése a bejelentkezést elveszítheti. Előny: az image nem nyilvános.
+- **Nyilvánossá tétel (ajánlott, a GitHub felületén kell megtenni):** GitHub → Packages → `ollama-dualbuf` → Package settings → Change visibility → Public. Utána a NAS bejelentkezés nélkül húzza: `docker pull ghcr.io/csaki89/ollama-dualbuf:<címke>`, a a NAS is tudja. Az image nem tartalmaz titkot (Ollama és llama.cpp, mindkettő MIT), a hátránya csak az, hogy bárki letöltheti.
+- **Privát marad:** a NAS shellben (root) `docker login ghcr.io -u csaki89`, jelszónak egy személyes hozzáférési token (classic, `read:packages` jogosultság). A token a NAS-on a Docker konfigurációs fájljában (`config.json`) tárolódik, lejárhat (akkor a frissítés/újratelepítés elhasal), és a a NAS rendszerfrissítése a bejelentkezést elveszítheti. Előny: az image nem nyilvános.
 A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; privátnál van token-kezelés. A compose az ág mozgó címkéjét használja (DECISIONS 49), a `latest`-et a workflow nem frissíti; rögzítéshez és visszaálláshoz a fix `<verzió>-dualbuf-<commit>` címke való.
 
 ## Hogyan kell a NAS-on elindítani
 1. Push az origin-re (kifejezett kérésre), az Actions lefut; a `Compute tags` lépés kiírja a címkét (`0.40.2-dualbuf-<commit>`).
 2. Láthatóság beállítása vagy `docker login` (lásd fent).
 3. A `docker-compose.yaml` az ág mozgó címkéjét tartalmazza (`dual-buffer-0.40.16`); újabb buildnél az appban kézzel kell pullt és újraindítást kérni (lásd a v0.40.16-os ellenőrzőlista 1. pontját).
-4. TrueNAS: Apps → Discover Apps → „Install via YAML” → a fájl tartalma, az app neve pl. `ollama-dualbuf`. A teszt a **30069**-es porton fut a mostani (30068) mellett, ugyanazt a `/mnt/nvme/ollama/models` mappát használja.
+4. A NAS app-felületén egyéni app YAML-ból, a fájl tartalmával. A teszt a **<PORT_DUALBUF>**-es porton fut a mostani (<PORT_PROD>) mellett, ugyanazt a `<MODELS_DIR>` mappát használja.
 5. Ellenőrzés: `docker logs ollama-dualbuf` (az `OLLAMA_DEBUG=1`-gyel bővebb) → `using llama-server for model`, `load_tensors: dual-buffer: N weights also stored in ROCm_Host (X MiB)`, `ROCm0 model buffer`, `CPU_REPACK model buffer`, `ROCm_Host model buffer`, és a `load_mode = none`. Ha `dual-buffer ... disabling it` figyelmeztetést látsz, az ok a sorban van (mmap, `--no-repack` vagy nincs host-puffer).
 
 **Közös modellmappa:**
@@ -43,13 +43,13 @@ A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; p
   - A teszt-instance-szal ne `pull`/`rm`/`create` olyan néven, ami a produkciósban használt név (felülírná a manifestet). A variánsnak mindig új nevet adj (`<modell>-dualbuf-<num_gpu>`), és a produkciós modelleket ne töröld.
   - Az `OLLAMA_NOPRUNE=1` marad; enélkül a teszt-instance induláskor a számára ismeretlen (félkész vagy másik instance által húzott) blobokat törölhetné. A produkciósat ez nem védi: az továbbra is takarít, ha neki nincs beállítva, ezért a variáns törlése (`ollama rm`) a blobot nem érinti, amíg más manifest hivatkozik rá.
   - Egyszerre ne futtass nagy modellt mindkét példányon: közös a RAM és a GPU (a `OLLAMA_MAX_LOADED_MODELS=1` példányonként értendő).
-- **Erőforráskorlát és RAM-védelem:** a compose 60 CPU-t és 100 GB RAM-ot ad a konténernek (`deploy.resources.limits`). Ez cgroup-korlát, amit a dual-buffer automatikus RAM-védelme olvas (llama-dualbuf DECISIONS 11–13): a másolatokra jutó keret = korlát − használat (az inaktív page cache nélkül) − a CPU-n maradó modellrész − tartalék (max(1 GiB, a korlát 5%-a)). Ha a keret nem elég, kevesebb tenzor kap host-másolatot, ha 0, a dual-buffer figyelmeztetéssel kikapcsol. A naplósor jelzi a forrást: `free RAM N MiB (… cgroup limit …)`. A TrueNAS custom appban a `deploy.resources` érvényesülését ellenőrizd (`docker inspect` → `HostConfig.Memory`), különben a védelem a gazdagép RAM-ját látja.
+- **Erőforráskorlát és RAM-védelem:** a compose CPU- és memóriakorlátot ad a konténernek (`deploy.resources.limits`). Ez cgroup-korlát, amit a dual-buffer automatikus RAM-védelme olvas (llama-dualbuf DECISIONS 11–13): a másolatokra jutó keret = korlát − használat (az inaktív page cache nélkül) − a CPU-n maradó modellrész − tartalék (max(1 GiB, a korlát 5%-a)). Ha a keret nem elég, kevesebb tenzor kap host-másolatot, ha 0, a dual-buffer figyelmeztetéssel kikapcsol. A naplósor jelzi a forrást: `free RAM N MiB (… cgroup limit …)`. A a NAS custom appban a `deploy.resources` érvényesülését ellenőrizd (`docker inspect` → `HostConfig.Memory`), különben a védelem a gazdagép RAM-ját látja.
 - A compose healthchecket (`ollama list`) és naplókorlátot (10 MB × 3) is tartalmaz.
 
 ## Hogyan kell mérni
 **Mi fut mely motoron:** a 0.40.2-ben minden GGUF modell a llama-serveren fut (`llm.NewLlamaServer`), tehát a **qwen3-vl:8b, a Qwen2.5-1.5B és a qwen3-coder:30b is**; Ollama „saját motorja” GGUF-ra nincs. Egyedül a `safetensors` modell megy az `mlxrunner`-re, ami a NAS ROCm image-ében nem érhető el (DESIGN.md 3.). A qwen3-vl:8b blobját a compat réteg fordítja (és mmap nélkül tölti). A naplóban a `using llama-server for model` sor ezt minden modellnél megerősíti.
 
-**Elrendezés:** két Ollama fut egyszerre a NAS-on (a mostani `ollama/ollama:0.40.2-rocm` a 30068-on és a teszt a 30069-en). A GPU-t egyszerre csak az egyik használhatja (10 GB), ezért mérés közben a másikat `keep_alive: 0`-val ürítsd ki, vagy állítsd le.
+**Elrendezés:** két Ollama fut egyszerre a NAS-on (a mostani `ollama/ollama:0.40.2-rocm` a <PORT_PROD>-on és a teszt a <PORT_DUALBUF>-en). A GPU-t egyszerre csak az egyik használhatja, ezért mérés közben a másikat `keep_alive: 0`-val ürítsd ki, vagy állítsd le.
 
 | # | modell | `num_gpu` | motor | cél |
 |---|---|---|---|---|
@@ -58,14 +58,14 @@ A különbség tehát: nyilvánosnál nincs titok a NAS-on és nincs lejárat; p
 | 3 | qwen3-coder:30b | pl. 20 (a VRAM-hoz igazítva) | llama-server | MoE-próba (lásd nyitott kérdés 3.) |
 
 **Konfigurációk mindhárom modellhez:**
-- A) régi: `ollama/ollama:0.40.2-rocm` (30068), `use_mmap` be- és kikapcsolt állapotban is (a kikapcsolt a méltányos referencia a `--load-mode none` miatt).
+- A) régi: `ollama/ollama:0.40.2-rocm` (<PORT_PROD>), `use_mmap` be- és kikapcsolt állapotban is (a kikapcsolt a méltányos referencia a `--load-mode none` miatt).
 - B) új, `LLAMA_ARG_DUAL_BUFFER` nélkül (a compose-ban a változót töröld vagy `0`): az új image alapviselkedése, a patch hatása nélkül.
 - C) új, `LLAMA_ARG_DUAL_BUFFER=1`.
 A B és C között a kapcsoló az egyetlen különbség (ugyanaz az image és ugyanaz a `LLAMA_ARG_LOAD_MODE=none`). A `LLAMA_ARG_NO_HOST` ne legyen beállítva (felülírja a viselkedést).
 
 **Parancs (egy mérés, a kérés opciói felülírják a Modelfile-t):**
 ```
-HOST=http://<nas>:30069   # 30068 a régi
+HOST=http://<nas>:<PORT_DUALBUF>   # <PORT_PROD> a régi
 for N in 30 18 6; do
   for i in 1 2 3; do
     curl -s $HOST/api/generate -d '{"model":"qwen3-vl:8b","prompt":"'"$PROMPT"'","stream":false,
@@ -93,15 +93,16 @@ A patch (`003`) tartalmazza a rugalmas sávot is (a GPU-s rétegek első N-je fu
 
 **Futtatás a NAS-on** (a repó klónjából, root vagy docker-csoport; a szkript Python 3, nem a zsh):
 ```
-sudo python3 tools/dualbuf/nas-flex-bench.py --image ghcr.io/csaki89/ollama-dualbuf:<címke>
+sudo python3 tools/dualbuf/nas-flex-bench.py --image ghcr.io/csaki89/ollama-dualbuf:<címke> --models-dir <MODELS_DIR> \
+  --render-node /dev/dri/<RENDER_NODE> --vram-path /sys/bus/pci/devices/<PCI_ADDR>/mem_info_vram_used --memory <MEMORY_LIMIT> --cpus <CPU_LIMIT>
 ```
-- Előtte a produkciós Ollama ne tartson modellt a GPU-n (a VRAM-értékeket torzítaná): `curl -s localhost:30068/api/generate -d '{"model":"<modell>","keep_alive":0}'`, vagy várd meg a lejáratot. A szkript figyelmeztet, ha a GPU 300 MiB-nál többet használ indulás előtt.
-- Alapból: modellek `qwen3-vl:8b` (dense) és `qwen3-coder:30b` (MoE), 0/1/2 levett réteg, mindegyik HIP-gráfokkal és `GGML_CUDA_DISABLE_GRAPHS=1`-gyel (12 konténerindítás, modellenként néhány perc betöltéssel; a teljes futás kb. fél–egy óra). A tesztkonténer: 100 GB memória- és 60 CPU-korlát, `/dev/kfd`, `/dev/dri/renderD129`, `HSA_OVERRIDE_GFX_VERSION=10.3.0`, a `/mnt/nvme/ollama/models` csak olvashatóan, port 30070.
+- Előtte a produkciós Ollama ne tartson modellt a GPU-n (a VRAM-értékeket torzítaná): `curl -s localhost:<PORT_PROD>/api/generate -d '{"model":"<modell>","keep_alive":0}'`, vagy várd meg a lejáratot. A szkript figyelmeztet, ha a GPU 300 MiB-nál többet használ indulás előtt.
+- Alapból: modellek `qwen3-vl:8b` (dense) és `qwen3-coder:30b` (MoE), 0/1/2 levett réteg, mindegyik HIP-gráfokkal és `GGML_CUDA_DISABLE_GRAPHS=1`-gyel (12 konténerindítás, modellenként néhány perc betöltéssel; a teljes futás kb. fél–egy óra). A tesztkonténer: 100 GB memória- és 60 CPU-korlát, `/dev/kfd`, `/dev/dri/<RENDER_NODE>`, `HSA_OVERRIDE_GFX_VERSION=10.3.0`, a `<MODELS_DIR>` csak olvashatóan, port <PORT_BENCH>.
 - Részhalmaz: `--models qwen3-vl:8b --layers 0,1 --no-graphs-off`; a dense modellnél beállítható az `-ngl`: `--num-gpu qwen3-vl:8b=30`; a MoE-nél ne add meg (az Ollama/`--fit` dönt). `--dry-run` csak kiírja a docker parancsokat.
 - Eredmény: `flex-bench-<időbélyeg>/results.md` (táblázat: generálás és hosszú prompt tok/s, VRAM, felszabadult MiB, levétel/visszatétel ideje, gráfhasítások, értelmes-e a kimenet, eltér-e a k=0-tól és a gráfok nélküli futástól), `results.json` és a konténernaplók a `logs/` alatt.
 - Ha az Ollama a csak olvasható modellmappán nem indulna el, a napló mutatja; ilyenkor a mappát ideiglenesen írhatóra kell csatolni (a szkriptben a `:ro`).
 
-**Mit mér és hogyan:** a bemelegítő kérés tölti be a modellt, ennek első tokenjei után a `LLAMA_FLEX_TEST="1:take,..."` leveszi a rétegeket (a levétel és a K/V mozgatása a naplóból: `flex_move: layer N moved to CPU (…ms…)`). A szabad VRAM a `mem_info_vram_used` (`0000:86:00.0`) különbsége a k=0 esethez képest. A visszatételt (`20000:put`) a szkript töltelék-promptokkal éri el, a visszatételi idő szintén a naplóból jön. A gráfhasítások a `sched_reserve: graph … splits = pp / tg` sorokból (a szkript `LLAMA_FLEX_TEST_RESERVE=1`-et állít). A szkriptet a laptopon nem tudtam futtatni (nincs Python), az első futás a NAS-on lesz; a naplóformátum-illesztést valódi llama-server naplóval ellenőriztem.
+**Mit mér és hogyan:** a bemelegítő kérés tölti be a modellt, ennek első tokenjei után a `LLAMA_FLEX_TEST="1:take,..."` leveszi a rétegeket (a levétel és a K/V mozgatása a naplóból: `flex_move: layer N moved to CPU (…ms…)`). A szabad VRAM a `mem_info_vram_used` (`<PCI_ADDR>`) különbsége a k=0 esethez képest. A visszatételt (`20000:put`) a szkript töltelék-promptokkal éri el, a visszatételi idő szintén a naplóból jön. A gráfhasítások a `sched_reserve: graph … splits = pp / tg` sorokból (a szkript `LLAMA_FLEX_TEST_RESERVE=1`-et állít). A szkriptet a laptopon nem tudtam futtatni (nincs Python), az első futás a NAS-on lesz; a naplóformátum-illesztést valódi llama-server naplóval ellenőriztem.
 
 **MoE-nél mire számíts:** a sáv a 0..N-1. réteg; a `--fit` szerint ezek az elöl lévő, teljes rétegek, ha jutott rájuk VRAM. A hátsó rétegek szakértői CPU-n vannak, ezek nem mozognak. Részletek és korlát: DECISIONS.md 16.
 
@@ -111,24 +112,24 @@ A llama-server a `--fit`-ből maga számolja a zónákat (dense és MoE), a KV a
 ### VMM reprodukáló teszt a NAS-on
 Ebből a checkoutból (vagy a csaki89/llama.cpp dual-buffer branchből), egyetlen paranccsal (a négy eset külön folyamatban fut, a végén összesítés):
 ```
-docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-repro.sh
+docker run --rm --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-repro.sh
 ```
 Esetek: (a) a régi minta (96 címtartomány, 4 MiB-os darab, aszinkron nullázás saját adatfolyamon), (b) az új (egy címtartomány, szakaszok, 2 MiB-ra igazított darabok, szinkron nullázás, növelés), (c) a régi szinkron nullázással, (d) a régi `max(ajánlott, 2 MiB)` igazítással. Az esetenkénti napló: `/tmp/vmm-repro-<eset>.log` a konténerben (a kimenet a terminálon is látszik).
 
 ### VMM stresszteszt a NAS-on
 Ebből a checkoutból, egy paranccsal (minden futás külön folyamat, a végén összesítés; a naplók a konténer `/tmp`-jében):
 ```
-docker run --rm --device /dev/kfd --device /dev/dri/renderD129 --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
+docker run --rm --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
 ```
 Szűkítés: `-e SYNCS="barrier both" -e CASES="a c" -e RUNS=5 -e WAIT_MS=1`.
 
 ## Ellenőrzés a NAS-on: v0.40.16 (`dual-buffer-0.40.16`)
 Zárójelben: melyik bizonytalan döntést ellenőrzi (DECISIONS 48 a–d). Visszaállás: a compose `image:` sorában `ghcr.io/csaki89/ollama-dualbuf:0.40.2-dualbuf-11359f1`, majd pull és újraindítás.
-1. **Az image frissítése (minden új buildnél kézzel):** TrueNAS → Apps → `ollama-dualbuf` → Edit, a YAML-ban az új `docker-compose.yaml` (image: `ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`). A mozgó címkét a TrueNAS/Docker magától nem húzza újra (az alap pull-szabály csak hiányzó image-et húz), ezért az appnál kérj kézzel pullt (Apps → az app → „Pull Images”/Update, vagy a NAS shellben `docker pull ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`), utána indítsd újra az appot (Stop → Start). Ellenőrzés: `docker exec ollama-dualbuf ollama --version` → `0.40.16`; `docker image inspect ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16 --format '{{index .RepoDigests 0}} {{index .Config.Labels "org.opencontainers.image.version"}}'` a workflow által kiírt fix címkét mutatja.
+1. **Az image frissítése (minden új buildnél kézzel):** a NAS app-felületén az app szerkesztése, a YAML-ban az új `docker-compose.yaml` (image: `ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`). A mozgó címkét a a NAS/Docker magától nem húzza újra (az alap pull-szabály csak hiányzó image-et húz), ezért az appnál kérj kézzel pullt (Apps → az app → „Pull Images”/Update, vagy a NAS shellben `docker pull ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16`), utána indítsd újra az appot (Stop → Start). Ellenőrzés: `docker exec ollama-dualbuf ollama --version` → `0.40.16`; `docker image inspect ghcr.io/csaki89/ollama-dualbuf:dual-buffer-0.40.16 --format '{{index .RepoDigests 0}} {{index .Config.Labels "org.opencontainers.image.version"}}'` a workflow által kiírt fix címkét mutatja.
 2. **Indul a mostani beállításokkal:** `docker logs ollama-dualbuf 2>&1 | grep -iE "gfx|rocm|error"`: a ROCm-eszköz látszik (gfx1030 a `HSA_OVERRIDE_GFX_VERSION=10.3.0`-val), a healthcheck `healthy`.
-3. **embeddinggemma-2:270m (a cél):** amíg a 0.40.2-es példány nem húz semmit (közös modellmappa): `curl -s http://<nas>:30069/api/pull -d '{"model":"embeddinggemma-2:270m"}'`, majd `curl -s http://<nas>:30069/api/embed -d '{"model":"embeddinggemma-2:270m","input":"hello world"}' | jq '.embeddings[0] | length'` → `768`. Összevetésül `qwen3-embedding:0.6b` → `1024`. A 0.40.2-es példány a modellt listázza, de nem futtatja (várható).
+3. **embeddinggemma-2:270m (a cél):** amíg a 0.40.2-es példány nem húz semmit (közös modellmappa): `curl -s http://<nas>:<PORT_DUALBUF>/api/pull -d '{"model":"embeddinggemma-2:270m"}'`, majd `curl -s http://<nas>:<PORT_DUALBUF>/api/embed -d '{"model":"embeddinggemma-2:270m","input":"hello world"}' | jq '.embeddings[0] | length'` → `768`. Összevetésül `qwen3-embedding:0.6b` → `1024`. A 0.40.2-es példány a modellt listázza, de nem futtatja (várható).
 4. **Dual-buffer és zónák egy modellbetöltésnél:** a naplóban `using llama-server for model`, `dual-buffer: N weights also stored in ROCm_Host`, `zones: flash attention ..., dynamic KV on`, `set_dynamic: ... layers in place (VMM)`; nincs `disabling it`, `fallback` vagy `GGML_LOG_ERROR`-sor (48 a, c).
 5. **`vmm-stress.sh`** (előtte a modelleket unload): `docker exec ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh` (gyors: `-e QUICK=1`); minden eset hibátlan, a VRAM visszajön (48 a).
 6. **`arch_test.sh`, `long_ctx.sh`** (a NAS-on lévő mérőscriptek, ebben a repóban nincsenek): hibátlan futás, a `long_ctx.sh` 118K-ig hibátlan átmenettel; a naplóban a `relayout: KV ...` és a `flex_move` sorok a 0.40.2-es futáshoz hasonlóak (48 c).
 7. **qwen3-coder:30b sebesség** a dokumentált értékekhez képest: rövid gen ~36–37 tok/s, 60K-n gen ~18,9 tok/s, 118K-ig hibátlan átmenet. A llama.cpp ~830 commitot lépett (HIP MMQ, flash attention), az eltérés mindkét irányba lehet; érdemi romlásnál a fix 0.40.2-es címkével ugyanaz a mérés (48 b).
-8. **Közös modellmappa:** a tesztek után a 0.40.2-es példány (30068) a saját modelljeit változatlanul listázza és futtatja; a 0.40.16 a 0.40.2-vel közös store-on fut, a két példány verziója már nem azonos (48 d).
+8. **Közös modellmappa:** a tesztek után a 0.40.2-es példány (<PORT_PROD>) a saját modelljeit változatlanul listázza és futtatja; a 0.40.16 a 0.40.2-vel közös store-on fut, a két példány verziója már nem azonos (48 d).

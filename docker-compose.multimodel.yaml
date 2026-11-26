@@ -1,9 +1,12 @@
-# TrueNAS SCALE custom app for the multimodel branch (Ollama 0.40.16 + dual-buffer + the multi-model rules of
-# /models/dualbuf.yaml, ROCm + Vulkan). A test instance next to the others: port 30071.
+# Docker compose app for the multimodel branch (Ollama 0.40.16 + dual-buffer + the multi-model rules of
+# /models/dualbuf.yaml, ROCm + Vulkan). A test instance next to the others.
+#
+# Set in an .env file next to this one (or in the environment): OLLAMA_PORT, MODELS_DIR, RENDER_NODE_ROCM,
+# RENDER_NODE_VULKAN (the render nodes of the cards: `ls -l /dev/dri/by-path`), CPU_LIMIT, MEMORY_LIMIT.
 #
 # - Image: the moving tag :multimodel (every "dualbuf-image" build of the multimodel branch overwrites it; the
 #   workflow also prints a fixed <version>-dualbuf-<commit> tag). Pull by hand for a newer build, then restart.
-# - The config: /mnt/nvme/ollama/models/dualbuf.yaml (example: docs/dualbuf.example.yaml). Only this image reads it.
+# - The config: $MODELS_DIR/dualbuf.yaml (example: docs/dualbuf.example.yaml). Only this image reads it.
 #   Fill the devices section from the log line "dualbuf devices" / "inference compute" (PCI address or name).
 # - The other Ollama instances share the model directory: run one of them at a time on the GPU (docs/NAS-TESTS.md).
 services:
@@ -12,15 +15,15 @@ services:
     container_name: ollama-multimodel
     restart: unless-stopped
     ports:
-      - "30071:11434"
+      - "${OLLAMA_PORT}:11434"
     devices:
       # /dev/kfd: the ROCm backend needs it, and the Vulkan backend uses it for the compute power state of an AMD card
       # (an empty KFD compute queue while a model is loaded: without it the GPU stays at low clocks in a GPU/CPU split)
       - /dev/kfd:/dev/kfd
-      # the ROCm card (today the RX 6700); for the X080 add/replace its render node
-      - /dev/dri/renderD129:/dev/dri/renderD129
-      # the Vulkan card (RX 550): its render node, see `ls -l /dev/dri/by-path` on the NAS (renderD128 is an assumption)
-      - /dev/dri/renderD128:/dev/dri/renderD128
+      # the ROCm card; for a further card add its render node
+      - /dev/dri/${RENDER_NODE_ROCM}:/dev/dri/${RENDER_NODE_ROCM}
+      # the Vulkan card: its render node
+      - /dev/dri/${RENDER_NODE_VULKAN}:/dev/dri/${RENDER_NODE_VULKAN}
     group_add:
       - video
       - render
@@ -33,8 +36,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "60"
-          memory: 100G
+          cpus: "${CPU_LIMIT}"
+          memory: ${MEMORY_LIMIT}
     healthcheck:
       test: ["CMD", "/bin/ollama", "list"]
       interval: 30s
@@ -61,4 +64,4 @@ services:
       OLLAMA_MODELS: /models
       OLLAMA_HOST: 0.0.0.0:11434
     volumes:
-      - /mnt/nvme/ollama/models:/models
+      - ${MODELS_DIR}:/models

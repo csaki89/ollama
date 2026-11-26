@@ -44,12 +44,12 @@ func waitQueued(t *testing.T, c *Coordinator, n int) {
 	}
 }
 
-var gpuCPU = []string{"x080", "cpu"}
+var gpuCPU = []string{"gpu0", "cpu"}
 
 func TestCoordFreeAndNoLimit(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
 	a := mustAcquire(t, c, Request{Devices: gpuCPU})
-	if a.Device != "x080" || a.Reason != "free" {
+	if a.Device != "gpu0" || a.Reason != "free" {
 		t.Fatalf("a: %+v", a)
 	}
 	// cpu has no limit: any number may run there
@@ -60,8 +60,8 @@ func TestCoordFreeAndNoLimit(t *testing.T) {
 	}
 	a.Release()
 	a.Release() // once
-	if c.Running("x080") != 0 {
-		t.Fatalf("running after release: %d", c.Running("x080"))
+	if c.Running("gpu0") != 0 {
+		t.Fatalf("running after release: %d", c.Running("gpu0"))
 	}
 	if g := mustAcquire(t, c, Request{}); g.Device != "" {
 		t.Fatalf("no devices: %+v", g)
@@ -69,19 +69,19 @@ func TestCoordFreeAndNoLimit(t *testing.T) {
 }
 
 func TestCoordWaitThenGet(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	a := mustAcquire(t, c, Request{Devices: gpuCPU})
 	ch := acquireAsync(c, context.Background(), Request{Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 2 * time.Second})
 	waitQueued(t, c, 1)
 	a.Release()
 	r := <-ch
-	if r.err != nil || r.g.Device != "x080" || r.g.Reason != "waited" {
+	if r.err != nil || r.g.Device != "gpu0" || r.g.Reason != "waited" {
 		t.Fatalf("waited: %+v %v", r.g, r.err)
 	}
 }
 
 func TestCoordWaitTimeoutNext(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	mustAcquire(t, c, Request{Devices: gpuCPU})
 	start := time.Now()
 	g := mustAcquire(t, c, Request{Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 50 * time.Millisecond})
@@ -91,7 +91,7 @@ func TestCoordWaitTimeoutNext(t *testing.T) {
 }
 
 func TestCoordNextNoWait(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	mustAcquire(t, c, Request{Devices: gpuCPU})
 	start := time.Now()
 	g := mustAcquire(t, c, Request{Devices: gpuCPU, OnBusy: OnBusyNext, WaitTimeout: time.Hour})
@@ -101,7 +101,7 @@ func TestCoordNextNoWait(t *testing.T) {
 }
 
 func TestCoordQueueArrivalOrder(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	gpu := mustAcquire(t, c, Request{Devices: gpuCPU})
 	cpu := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
 	d := acquireAsync(c, context.Background(), Request{Model: "d", Devices: gpuCPU, OnBusy: OnBusyNext})
@@ -117,9 +117,9 @@ func TestCoordQueueArrivalOrder(t *testing.T) {
 	if rd.g.Device != "cpu" || rd.g.Reason != "queued" {
 		t.Fatalf("d: %+v", rd.g)
 	}
-	gpu.Release() // x080 -> e
+	gpu.Release() // gpu0 -> e
 	re := <-e
-	if re.g.Device != "x080" {
+	if re.g.Device != "gpu0" {
 		t.Fatalf("e: %+v", re.g)
 	}
 	select {
@@ -135,14 +135,14 @@ func TestCoordQueueArrivalOrder(t *testing.T) {
 
 func TestCoordWaiterKeepsItsTurn(t *testing.T) {
 	// a request waiting for its first device is not overtaken there by a later one
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	a := mustAcquire(t, c, Request{Devices: gpuCPU})
 	b := acquireAsync(c, context.Background(), Request{Model: "b", Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 2 * time.Second})
 	waitQueued(t, c, 1)
-	late := acquireAsync(c, context.Background(), Request{Model: "late", Devices: []string{"x080"}})
+	late := acquireAsync(c, context.Background(), Request{Model: "late", Devices: []string{"gpu0"}})
 	waitQueued(t, c, 2)
 	a.Release()
-	if r := <-b; r.g.Device != "x080" {
+	if r := <-b; r.g.Device != "gpu0" {
 		t.Fatalf("b: %+v", r.g)
 	}
 	select {
@@ -153,10 +153,10 @@ func TestCoordWaiterKeepsItsTurn(t *testing.T) {
 }
 
 func TestCoordCancel(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1}))
-	mustAcquire(t, c, Request{Devices: []string{"x080"}})
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
+	mustAcquire(t, c, Request{Devices: []string{"gpu0"}})
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := acquireAsync(c, ctx, Request{Devices: []string{"x080"}})
+	ch := acquireAsync(c, ctx, Request{Devices: []string{"gpu0"}})
 	waitQueued(t, c, 1)
 	cancel()
 	if r := <-ch; r.err == nil {
@@ -168,7 +168,7 @@ func TestCoordCancel(t *testing.T) {
 }
 
 func TestCoordAlsoCPU(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1, "cpu": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
 	cpuOnly := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
 	g := mustAcquire(t, c, Request{Devices: gpuCPU})
 	done := make(chan error, 1)
@@ -182,23 +182,23 @@ func TestCoordAlsoCPU(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if c.Running("cpu") != 1 || c.Running("x080") != 1 {
-		t.Fatalf("running: cpu %d x080 %d", c.Running("cpu"), c.Running("x080"))
+	if c.Running("cpu") != 1 || c.Running("gpu0") != 1 {
+		t.Fatalf("running: cpu %d gpu0 %d", c.Running("cpu"), c.Running("gpu0"))
 	}
 	g.Release()
-	if c.Running("cpu") != 0 || c.Running("x080") != 0 {
-		t.Fatalf("after release: cpu %d x080 %d", c.Running("cpu"), c.Running("x080"))
+	if c.Running("cpu") != 0 || c.Running("gpu0") != 0 {
+		t.Fatalf("after release: cpu %d gpu0 %d", c.Running("cpu"), c.Running("gpu0"))
 	}
 }
 
 func TestCoordReleaseOnDone(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"x080": 1}))
+	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
 	ctx, cancel := context.WithCancel(context.Background())
-	g := mustAcquire(t, c, Request{Devices: []string{"x080"}})
+	g := mustAcquire(t, c, Request{Devices: []string{"gpu0"}})
 	g.ReleaseOnDone(ctx)
 	cancel()
 	deadline := time.Now().Add(time.Second)
-	for c.Running("x080") != 0 {
+	for c.Running("gpu0") != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("not released")
 		}

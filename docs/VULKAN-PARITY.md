@@ -1,6 +1,6 @@
 # Vulkan és ROCm: a dual-buffer, a zónák, a flex rétegek és a dinamikus KV egyezése
 
-Felmérés a `multimodel` branchen (a45647ddb..6b19b5a28 után), módosítás előtt. Minta: a ROCm (HIP) út. Mérés: laptop, Intel Iris Xe (Vulkan, UMA/iGPU), qwen2.5-1.5B Q4_K_M, `--auto-zones --dual-buffer -fa on --load-mode none -c 16384`, `--fit-target` 5800 / 6000 / 6200 / 6500 MiB (a 2. és 3. zóna kikényszerítésére), egy ~11 000 tokenes, utána két rövid kérés. Szkript: `tools/dualbuf/vk-parity.sh`.
+Felmérés a `multimodel` branchen (a45647ddb..6b19b5a28 után), módosítás előtt. Minta: a ROCm (HIP) út. Mérés: laptop, integrált Intel GPU (Vulkan, UMA/iGPU), qwen2.5-1.5B Q4_K_M, `--auto-zones --dual-buffer -fa on --load-mode none -c 16384`, `--fit-target` 5800 / 6000 / 6200 / 6500 MiB (a 2. és 3. zóna kikényszerítésére), egy ~11 000 tokenes, utána két rövid kérés. Szkript: `tools/dualbuf/vk-parity.sh`.
 
 | elem | ROCm (minta) | Vulkan ma | eltérés |
 |---|---|---|---|
@@ -26,7 +26,7 @@ Felmérés a `multimodel` branchen (a45647ddb..6b19b5a28 után), módosítás el
 ## Eredmény
 Lásd a végén (a módosítások után kitöltve).
 
-## Eredmény (e795e5860 után; mérés: laptop, Iris Xe, `tools/dualbuf/vk-parity.sh`)
+## Eredmény (e795e5860 után; mérés: laptop, integrált Intel GPU, `tools/dualbuf/vk-parity.sh`)
 | elem | állapot |
 |---|---|
 | dual-buffer, auto zónák, flex-mozgás a K/V-vel, naplósorok | egyezik (a módosítás előtt is) |
@@ -45,7 +45,7 @@ Nyitva (OPEN-QUESTIONS.md): a fit költségvetés nélkül a heap teljes méret�
 1. **Másolásos növelés helyben növelés helyett.** A `relayout` eszközönként egy arénát kér a nem-flex rétegek K/V-jének max-kontextusú méretére, szakaszonként +64 MiB címtartalékkal (közös kód, a ROCm-on is így). A HIP-aréna (`per_chunk`, DECISIONS 41) a címtartományt darabonként foglalja, a leképezéssel együtt: a ténylegesen lefoglalt cím a kártyára leképezett memóriával arányos. A Vulkan-aréna egyetlen sparse `VkBuffer` a teljes kért méretre: a 64 MiB-os tartalékokkal együtt túllépte a `sparseAddressSpaceSize`-t (RADV-n ~4 GiB) → `no growable (sparse) KV buffers` → minden réteg másolással.
 2. **A másolásos tartalék csúcsa.** A betöltéskori K/V rétegenként közös pufferben van (pufferenként több réteg); a `set_dynamic` utáni teljes relayout az új rétegpuffereket a régi közös puffer mellé foglalja, és a régit csak a végén engedi el: a csúcs a teljes régi + a teljes új K/V. A további növelések már rétegenként mennek (a `resize_peak` ezt könyveli).
 3. **A Vulkan host-pufferei nem látszanak a cgroupban.** A `Vulkan_Host` (dual-buffer példányok, a nem repackelhető CPU-súlyok, flex példányok, host-K/V, parkolt példányok) a meghajtón át (`vkAllocateMemory`, diszkrét kártyán a kernel GTT-je) foglal, amit a konténer memória-cgroupja nem számol; a `hipHostMalloc` (ROCm) felhasználói lapokat rögzít, azokat számolja. A llama-server RAM-őre és az Ollama-tervezés (`PlanRAM`) a cgroup `memory.current`-jéből dolgozik.
-4. **Split-generálás.** A laptopon (Iris Xe, qwen2.5-1.5B, minden réteg a GPU-n, az FFN a CPU-n: 58 split tokenenként) a Vulkan-részek tokenenként ~22 ms-mal többet adnak, mint a csak-GPU-s futás ugyanazon műveletei: váltásonként ~0,75 ms, a gráfra várásban (`GGML_SCHED_TIMING`). A GPU→CPU visszaolvasás összevonása a gráf beküldésével (egy várakozás kettő helyett) a laptopon nem változtatott. Hogy ez a NAS-on a teljes ok-e, és mekkora a ROCm-os megfelelője, csak ott mérhető.
+4. **Split-generálás.** A laptopon (integrált Intel GPU, qwen2.5-1.5B, minden réteg a GPU-n, az FFN a CPU-n: 58 split tokenenként) a Vulkan-részek tokenenként ~22 ms-mal többet adnak, mint a csak-GPU-s futás ugyanazon műveletei: váltásonként ~0,75 ms, a gráfra várásban (`GGML_SCHED_TIMING`). A GPU→CPU visszaolvasás összevonása a gráf beküldésével (egy várakozás kettő helyett) a laptopon nem változtatott. Hogy ez a NAS-on a teljes ok-e, és mekkora a ROCm-os megfelelője, csak ott mérhető.
 5. **Teljesen GPU-n, hosszú kontextusnál lassabb.** A sparse darab a RADV-n a sparse blokk (64 KiB), a ROCm-on 2 MiB (a szakaszigazítás, `GGML_CUDA_VMM_MIN_ALIGN`). 64 KiB-os kötésekkel a K/V nem kap nagy (2 MiB-os) laptábla-töredékeket; a hosszú kontextus K/V-olvasása így több TLB-hibával jár, rövid kontextusnál nem számít. A „nagyobb méretben maradt” KV ezt erősíti (több sparse darab). Mérés a NAS-on: sparse vs. `GGML_VK_SPARSE=0` ugyanazon a hosszú kérésen.
 6. Csak dokumentálva (OPEN-QUESTIONS).
 7. **Könyvelt és mért szabad memória eltér.** A könyvelés a ggml-pufferek névleges méretét látja (súlyok, K/V `cell_bytes` x cella, compute pufferek). Nem látja: (a) a Vulkan-backend saját eszközfoglalásait (`prealloc_x/y/split_k`, `add_rms_partials`, `sync_staging`: a gráf futása közben nőnek, nem a scheduler foglalja); (b) a sparse szakaszok darabra kerekítését (szakaszonként legfeljebb egy darab, a laptopon 8 MiB x 56 szakasz). A CUDA/HIP-pool ugyanígy kívül esik, de ott a NAS-mérések egyeztek (DECISIONS 45-46).
@@ -121,11 +121,11 @@ A shaderlogika nem változott: csak a K/V-hozzáférések kerültek makróba (gy
 | a szakasz legfeljebb 4 GiB (afölött az a réteg másolással nő) | a shaderek 32 bites szakaszon belüli eltolással címeznek (mint a gyári kötés is) |
 | tartalék: `bufferDeviceAddress` vagy `shaderInt64` nélkül nincs darabos KV, rétegenként másolásos növelés, egy naplósor a hiányzó képességgel | a darabtábla 64 bites címeket tart |
 
-**Laptop (Iris Xe, qwen2.5-1.5B, `-c 16384`, `--auto-zones --dual-buffer -fa on`, 4701 tokenes kérés + két rövid, `temperature 0`):** a kimenet bájtra azonos a dinamikus KV nélküli (fix KV) futással, a másolásos úttal (`LLAMA_KV_NO_VMM=1`), és darabos KV-val akkor is, ha egy szakasz 64 darabból áll (`GGML_VK_KV_CHUNK_KIB=128`, 256 soros darabok, a figyelés darabhatárokon át olvas); f16 és q8_0 K/V-vel is (q8_0: 272 bájtos sor, 512 soros = 139 264 bájtos darab). Növelés helyben (`KV 4096 -> 4864 cells ... 14 grown in place`), zsugorítás helyben (`--no-zones-flex`: `14 shrunk in place`, a szakaszok 2 490 368 → 2 097 152 bájt), flex-mozgás (`flex_move: layer 8 K/V moved to Vulkan_Host`), park/unpark 3 körben (a válaszok azonosak, a K/V a darabos szakaszokból a hostra és vissza). A felszabaduló memória mérése és a sebesség a gyárihoz képest a diszkrét kártyán mérendő (NAS-TESTS 15); UMA-n a mért szabad memória a rendszer zaja miatt erre alkalmatlan.
+**Laptop (integrált Intel GPU, qwen2.5-1.5B, `-c 16384`, `--auto-zones --dual-buffer -fa on`, 4701 tokenes kérés + két rövid, `temperature 0`):** a kimenet bájtra azonos a dinamikus KV nélküli (fix KV) futással, a másolásos úttal (`LLAMA_KV_NO_VMM=1`), és darabos KV-val akkor is, ha egy szakasz 64 darabból áll (`GGML_VK_KV_CHUNK_KIB=128`, 256 soros darabok, a figyelés darabhatárokon át olvas); f16 és q8_0 K/V-vel is (q8_0: 272 bájtos sor, 512 soros = 139 264 bájtos darab). Növelés helyben (`KV 4096 -> 4864 cells ... 14 grown in place`), zsugorítás helyben (`--no-zones-flex`: `14 shrunk in place`, a szakaszok 2 490 368 → 2 097 152 bájt), flex-mozgás (`flex_move: layer 8 K/V moved to Vulkan_Host`), park/unpark 3 körben (a válaszok azonosak, a K/V a darabos szakaszokból a hostra és vissza). A felszabaduló memória mérése és a sebesség a gyárihoz képest a diszkrét kártyán mérendő (NAS-TESTS 15); UMA-n a mért szabad memória a rendszer zaja miatt erre alkalmatlan.
 
 # 4. lépés: MoE split-generálás (qwen3-coder:30b) Vulkanon a CPU sebességén
 
-**Hiba (NAS, RX 6700):** qwen3-coder:30b, auto zónák, dual-buffer: Vulkanon ~20 tok/s, csak CPU-n ~21, ROCm-on ugyanazon a kártyán ~35. A betöltés (CPU_REPACK, host-iker, GPU-s rétegdarabok) a két backenden azonos; a generálás Vulkanon tokenenként ~16–20 ms-mal lassabb.
+**Hiba (NAS, RDNA2-es kártya):** qwen3-coder:30b, auto zónák, dual-buffer: Vulkanon ~20 tok/s, csak CPU-n ~21, ROCm-on ugyanazon a kártyán ~35. A betöltés (CPU_REPACK, host-iker, GPU-s rétegdarabok) a két backenden azonos; a generálás Vulkanon tokenenként ~16–20 ms-mal lassabb.
 
 ## Összevetés generáláskor (1 tokenes köteg)
 ROCm-oldal: a kódból (ggml-cuda és a scheduler) levezetve; Vulkan-oldal: a kódból és a laptopon mérve (`GGML_SCHED_DEBUG=2`, `GGML_SCHED_TIMING=32`, granite-3.1-1b-a400m Q4_K_M, a szakértők a CPU-n: `-ngl 99 -ot exps=CPU --dual-buffer -fa on`, ugyanaz a rétegszerkezet, mint a coder szakértő-override-os rétegeinél).
@@ -139,7 +139,7 @@ ROCm-oldal: a kódból (ggml-cuda és a scheduler) levezetve; Vulkan-oldal: a k�
 | az aktivációk útja GPU→CPU | a CPU-split bemenetei: `ffn_norm` (reshape-nézet) és a top-k azonosítók (nézet); a scheduler nézet-bemenetet szinkron olvas: `synchronize` + bemenetenként `buffer_get_tensor` = `hipMemcpy` D2H a rögzített CPU-compute-pufferbe (pörgő szinkron) | ugyanez a hívássor; a `buffer_get_tensor` = `ggml_vk_buffer_read` | **költségben eltér** (lent) |
 | CPU→GPU | `ffn_moe_down` (nem nézet): szinkron `hipMemcpy` H2D | a compute parancspufferbe rögzített másolás (2. lépés) | Vulkanon olcsóbb |
 
-**Egy váltás költsége a javítás előtt.** GPU→CPU: (1) a gráf utolsó parancspufferének beküldése a kerítéssel, pörgő várás (2. lépés), (2) **bemenetenként** (2 db) egy új ideiglenes parancspuffer az **átviteli soron** (AMD-n külön DMA-motor), `vkQueueSubmit`, **alvó** `vkWaitForFences` (kernel-ébresztés), pool-takarítás. Laptopon (Iris Xe, Windows) egy ilyen olvasás átlag **~190–225 µs**, váltásonként kettő, a granite 24 rétegén tokenenként ~10 ms. A HIP ugyanezt két ~10–20 µs-os `hipMemcpy`-vel fizeti (felhasználói módú sor, pörgő szinkron). A coder 48 rétegén ~96 visszaolvasás tokenenként: ez a NAS-on mért 16–20 ms nagyságrendje. A végrehajtás helye tehát egyezik, **a különbség a váltásonkénti költség**.
+**Egy váltás költsége a javítás előtt.** GPU→CPU: (1) a gráf utolsó parancspufferének beküldése a kerítéssel, pörgő várás (2. lépés), (2) **bemenetenként** (2 db) egy új ideiglenes parancspuffer az **átviteli soron** (AMD-n külön DMA-motor), `vkQueueSubmit`, **alvó** `vkWaitForFences` (kernel-ébresztés), pool-takarítás. Laptopon (integrált Intel GPU, Windows) egy ilyen olvasás átlag **~190–225 µs**, váltásonként kettő, a granite 24 rétegén tokenenként ~10 ms. A HIP ugyanezt két ~10–20 µs-os `hipMemcpy`-vel fizeti (felhasználói módú sor, pörgő szinkron). A coder 48 rétegén ~96 visszaolvasás tokenenként: ez a NAS-on mért 16–20 ms nagyságrendje. A végrehajtás helye tehát egyezik, **a különbség a váltásonkénti költség**.
 
 ## A javítás (csak ggml-vulkan; alapból be, `GGML_VK_LOW_LATENCY_SYNC=0` a régi út, tesztkapcsoló)
 1. **Előreolvasás a split-határon** (`vk_readahead`): egy kis gráf (a 2. lépés `defer_last_submit` feltétele) szinkronja után az eszköz megjegyzi, mely tartományokat olvasták vissza szinkron (a gráf azonosítója: kontextus, gráfcím, csomópontszám, első/utolsó csomópont és címe). Amikor ugyanez a gráf legközelebb szinkronizál, a megjegyzett tartományok másolása a gráf nyitott parancspufferébe kerül (barrier, `copyBuffer` egy gazda-oldali (host-cached) pufferbe, HOST-barrier), **ugyanazzal az egy beküldéssel és kerítéssel**. A szinkron olvasás, ha a tartomány benne van és azóta semmilyen beküldés (és a gazda semmit nem írt az eszköz memóriájába) nem történt, csak `memcpy`. Érvényesség: minden `vkQueueSubmit` (a queue-handle-ben, egy helyen) és minden gazda-oldali írás az eszköz memóriájába növel egy eszközszintű számlálót; az előreolvasás csak a saját beküldésének számlálóértékénél érvényes. Ha a minta változik, az olvasás a rendes úton megy (és a mintát újratanulja). GPU→CPU váltásonként így **1 beküldés + 1 pörgő várás**, mint a HIP stream-szinkronja, a két külön kör nélkül.
@@ -147,22 +147,22 @@ ROCm-oldal: a kódból (ggml-cuda és a scheduler) levezetve; Vulkan-oldal: a k�
 3. **Sűrűbb kerítés-lekérdezés kis gráf után:** a pörgő várás 1000 helyett 10 `pause`-onként kérdezi a kerítést (a 1000 `pause` a mai x86 magokon több tíz µs).
 4. **Mérés:** `GGML_SCHED_TIMING=N` mellett 2 másodpercenként egy Vulkan-sor: `ggml_vulkan: sched timing: per second: G graph recordings g us, S synchronizes s us, R sync reads r us (H from the read-ahead), W sync writes w us`.
 
-## Eredmény (laptop, Iris Xe; a kimenet bájtra azonos)
+## Eredmény (laptop, integrált Intel GPU; a kimenet bájtra azonos)
 | futás | tg tok/s | CPU `input copies` / gráf | sync read |
 |---|---|---|---|
 | granite MoE, szakértők a CPU-n, régi út (`GGML_VK_LOW_LATENCY_SYNC=0`) | 23,9–25,3 | 24,5–29,3 ms | 193–225 µs, 0 előreolvasásból |
 | ugyanez, új út | **31,8** | 15,9 ms | 0,6 µs, mind előreolvasásból |
 | qwen2.5-1.5B sűrű, FFN a CPU-n (a bemenet nem nézet: aszinkron visszaolvasás, 2. lépés) | 13,3–13,7 régi / 12,6–13,8 új | – | nincs szinkron olvasás |
-A laptopon a split lassabb a csak-CPU-snál (granite 45,6 tok/s), mert az Iris Xe-n a GPU-s figyelés rétegenként ~0,7 ms; ez a diszkrét kártyán nem áll fenn. Kimenet: granite split új = régi (389 karakter), qwen2.5 FFN-split új = régi (751 karakter), bájtra.
+A laptopon a split lassabb a csak-CPU-snál (granite 45,6 tok/s), mert az integrált GPU-n a GPU-s figyelés rétegenként ~0,7 ms; ez a diszkrét kártyán nem áll fenn. Kimenet: granite split új = régi (389 karakter), qwen2.5 FFN-split új = régi (751 karakter), bájtra.
 
 # 5. lépés: a maradék MoE-többlet és a host-memória (Vulkan)
 
-**Hiba (NAS, RX 6700, az előreolvasásos build):** qwen3-coder:30b, auto zónák, dual-buffer: Vulkanon ~26 tok/s, ROCm-on ~35, csak CPU-n ~21,5 (tokenenként ~10 ms többlet); gpt-oss:20b Vulkanon ~30, ROCm-on ~40–44. Az OS szerint mindkét backend ~30 GB RAM-ot foglal; Vulkanon ebből ~15 GB (`Vulkan_Host`) a GPU-meghajtón át, GTT-ként, ezt a konténer cgroupja és az RSS nem látja.
+**Hiba (NAS, RDNA2-es kártya, az előreolvasásos build):** qwen3-coder:30b, auto zónák, dual-buffer: Vulkanon ~26 tok/s, ROCm-on ~35, csak CPU-n ~21,5 (tokenenként ~10 ms többlet); gpt-oss:20b Vulkanon ~30, ROCm-on ~40–44. Az OS szerint mindkét backend ~30 GB RAM-ot foglal; Vulkanon ebből ~15 GB (`Vulkan_Host`) a GPU-meghajtón át, GTT-ként, ezt a konténer cgroupja és az RSS nem látja.
 
 ## A host-pufferek memóriatípusa (kódból; a laptopon a naplósorral mérve)
 Minden puffer, amelyet a CPU olvas, a `Vulkan_Host` puffertípusból (`ggml_vk_host_malloc`) vagy egy staging pufferből jön:
 
-| puffer | ki olvassa | kért típus (sorrendben) | RADV, diszkrét kártya (NAS) | laptop (Iris Xe, Windows, naplóból) |
+| puffer | ki olvassa | kért típus (sorrendben) | RADV, diszkrét kártya (NAS) | laptop (integrált Intel GPU, Windows, naplóból) |
 |---|---|---|---|---|
 | dual-buffer eredeti formájú példány, a nem repackelhető súlyok (pl. q6_K szakértők), flex host-példány, park-példány, a CPU compute és kimeneti puffere | CPU (generálás), GPU (op offload másolás) | HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED, utána HOST_VISIBLE\|HOST_COHERENT | GTT, HOST_CACHED típus (snoopolt, gyorsítótárazott); a meghajtó foglalja, a cgroup nem látja | 2-es típus: DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT\|HOST_CACHED (UMA) |
 | `sync_staging` (visszaolvasás), előreolvasás staging | CPU | ugyanaz | ugyanaz | ugyanaz |
@@ -182,12 +182,12 @@ A Vulkan-sor most részletesebb: `per second: R graph recordings r us, P replays
 |---|---|---|---|
 | gráf-rögzítés (CPU) | 25 × 76–79 µs = **~1,9 ms** | 25 × 23–25 µs = **~0,6 ms** (aláírás + beillesztés) | kernelindítások, a GPU már fut közben |
 | beküldés (`vkQueueSubmit`) | 25 × 22–26 µs = ~0,6 ms | ugyanannyi | ajtócsengő (felhasználói módú sor) |
-| GPU-rész (beküldéstől a kerítésig) | 25 × ~440 µs = ~11 ms (Iris Xe; a diszkrét kártyán sokkal kevesebb) | ugyanannyi | a stream szinkronja |
+| GPU-rész (beküldéstől a kerítésig) | 25 × ~440 µs = ~11 ms (integrált Intel GPU; a diszkrét kártyán sokkal kevesebb) | ugyanannyi | a stream szinkronja |
 | visszaolvasás | ~49, mind előreolvasásból, 0,5 µs | ugyanaz | `hipMemcpy` D2H |
 | szinkron bemenetírás | ~33 × 1,2–1,4 µs (UMA: közvetlen memcpy) | ugyanaz | `hipMemcpy` H2D |
 | CPU-rész (szakértők) | ~8,4 ms gráfonként | ugyanaz | ugyanaz |
 
-A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögzítés**: a HIP a kerneleket rögtön indítja és a GPU közben dolgozik, a Vulkan előbb a teljes parancspuffert rögzíti (a GPU addig áll). A beküldés és a GPU-várás a HIP-ben is megvan (más formában). A tok/s a laptopon alig mozdul (41,8–44,6 újrajátszással, 42,3–43,6 nélküle), mert itt a GPU-rész (Iris Xe, ~11 ms) és a közös memória-sávszélesség dominál; a diszkrét kártyán a rögzítés közvetlenül a tokenidőhöz adódik.
+A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögzítés**: a HIP a kerneleket rögtön indítja és a GPU közben dolgozik, a Vulkan előbb a teljes parancspuffert rögzíti (a GPU addig áll). A beküldés és a GPU-várás a HIP-ben is megvan (más formában). A tok/s a laptopon alig mozdul (41,8–44,6 újrajátszással, 42,3–43,6 nélküle), mert itt a GPU-rész (integrált Intel GPU, ~11 ms) és a közös memória-sávszélesség dominál; a diszkrét kártyán a rögzítés közvetlenül a tokenidőhöz adódik.
 
 ## A javítás: a változatlan split-gráfok parancspufferének újrajátszása (`vk_replay`, csak ggml-vulkan)
 1. **Mikor:** kis gráf (a 2. lépés `defer_last_submit` feltétele: < 1 GFLOP, egy beküldés), alacsony késleltetésű mód, nincs perf logger és debug marker.
@@ -200,7 +200,7 @@ A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögz
 **Eredmény (laptop):** granite split: rögzítés 82–87 ms/s → újrajátszás 26–28 ms/s; 10 futás újrajátszással, 6 nélküle és 4 kényszerített rögzítési hibával: futásonként (200, ill. 120 token) a kimenet mind bájtra azonos. qwen2.5-1.5B sűrű, FFN a CPU-n: rögzítés 46 ms/s → 10 ms/s, kimenet azonos (751 karakter); teljes GPU és auto zónák (nagy gráfok, nincs újrajátszás): azonos.
 
 ## Ami nem változott, és miért
-- **Szinkron bemenetírások (OPEN-QUESTIONS 22):** a laptopon UMA miatt az eszközpuffer host-látható, az írás közvetlen memcpy (1,2 µs); a diszkrét kártya útja (staging + beküldés + várás) itt nem kényszeríthető ki (az UMA-ág a `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM` előtt dönt). A RX 6700-on ReBAR-ral ugyanez a közvetlen út megy, nélküle bemenetenként egy beküldés. A halasztott írás (a következő beküldés elé) minden olvasási és beküldési utat érint; diszkrét kártya nélkül a helyessége nem ellenőrizhető, ezért nincs benne. A NAS-sor (`sync writes N us`) megmutatja, kell-e (OPEN-QUESTIONS 26).
+- **Szinkron bemenetírások (OPEN-QUESTIONS 22):** a laptopon UMA miatt az eszközpuffer host-látható, az írás közvetlen memcpy (1,2 µs); a diszkrét kártya útja (staging + beküldés + várás) itt nem kényszeríthető ki (az UMA-ág a `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM` előtt dönt). Az RDNA2-es kártyán ReBAR-ral ugyanez a közvetlen út megy, nélküle bemenetenként egy beküldés. A halasztott írás (a következő beküldés elé) minden olvasási és beküldési utat érint; diszkrét kártya nélkül a helyessége nem ellenőrizhető, ezért nincs benne. A NAS-sor (`sync writes N us`) megmutatja, kell-e (OPEN-QUESTIONS 26).
 - **A beküldés és a kerítés-várás váltásonként:** a Vulkan API része (egy `vkQueueSubmit` és egy kerítés); a HIP felhasználói módú sora és memóriajel-alapú szinkronja ennél olcsóbb. A NAS-mérés (`submissions`, `GPU waits` átlaga a ROCm `final wait`-jéhez képest) dönti el, mennyi marad (OPEN-QUESTIONS 25).
 
 ## RAM-könyvelés
@@ -208,7 +208,7 @@ A laptopon a Vulkan-útból jövő, a ROCm-on nem létező rész a **gráf-rögz
 - Ollama: a `host memory:` sorból kiolvasott értékről naplósor (`dualbuf: runner driver host memory not seen by the memory cgroup uncharged_mib=...`), és javítva a dupla számolás: ha a `ram_limit` egy rendszer-olvasást ír felül (nincs cgroup-korlát), a használat a rendszeré, abban a GTT már benne van; eddig ilyenkor is hozzáadódott. Most csak cgroup-ból olvasott használathoz adódik (`RAM.UsedFrom`).
 
 # 6. lépés: a GPU órajele (compute-teljesítményállapot)
-**Mérés (NAS, RX 6700, image 679b2aa):** azonos elrendezés mellett ROCm 38,4–39,4, Vulkan 25,5, csak CPU ~24,6 tok/s (coder); generálás közben a GPU órajele ROCm alatt 2670 MHz, Vulkan alatt 500–630 MHz. Egy mellette futó ROCm-folyamattal a Vulkan is 2670 MHz-en fut: 38,99 tok/s. A különbség tehát nem a Vulkan-útban volt (az 2–3 ms tokenenként), hanem a meghajtó energiaprofiljában: az amdgpu aktív KFD-sor mellett vált compute profilra.
+**Mérés (NAS, RDNA2-es kártya, image 679b2aa):** azonos elrendezés mellett ROCm 38,4–39,4, Vulkan 25,5, csak CPU ~24,6 tok/s (coder); generálás közben a GPU órajele ROCm alatt 2670 MHz, Vulkan alatt 500–630 MHz. Egy mellette futó ROCm-folyamattal a Vulkan is 2670 MHz-en fut: 38,99 tok/s. A különbség tehát nem a Vulkan-útban volt (az 2–3 ms tokenenként), hanem a meghajtó energiaprofiljában: az amdgpu aktív KFD-sor mellett vált compute profilra.
 
 | | ROCm | Vulkan előtte | Vulkan most |
 |---|---|---|---|

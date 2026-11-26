@@ -1,4 +1,4 @@
-BIN=${BIN:-/c/b/c16/bin/llama-server.exe}
+BIN=${BIN:?set BIN to the llama-server binary}
 M=${MODEL:?set MODEL to a GGUF (qwen3:0.6b)}
 D=$(pwd)/slots; P=18124
 PROMPT=$(for i in $(seq 1 60); do printf 'The quick brown fox jumps over the lazy dog number %d. ' $i; done)

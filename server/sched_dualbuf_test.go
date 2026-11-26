@@ -122,7 +122,7 @@ func TestDualbufModelOptionsPrecedence(t *testing.T) {
 }
 
 func TestDualbufVictimSameDevice(t *testing.T) {
-	s := dualbufTestScheduler(t, "devices:\n  x080: { backend: rocm, match: \"03:00.0\" }\n  rx550: { backend: vulkan, match: \"RX 550\" }\nswap:\n  enabled: true\n")
+	s := dualbufTestScheduler(t, "devices:\n  gpu0: { backend: rocm, match: \"aa:00.0\" }\n  gpu1: { backend: vulkan, match: \"Test GPU B\" }\nswap:\n  enabled: true\n")
 	cfg := s.dualbuf.Config()
 	mk := func(path, dev string, lastUsed int64, refs uint) *runnerRef {
 		m := &Model{ModelPath: path, dualbuf: &dualbufLoad{cfg: cfg, placement: dev}}
@@ -132,11 +132,11 @@ func TestDualbufVictimSameDevice(t *testing.T) {
 		s.loaded[r.modelKey] = r
 		return r
 	}
-	mk("/m/old-on-rx550", "rx550", 1, 0)
-	newer := mk("/m/new-on-x080", "x080", 30, 0)
-	older := mk("/m/old-on-x080", "x080", 20, 0)
-	busy := mk("/m/busy-on-x080", "x080", 10, 1)
-	req := &LlmRequest{model: &Model{ModelPath: "/m/want", dualbuf: &dualbufLoad{cfg: cfg, placement: "x080"}}}
+	mk("/m/old-on-gpu1", "gpu1", 1, 0)
+	newer := mk("/m/new-on-gpu0", "gpu0", 30, 0)
+	older := mk("/m/old-on-gpu0", "gpu0", 20, 0)
+	busy := mk("/m/busy-on-gpu0", "gpu0", 10, 1)
+	req := &LlmRequest{model: &Model{ModelPath: "/m/want", dualbuf: &dualbufLoad{cfg: cfg, placement: "gpu0"}}}
 	v := s.dualbufVictim(req)
 	if v != older || !older.dualbufPark.Load() {
 		t.Fatalf("victim %s park %v", v.modelPath, v.dualbufPark.Load())

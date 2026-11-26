@@ -6,7 +6,7 @@
 - **Helyette:** a patch-elt `llama-server.exe`-t közvetlenül indítottam ugyanazokkal a kapcsolókkal, amelyeket az Ollama ad (`llm/llama_server.go`: `--model --port --host --no-webui --offline -c -np --log-verbosity 4 --no-log-prefix --no-log-timestamps --load-mode none --flash-attn auto -b 512 -ub 512 -ngl 14`), `GGML_BACKEND_PATH`-szel a Vulkan backendre, és az env-változókkal. A llama-server oldala (amire a dual-buffer hat) így ugyanaz; az Ollama-oldal (kapcsoló-átadás, env-öröklés) a forrásból igazolt (DESIGN.md 2., 4.), futtatással nem.
 
 ## Beállítás
-Qwen2.5-1.5B Q4_K_M (`../llama-dualbuf/models`), Intel Iris Xe iGPU (Vulkan0), 4 szál, `-ngl 14`, `--load-mode none`, 2251 tokenes prompt (ismételt mondat), `cache_prompt=false`, `temperature=0`, 48 generált token, 1 bemelegítő + 3 mért kérés. Eszköz: `tools/dualbuf/bench-server.ps1`. Módok:
+Qwen2.5-1.5B Q4_K_M (`../llama-dualbuf/models`), integrált Intel GPU (Vulkan0), 4 szál, `-ngl 14`, `--load-mode none`, 2251 tokenes prompt (ismételt mondat), `cache_prompt=false`, `temperature=0`, 48 generált token, 1 bemelegítő + 3 mért kérés. Eszköz: `tools/dualbuf/bench-server.ps1`. Módok:
 - `host` = alapviselkedés, **LLAMA_ARG_DUAL_BUFFER nélkül** (a host-puffer nyer, a CPU-s súly `Vulkan_Host`-ban);
 - `repack` = `LLAMA_ARG_NO_HOST=1` (a CPU-s súly `CPU_REPACK`-ben, nincs op offload a repackelt súlyokra);
 - `dual` = `LLAMA_ARG_DUAL_BUFFER=1`.
@@ -49,7 +49,7 @@ A napló: `flex layers 15-16: 24 weights with a CPU copy (53,72 MiB), 12 with a 
 # Többmodelles munka: laptopos tesztek (multimodel branch)
 
 ## KV-mentés és -visszatöltés (llama-server slot save/restore), 2026-11-23
-Fork llama-server (b12177 + 001 + 003 + 004, CPU, `C:\b\c16`), qwen3:0.6b, `-np 1 -ngl 0 --load-mode none`, 832 tokenes prompt, 16 generált token, `temperature 0`. Mentés `-c 4096`-tal, visszatöltés új folyamatba. Szkriptek: `tools/dualbuf/multimodel/slot-restore.sh`, `slot-restore-edge.sh` (`MODEL=<gguf>`, `BIN=<llama-server>`).
+Fork llama-server (b12177 + 001 + 003 + 004, CPU, `<BUILD_DIR>`), qwen3:0.6b, `-np 1 -ngl 0 --load-mode none`, 832 tokenes prompt, 16 generált token, `temperature 0`. Mentés `-c 4096`-tal, visszatöltés új folyamatba. Szkriptek: `tools/dualbuf/multimodel/slot-restore.sh`, `slot-restore-edge.sh` (`MODEL=<gguf>`, `BIN=<llama-server>`).
 
 | visszatöltés ide | eredmény | a következő azonos kérés | kimenet |
 |---|---|---|---|
@@ -63,7 +63,7 @@ Fork llama-server (b12177 + 001 + 003 + 004, CPU, `C:\b\c16`), qwen3:0.6b, `-np 
 Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is visszatölthető, ha a mentett tokenek elférnek; a dinamikus KV-val is (a KV a visszatöltéskor nő). Eltérő KV-típusnál a llama-server maga is elutasítja; a fork ezt előre szűri (`KVMeta.Compatible`, a fájlnévben is benne a KV-típus), hogy a hibasor el se jöjjön.
 
 ## Az Ollama a multimodel-kóddal, laptopon (Vulkan iGPU + CPU), 2026-11-23
-- Bináris: `ollama.exe` a `multimodel-ci` workflow Windows-buildjéből (`0.40.16-mm-3d5b17c`, majd `-0789900`), mellette `lib/ollama`: a fork CPU-s llama-servere (b12177 + 001 + 003 + 004, `C:\b\c16`) és a hozzá fordított `vulkan/ggml-vulkan.dll` (`C:\b\v16`). Intel Iris Xe (Vulkan0, `OLLAMA_IGPU_ENABLE=1`, Windowson PCI-cím nélkül), 16 GB RAM (a teszt alatt ~0,5–2 GB szabad).
+- Bináris: `ollama.exe` a `multimodel-ci` workflow Windows-buildjéből (`0.40.16-mm-3d5b17c`, majd `-0789900`), mellette `lib/ollama`: a fork CPU-s llama-servere (b12177 + 001 + 003 + 004, `<BUILD_DIR>`) és a hozzá fordított `vulkan/ggml-vulkan.dll` (`C:\b\v16`). integrált Intel GPU (Vulkan0, `OLLAMA_IGPU_ENABLE=1`, Windowson PCI-cím nélkül), a laptop RAM-ja (a teszt alatt ~0,5–2 GB szabad).
 - Modellek (`ollama create` a GGUF-okból): `qwen25:1.5b` (Q4_K_M), `qwen3:0.6b`, `qwen3-embedding:0.6b`. Config: `tools/dualbuf/multimodel/laptop-dualbuf.yaml`; szkriptek: `serve.sh`, `gen.sh`, `busy.sh`, `swap.sh` (ugyanott).
 
 | eset | eredmény |
@@ -71,7 +71,7 @@ Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is v
 | config nélkül | az indítósor a gyári: `-c 4096 -np 1 ... --flash-attn auto -b 512 -ub 512 --context-shift --keep 4`; nincs `dualbuf` naplósor |
 | config megjelenése futó modell mellett | a config nélkül betöltött példány változatlanul szolgál (0,01 s „betöltés”); a config a kirakás utáni betöltéskor lép életbe |
 | erősorrend, naplósor | `dualbuf effective settings ... devices=[igpu,cpu](model:qwen25:1.5b) ... dual_buffer=true(defaults) ... max_context=8192(model:...) keep_alive=10m0s(defaults) parallel=1(builtin) ...`; a llama-server: `-c 8192`, `--split-mode none --main-gpu 0`, a naplóban `auto zones`, `dual-buffer`, `set_dynamic: dynamic KV: 4096 -> 8192 cells ... 28 by copy` (Vulkanon másolással nő) |
-| eszközazonosítás | `dualbuf devices matched="cpu=CPU, igpu=Vulkan Vulkan0 \"Intel(R) Iris(R) Xe Graphics\" no PCI id"` (név szerint) |
+| eszközazonosítás | `dualbuf devices matched="cpu=CPU, igpu=Vulkan Vulkan0 \"<integrált Intel GPU>\" no PCI id"` (név szerint) |
 | futási korlát, `on_busy: next` | A (qwen25) az igpu-n generál; B (qwen3, `next`) 0 s várakozással a CPU-ra kerül, `-ngl 0`-s CPU-s példány indul (repack) |
 | `on_busy: wait`, lejár | C (qwen25, `wait_timeout 3s`) 3,04 s után továbblép; ha a CPU is foglalt, sorba áll, és az elsőként felszabaduló eszközt kapja (`reason=queued waited=17.571s`) |
 | `on_busy: wait`, időben felszabadul | C 1,5 s várakozás után az igpu-t kapja (`reason=waited`) |
@@ -83,7 +83,7 @@ Következtetés: azonos modellre és KV-típusra eltérő max kontextusnál is v
 
 Nem tesztelt a laptopon: a VRAM-hiány miatti csere (az iGPU szabad memóriája nem változik, ezért a `MAX_LOADED_MODELS` váltotta ki; ugyanaz az áldozatválasztás fut), két GPU, a GPU+CPU megosztott modell CPU-helye (egységteszt: `TestCoordAlsoCPU`), a fájlzárolás (Linux), ROCm. Ezek a `NAS-TESTS.md`-ben.
 
-## Dinamikus KV Vulkanon az Ollamán át (laptop, Iris Xe), 2026-11-23
+## Dinamikus KV Vulkanon az Ollamán át (laptop, integrált Intel GPU), 2026-11-23
 `qwen25:1.5b`, config: `max_context: 8192`, `dynamic_kv: true` (defaults). 7128 tokenes prompt („What color is the frog?”).
 - Dinamikus KV: `set_dynamic: dynamic KV: 4096 -> 8192 cells ... 28 by copy`, a promptnál `relayout: KV 4096 -> 8192 cells (... 28 new by copy) 160.4 ms: alloc 119.7, copy 36.3, free 4.0`, `zones_state ... KV 8192 cells (224 MiB on the device)`. Válasz: „The color of the frog is green.”
 - Ugyanez a kérés `options.dynamic_kv: false`-szal: a naplósor `dynamic_kv=false(request)`, az ujjlenyomat eltér, újratöltés; az új folyamatban nincs `auto zones`/`set_dynamic` sor (statikus KV). Válasz: ugyanaz.
@@ -91,7 +91,7 @@ Nem tesztelt a laptopon: a VRAM-hiány miatti csere (az iGPU szabad memóriája 
 
 # Többmodelles munka, 2. kör: Vulkan sparse KV és folyamaton belüli csere (laptop, 2026-11-23)
 
-## Vulkan sparse KV (llama-server közvetlenül; csaki89/llama.cpp `multimodel`, Iris Xe)
+## Vulkan sparse KV (llama-server közvetlenül; csaki89/llama.cpp `multimodel`, integrált Intel GPU)
 qwen2.5-1.5B Q4_K_M, `--auto-zones -fa on --load-mode none`; szkript: llama.cpp `tools/dualbuf/vk-sparse-grow.sh`.
 - `ggml_backend_vk_vmm_arena_new: Vulkan0: sparse KV buffers: block 65536, chunk 2097152 bytes`; `set_dynamic: ... growth on the device: 28/28 layers in place (VMM)`.
 - `-c 8192`, ~7000 tokenes prompt: `relayout: KV 4096 -> 8192 cells (... 28 grown in place, 0 new by copy ...) 171.7 ms`; új rövid kérés: `KV 8192 -> 4096 cells (... 28 shrunk in place ...) 32.9 ms`. A válasz azonos a `GGML_VK_SPARSE=0`-s (másolásos, `no growable (sparse) KV buffers: GGML_VK_SPARSE=0; the KV grows by copy`) futáséval.
@@ -113,7 +113,7 @@ Config: `tools/dualbuf/multimodel/laptop-dualbuf.yaml` (`swap: { enabled: true, 
 - Javított hiba a mérés közben: a parkolt példány RAM-áldozatként busy-loopot okozott (az ütemező a parkoltakat a betöltött-számlálóból is kivonta); most csak a `MAX_LOADED_MODELS`-összevetésből maradnak ki.
 
 # Vulkan–ROCm egyezés (1. lépés), laptop, 2026-11-24
-llama-server közvetlenül (csaki89/llama.cpp `multimodel` e795e5860), Intel Iris Xe (Vulkan, UMA), qwen2.5-1.5B Q4_K_M, `--auto-zones --dual-buffer -fa on --load-mode none`; szkript: llama.cpp `tools/dualbuf/vk-parity.sh` (egy ~11 000 vagy ~21 000 tokenes, majd két rövid kérés). Felmérés és eredmény: `docs/VULKAN-PARITY.md`.
+llama-server közvetlenül (csaki89/llama.cpp `multimodel` e795e5860), integrált Intel GPU (Vulkan, UMA), qwen2.5-1.5B Q4_K_M, `--auto-zones --dual-buffer -fa on --load-mode none`; szkript: llama.cpp `tools/dualbuf/vk-parity.sh` (egy ~11 000 vagy ~21 000 tokenes, majd két rövid kérés). Felmérés és eredmény: `docs/VULKAN-PARITY.md`.
 
 | futás | beállítás | napló (lényeg) | kimenet |
 |---|---|---|---|
@@ -126,7 +126,7 @@ llama-server közvetlenül (csaki89/llama.cpp `multimodel` e795e5860), Intel Iri
 A darab mért visszaadási egysége előtt (64 KiB-os darab) a zsugorítás 196 MiB-ból csak 72 MiB-ot adott vissza: ezért került a darabválasztásba (`release unit`).
 
 # Vulkan, 2. lépés (laptop, 2026-11-24, csak célzott ellenőrzés)
-llama-server (csaki89/llama.cpp `multimodel`, f8133efac..bbd033c19), Iris Xe, qwen2.5-1.5B Q4_K_M, `vk-parity.sh` (egy ~11 000 tokenes, majd két rövid kérés); minden kimenet bájtra egyezik a `--auto-zones` nélküli referenciával.
+llama-server (csaki89/llama.cpp `multimodel`, f8133efac..bbd033c19), integrált Intel GPU, qwen2.5-1.5B Q4_K_M, `vk-parity.sh` (egy ~11 000 tokenes, majd két rövid kérés); minden kimenet bájtra egyezik a `--auto-zones` nélküli referenciával.
 
 | ellenőrzés | beállítás | eredmény |
 |---|---|---|
@@ -139,7 +139,7 @@ llama-server (csaki89/llama.cpp `multimodel`, f8133efac..bbd033c19), Iris Xe, qw
 | split-generálás | `-ngl 99 -ot "ffn_(up\|down\|gate)=CPU"` (58 split), `GGML_SCHED_TIMING=48` | CPU input copies 25,8 ms/gráf, Vulkan compute 3,9 + final wait 14,5 ms; `GGML_VK_ASYNC_READBACK=1`: 13,9 vs 13,9 tok/s (nincs különbség) |
 
 # Vulkan split-határ (laptop, 2026-11-25)
-llama.cpp `multimodel` 1d415f877, Iris Xe, qwen2.5-1.5B Q4_K_M, `-ngl 99 -ot "ffn_(up|down|gate)=CPU,attn_(q|k|v|output)\.weight=CPU"` (a GPU-n csak kis műveletek: 282 split tokenenként, 141 GPU→CPU váltás), 96 token generálás, `GGML_SCHED_TIMING=48`, három felváltott pár (a laptop hőfüggő, ezért ugyanazzal a binárissal, `GGML_VK_LOW_LATENCY_SYNC=0/1`):
+llama.cpp `multimodel` 1d415f877, integrált Intel GPU, qwen2.5-1.5B Q4_K_M, `-ngl 99 -ot "ffn_(up|down|gate)=CPU,attn_(q|k|v|output)\.weight=CPU"` (a GPU-n csak kis műveletek: 282 split tokenenként, 141 GPU→CPU váltás), 96 token generálás, `GGML_SCHED_TIMING=48`, három felváltott pár (a laptop hőfüggő, ezért ugyanazzal a binárissal, `GGML_VK_LOW_LATENCY_SYNC=0/1`):
 
 | gráfonként (tokenenként) | előtte (=0) | utána (=1) |
 |---|---|---|

@@ -277,7 +277,7 @@ int main() {
     CHECK(pick_chunk(1024, 2*MiB, 2*MiB) == 2*MiB, "minimum granularity 2 MiB");
     // the automatic chunk: the measured booking unit decides, the driver's booking then equals the mapped size
     struct { size_t gmin, grec, drv, want_chunk, want_unit; const char * what; } cases[] = {
-        { 4*KiB, 4*KiB,  2*MiB, 2*MiB, 2*MiB, "RX 6700 / amdgpu KFD: granularity 4 KiB, booking 2 MiB" },
+        { 4*KiB, 4*KiB,  2*MiB, 2*MiB, 2*MiB, "RDNA2 / amdgpu KFD: granularity 4 KiB, booking 2 MiB" },
         { 4*KiB, 4*KiB,  0,     2*MiB, 4*KiB, "a driver that books the size: the alignment" },
         { 4*KiB, 4*KiB,  8*MiB, 8*MiB, 8*MiB, "a larger booking unit raises the chunk and the alignment" },
         { 2*MiB, 2*MiB,  2*MiB, 2*MiB, 2*MiB, "CUDA-like: granularity 2 MiB" },

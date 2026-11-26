@@ -49,8 +49,8 @@ func TestEvictionOrderAndPlan(t *testing.T) {
 
 func TestKVFiles(t *testing.T) {
 	from, to := t.TempDir(), t.TempDir()
-	prefix := KVPrefix("sha256:0123456789abcdef0123", "x080", "")
-	if prefix != "kv-0123456789abcdef-x080-f16" {
+	prefix := KVPrefix("sha256:0123456789abcdef0123", "gpu0", "")
+	if prefix != "kv-0123456789abcdef-gpu0-f16" {
 		t.Fatalf("prefix %s", prefix)
 	}
 	if err := os.WriteFile(filepath.Join(from, SlotFileName(prefix, 0)), []byte("kv"), 0o644); err != nil {
@@ -85,7 +85,7 @@ func TestKVFiles(t *testing.T) {
 func TestManagerParkAndPresent(t *testing.T) {
 	m := NewManager(filepath.Join(t.TempDir(), ConfigFileName), nil)
 	c := mustParse(t, exampleConfig)
-	if got := m.Present(c, []string{"x080", "cpu"}); len(got) != 2 {
+	if got := m.Present(c, []string{"gpu0", "cpu"}); len(got) != 2 {
 		t.Fatalf("before discovery all devices count as present: %v", got)
 	}
 	m.NoteDevices(nil)
