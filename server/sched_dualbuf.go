@@ -219,6 +219,11 @@ func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServer
 	if unch := s.dualbufHostUncharged(nil); unch > 0 {
 		config.ExtraEnv["LLAMA_ARG_RAM_UNCHARGED_MIB"] = strconv.FormatUint(unch>>20, 10)
 	}
+	// reserve_mib of the GPU the model is placed on: its fit target (and the zones margin), else LLAMA_ARG_FIT_TARGET applies
+	if mib, ok := db.cfg.GPUReserveMiB(db.placement); ok {
+		config.ExtraEnv["LLAMA_ARG_FIT_TARGET"] = strconv.Itoa(mib)
+		slog.Info("dualbuf: device VRAM reserve", "model", db.eff.Model, "device", db.placement, "reserve_mib", mib)
+	}
 	config.ArgOverrides = db.launch.Args
 	config.KVCacheType = db.launch.KVType
 	if db.cfg.SwapEnabled() && db.cfg.Swap.KeepInRAM == multimodel.KeepInRAMPinned && db.placement != multimodel.DeviceCPU {
@@ -295,8 +300,8 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 			ram.Limit, ram.Source = ram.Used+mib<<20, "env override"
 		}
 	}
-	// a reserve like the llama-server RAM guard: the eviction comes before the cgroup limit is reached
-	need += multimodel.RAMReserve(ram.Limit)
+	// the RAM reserve (reserve_mib of the cpu device, else like the llama-server RAM guard): the eviction comes before the limit is reached
+	need += db.cfg.RAMReserve(ram.Limit)
 
 	var cands []multimodel.Candidate
 	for _, p := range s.dualbuf.ParkedList() {

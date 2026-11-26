@@ -19,15 +19,19 @@ func dualbufTestScheduler(t *testing.T, config string) *Scheduler {
 			t.Fatal(err)
 		}
 	}
-	return &Scheduler{loaded: map[string]*runnerRef{}, dualbuf: multimodel.NewManager(p, func(string) string { return "" })}
+	m := multimodel.NewManager(p, func(string) string { return "" })
+	if err := m.Load(); err != nil {
+		t.Fatal(err)
+	}
+	return &Scheduler{loaded: map[string]*runnerRef{}, dualbuf: m}
 }
 
 const dualbufTestConfig = `
-defaults:
+default:
   max_context: 8192
   keep_alive: 30m
 devices:
-  cpu: { max_running: 1 }
+  cpu: { backend: cpu, max_running: 1 }
 models:
   small:latest:
     devices: [cpu]
@@ -122,7 +126,7 @@ func TestDualbufModelOptionsPrecedence(t *testing.T) {
 }
 
 func TestDualbufVictimSameDevice(t *testing.T) {
-	s := dualbufTestScheduler(t, "devices:\n  gpu0: { backend: rocm, match: \"aa:00.0\" }\n  gpu1: { backend: vulkan, match: \"Test GPU B\" }\nswap:\n  enabled: true\n")
+	s := dualbufTestScheduler(t, "default: {}\ndevices:\n  gpu0: { backend: rocm, match: \"aa:00.0\" }\n  gpu1: { backend: vulkan, match: \"Test GPU B\" }\nswap:\n  enabled: true\n")
 	cfg := s.dualbuf.Config()
 	mk := func(path, dev string, lastUsed int64, refs uint) *runnerRef {
 		m := &Model{ModelPath: path, dualbuf: &dualbufLoad{cfg: cfg, placement: dev}}

@@ -1,7 +1,8 @@
 // Package multimodel holds the dual-buffer fork's multi-model settings
-// (<models>/dualbuf.yaml): per model devices, running limits, the zones and
-// KV switches, keep alive, and the swap and KV saving rules. Without a config
-// file nothing here changes the scheduler.
+// (<models>/dualbuf.yaml): the devices (GPUs and the CPU) with their running limits and reserves, the
+// default section and the per model sections (device list, busy rule, keep alive, the zones and KV
+// switches), and the swap and KV saving rules. The file is read once, at the server start; a broken file
+// stops the start. Without a config file nothing here changes the scheduler.
 package multimodel
 
 import (
@@ -22,21 +23,32 @@ import (
 
 // Config is the parsed and validated dualbuf.yaml.
 type Config struct {
-	Defaults Settings            `yaml:"defaults"`
-	Devices  map[string]Device   `yaml:"devices"`
-	Models   map[string]Settings `yaml:"models"`
-	Swap     Swap                `yaml:"swap"`
+	// Default is the required default section: the settings of the models without their own section, and the
+	// base of the fields a model section leaves out
+	Default *Settings           `yaml:"default"`
+	Devices map[string]Device   `yaml:"devices"`
+	Models  map[string]Settings `yaml:"models"`
+	Swap    Swap                `yaml:"swap"`
 	// RAMLimit caps the RAM the scheduler plans with below the container limit (e.g. "90GiB"); empty: the cgroup limit
 	RAMLimit string `yaml:"ram_limit"`
+	// OldDefaults is the earlier name of the default section: an error that names the new one
+	OldDefaults any `yaml:"defaults"`
 
+	// Defaults is the default section (empty when the config was not parsed)
+	Defaults      Settings `yaml:"-"`
+	modelOrder    []string // the models keys in file order (the first matching pattern wins)
 	ramLimitBytes uint64
 }
 
-// Device is one entry of the devices section. "cpu" is built in and takes no backend or match.
+// Device is one entry of the devices section: a GPU (backend rocm, vulkan, cuda or metal, matched by its PCI
+// address or a part of its name) or the CPU (the entry named "cpu", backend cpu, no match).
 type Device struct {
 	Backend    string `yaml:"backend"`
 	Match      string `yaml:"match"`
 	MaxRunning *int   `yaml:"max_running"`
+	// ReserveMiB: on a GPU the VRAM kept free on it (the llama-server fit target, also the zones' margin; default
+	// LLAMA_ARG_FIT_TARGET); on the CPU the reserve of the whole RAM budget (default max(1 GiB, 5% of the limit))
+	ReserveMiB *int `yaml:"reserve_mib"`
 }
 
 // Settings are the per model fields; the defaults section has the same fields.
@@ -76,11 +88,15 @@ const (
 	KeepInRAMPinned = "pinned"
 	KeepInRAMNone   = "none"
 
-	// DeviceCPU is the built in CPU device name
+	// DeviceCPU is the name of the CPU device entry (backend cpu)
 	DeviceCPU = "cpu"
+	// BackendCPU is the backend of the CPU device
+	BackendCPU = "cpu"
 )
 
-// Duration accepts "30m", "120s", "-1" / -1 (forever) and a number of seconds.
+// Duration accepts "30m", "120s", "-1" / -1 (forever) and a number of seconds. keep_alive -1: the model is never
+// taken off the stack (never loaded again from nothing) but may be moved (parked, put on another device);
+// wait_timeout -1: wait for the first device without a limit.
 type Duration struct {
 	time.Duration
 	Forever bool
@@ -127,17 +143,20 @@ func (d Duration) String() string {
 	return d.Duration.String()
 }
 
-// Parse reads and validates a config file's content. Unknown keys are errors.
+// Parse reads and validates a config file's content. Unknown keys are errors, the default section is required.
 func Parse(data []byte) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
-		if errors.Is(err, io.EOF) {
-			// an empty file is a valid, empty config
-			return &Config{}, nil
+		if !errors.Is(err, io.EOF) {
+			return nil, err
 		}
-		return nil, err
+		// an empty file: no default section, reported by validate
+	}
+	c.modelOrder = modelKeyOrder(data)
+	if c.Default != nil {
+		c.Defaults = *c.Default
 	}
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -145,36 +164,77 @@ func Parse(data []byte) (*Config, error) {
 	return &c, nil
 }
 
+// modelKeyOrder is the order of the models keys in the file (the map loses it).
+func modelKeyOrder(data []byte) []string {
+	var root yaml.Node
+	if yaml.Unmarshal(data, &root) != nil || len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	top := root.Content[0].Content
+	for i := 0; i+1 < len(top); i += 2 {
+		if top[i].Value != "models" || top[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		var keys []string
+		for j := 0; j+1 < len(top[i+1].Content); j += 2 {
+			keys = append(keys, top[i+1].Content[j].Value)
+		}
+		return keys
+	}
+	return nil
+}
+
 var kvTypes = []string{"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 
 func (c *Config) validate() error {
 	var errs []error
-	for name, d := range c.Devices {
-		if name == "" {
+	if c.OldDefaults != nil {
+		errs = append(errs, errors.New("defaults: the section is called default now"))
+	}
+	if c.Default == nil {
+		errs = append(errs, errors.New("default: missing (required: the settings of the models without their own section)"))
+	}
+	devNames := make([]string, 0, len(c.Devices))
+	for name := range c.Devices {
+		devNames = append(devNames, name)
+	}
+	sort.Strings(devNames)
+	for _, name := range devNames {
+		d := c.Devices[name]
+		if strings.TrimSpace(name) == "" {
 			errs = append(errs, errors.New("devices: empty device name"))
 			continue
 		}
 		if d.MaxRunning != nil && *d.MaxRunning < 1 {
 			errs = append(errs, fmt.Errorf("devices.%s.max_running: must be at least 1", name))
 		}
-		if name == DeviceCPU {
-			if d.Backend != "" || d.Match != "" {
-				errs = append(errs, fmt.Errorf("devices.cpu: backend and match are not used for the CPU"))
+		if d.ReserveMiB != nil && *d.ReserveMiB < 0 {
+			errs = append(errs, fmt.Errorf("devices.%s.reserve_mib: must not be negative", name))
+		}
+		cpu := strings.EqualFold(d.Backend, BackendCPU)
+		if name == DeviceCPU || cpu {
+			switch {
+			case name != DeviceCPU:
+				errs = append(errs, fmt.Errorf("devices.%s.backend: cpu is the backend of the entry named cpu only", name))
+			case d.Backend != "" && !cpu:
+				errs = append(errs, fmt.Errorf("devices.cpu.backend: %q (the CPU entry has backend cpu)", d.Backend))
+			case d.Match != "":
+				errs = append(errs, fmt.Errorf("devices.cpu.match: not used for the CPU"))
 			}
 			continue
 		}
 		switch strings.ToLower(d.Backend) {
 		case "rocm", "vulkan", "cuda", "metal":
 		case "":
-			errs = append(errs, fmt.Errorf("devices.%s.backend: missing (rocm, vulkan, cuda)", name))
+			errs = append(errs, fmt.Errorf("devices.%s.backend: missing (rocm, vulkan, cuda, metal; cpu for the entry named cpu)", name))
 		default:
-			errs = append(errs, fmt.Errorf("devices.%s.backend: unknown backend %q (rocm, vulkan, cuda)", name, d.Backend))
+			errs = append(errs, fmt.Errorf("devices.%s.backend: unknown backend %q (rocm, vulkan, cuda, metal; cpu for the entry named cpu)", name, d.Backend))
 		}
 		if strings.TrimSpace(d.Match) == "" {
 			errs = append(errs, fmt.Errorf("devices.%s.match: missing (a name or a PCI address)", name))
 		}
 	}
-	errs = append(errs, c.validateSettings("defaults", c.Defaults)...)
+	errs = append(errs, c.validateSettings("default", c.Defaults)...)
 	names := make([]string, 0, len(c.Models))
 	for k := range c.Models {
 		names = append(names, k)
@@ -209,10 +269,8 @@ func (c *Config) validateSettings(where string, s Settings) []error {
 	var errs []error
 	seen := map[string]bool{}
 	for _, d := range s.Devices {
-		if d != DeviceCPU {
-			if _, ok := c.Devices[d]; !ok {
-				errs = append(errs, fmt.Errorf("%s.devices: unknown device %q", where, d))
-			}
+		if _, ok := c.Devices[d]; !ok {
+			errs = append(errs, fmt.Errorf("%s.devices: unknown device %q (not in the devices section)", where, d))
 		}
 		if seen[d] {
 			errs = append(errs, fmt.Errorf("%s.devices: %q is listed twice", where, d))
@@ -221,9 +279,6 @@ func (c *Config) validateSettings(where string, s Settings) []error {
 	}
 	if s.OnBusy != nil && *s.OnBusy != OnBusyWait && *s.OnBusy != OnBusyNext {
 		errs = append(errs, fmt.Errorf("%s.on_busy: %q (wait or next)", where, *s.OnBusy))
-	}
-	if s.WaitTimeout != nil && s.WaitTimeout.Forever {
-		errs = append(errs, fmt.Errorf("%s.wait_timeout: must not be negative", where))
 	}
 	if s.Zones != nil && *s.Zones != ZonesAuto && *s.Zones != ZonesOff {
 		errs = append(errs, fmt.Errorf("%s.zones: %q (auto or off; the flex band size is computed, not set)", where, *s.Zones))
@@ -292,6 +347,28 @@ func (c *Config) RAMLimitBytes() uint64 {
 		return 0
 	}
 	return c.ramLimitBytes
+}
+
+// GPUReserveMiB is reserve_mib of a GPU device; false when not set (then LLAMA_ARG_FIT_TARGET, or the
+// llama-server default, applies) or when the device is the CPU or unknown.
+func (c *Config) GPUReserveMiB(device string) (int, bool) {
+	if c == nil || device == "" || device == DeviceCPU {
+		return 0, false
+	}
+	if d, ok := c.Devices[device]; ok && d.ReserveMiB != nil {
+		return *d.ReserveMiB, true
+	}
+	return 0, false
+}
+
+// RAMReserve is the RAM kept free of the budget (limit): reserve_mib of the CPU device, else max(1 GiB, 5%).
+func (c *Config) RAMReserve(limit uint64) uint64 {
+	if c != nil {
+		if d, ok := c.Devices[DeviceCPU]; ok && d.ReserveMiB != nil {
+			return uint64(*d.ReserveMiB) << 20
+		}
+	}
+	return RAMReserve(limit)
 }
 
 // MaxRunning of a device; 0 means no limit (the device has no entry or no max_running).

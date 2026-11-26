@@ -12,7 +12,7 @@ import (
 )
 
 const exampleConfig = `
-defaults:
+default:
   dual_buffer: true
   dynamic_kv: true
   kv_type: f16
@@ -21,7 +21,7 @@ defaults:
 devices:
   gpu0:  { backend: rocm,   match: "0000:aa:00.0", max_running: 1 }
   gpu1: { backend: vulkan, match: "Test GPU B", max_running: 1 }
-  cpu:   { max_running: 1 }
+  cpu:   { backend: cpu, max_running: 1 }
 
 swap:
   enabled: true
@@ -71,34 +71,47 @@ func TestParseExample(t *testing.T) {
 	}
 }
 
-func TestParseEmpty(t *testing.T) {
-	c, err := Parse([]byte("  \n"))
-	if err != nil || c == nil {
-		t.Fatalf("empty: %v %v", c, err)
+func TestParseEmptyNeedsDefault(t *testing.T) {
+	// an empty file has no default section: invalid (a missing file is no config)
+	if _, err := Parse([]byte("  \n")); err == nil || !strings.Contains(err.Error(), "default: missing") {
+		t.Fatalf("empty: %v", err)
+	}
+	if c, err := Parse([]byte("default: {}\n")); err != nil || c == nil {
+		t.Fatalf("only an empty default section: %v", err)
 	}
 }
 
 func TestParseErrors(t *testing.T) {
-	cases := map[string]string{
-		"unknown key":      "defaults:\n  dual_bufer: true\n",
-		"bad on_busy":      "models:\n  a:b:\n    on_busy: later\n",
-		"unknown device":   "models:\n  a:b:\n    devices: [gpu9]\n",
-		"bad backend":      "devices:\n  g: { backend: opencl, match: x }\n",
-		"no match":         "devices:\n  g: { backend: rocm }\n",
-		"bad kv type":      "defaults:\n  kv_type: q3_k\n",
-		"zones number":     "defaults:\n  zones: 4\n",
-		"bad duration":     "defaults:\n  keep_alive: soon\n",
-		"max_running zero": "devices:\n  cpu: { max_running: 0 }\n",
-		"bad keep_in_ram":  "swap:\n  keep_in_ram: disk\n",
-		"bad ram_limit":    "ram_limit: lots\n",
-		"bad fa":           "defaults:\n  flash_attention: maybe\n",
-		"yaml syntax":      "defaults: [\n",
-		"cpu with match":   "devices:\n  cpu: { backend: rocm, match: x }\n",
-		"device twice":     "devices:\n  g: { backend: rocm, match: x }\nmodels:\n  a:b:\n    devices: [g, g]\n",
+	// every case has a default section, so the error is the one named
+	cases := map[string]struct{ body, want string }{
+		"unknown key":        {"default:\n  dual_bufer: true\n", "dual_bufer"},
+		"bad on_busy":        {"default: {}\nmodels:\n  a:b:\n    on_busy: later\n", "on_busy"},
+		"unknown device":     {"default: {}\nmodels:\n  a:b:\n    devices: [gpu9]\n", "unknown device \"gpu9\""},
+		"cpu not declared":   {"default:\n  devices: [cpu]\n", "unknown device \"cpu\""},
+		"bad backend":        {"default: {}\ndevices:\n  g: { backend: opencl, match: x }\n", "unknown backend"},
+		"no backend":         {"default: {}\ndevices:\n  g: { match: x }\n", "backend: missing"},
+		"no match":           {"default: {}\ndevices:\n  g: { backend: rocm }\n", "match: missing"},
+		"bad kv type":        {"default:\n  kv_type: q3_k\n", "kv_type"},
+		"zones number":       {"default:\n  zones: 4\n", "zones"},
+		"bad duration":       {"default:\n  keep_alive: soon\n", "invalid duration"},
+		"max_running zero":   {"default: {}\ndevices:\n  cpu: { backend: cpu, max_running: 0 }\n", "max_running"},
+		"negative reserve":   {"default: {}\ndevices:\n  g: { backend: rocm, match: x, reserve_mib: -1 }\n", "reserve_mib"},
+		"bad keep_in_ram":    {"default: {}\nswap:\n  keep_in_ram: disk\n", "keep_in_ram"},
+		"bad ram_limit":      {"default: {}\nram_limit: lots\n", "ram_limit"},
+		"bad fa":             {"default:\n  flash_attention: maybe\n", "flash_attention"},
+		"yaml syntax":        {"default: [\n", "yaml"},
+		"cpu other backend":  {"default: {}\ndevices:\n  cpu: { backend: rocm, match: x }\n", "devices.cpu.backend"},
+		"cpu with match":     {"default: {}\ndevices:\n  cpu: { backend: cpu, match: x }\n", "devices.cpu.match"},
+		"cpu backend elsewh": {"default: {}\ndevices:\n  host: { backend: cpu }\n", "entry named cpu only"},
+		"device twice":       {"default: {}\ndevices:\n  g: { backend: rocm, match: x }\nmodels:\n  a:b:\n    devices: [g, g]\n", "listed twice"},
+		"no default":         {"devices:\n  cpu: { backend: cpu }\n", "default: missing"},
+		"old defaults name":  {"default: {}\ndefaults:\n  threads: 2\n", "called default now"},
+		"duplicate model":    {"default: {}\nmodels:\n  a:b: {}\n  a:b: {}\n", "already defined"},
 	}
-	for name, s := range cases {
-		if _, err := Parse([]byte(s)); err == nil {
-			t.Errorf("%s: no error", name)
+	for name, tc := range cases {
+		_, err := Parse([]byte(tc.body))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want %q in it", name, err, tc.want)
 		}
 	}
 }
@@ -110,7 +123,7 @@ func TestSectionFor(t *testing.T) {
 		"registry.ollama.ai/library/qwen3-coder:30b": "qwen3-coder:30b",
 		"QWEN3-VL:8B":          "qwen3-vl:8b",
 		"qwen3-embedding:0.6b": "qwen3-embedding:0.6b", // exact beats the pattern
-		"qwen3-embedding:4b":   "qwen3-embedding:*",    // longest pattern
+		"qwen3-embedding:4b":   "qwen3-embedding:*",    // the first matching pattern of the file
 		"qwen3:latest":         "qwen3*",
 		"qwen3":                "qwen3*",
 		"llama3:8b":            "",
@@ -121,6 +134,71 @@ func TestSectionFor(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: got %q want %q", name, got, want)
 		}
+	}
+
+	// the order of the file decides between patterns, not their length
+	o := mustParse(t, "default: {}\nmodels:\n  qwen3*:\n    threads: 1\n  qwen3-embedding:*:\n    threads: 2\n  qwen3-embedding:0.6b:\n    threads: 3\n")
+	for name, want := range map[string]string{"qwen3-embedding:4b": "qwen3*", "qwen3-embedding:0.6b": "qwen3-embedding:0.6b", "llama3": ""} {
+		if got, _ := o.SectionFor(name); got != want {
+			t.Errorf("order: %s: got %q want %q", name, got, want)
+		}
+	}
+	o = mustParse(t, "default: {}\nmodels:\n  qwen3-embedding:*:\n    threads: 2\n  qwen3*:\n    threads: 1\n")
+	if got, _ := o.SectionFor("qwen3-embedding:4b"); got != "qwen3-embedding:*" {
+		t.Errorf("order reversed: %q", got)
+	}
+}
+
+func TestDefaultSection(t *testing.T) {
+	c := mustParse(t, exampleConfig)
+	// no section: the default only
+	e := c.Resolve("llama3:8b", nil, nil, nil, nil)
+	if e.Section != "" || !e.DualBuffer.V || e.DualBuffer.Src != SrcDefaults || e.KeepAlive.V.Duration != 30*time.Minute {
+		t.Fatalf("default for an unknown model: %+v", e)
+	}
+	// a section: its fields over the default, the rest from the default
+	e = c.Resolve("qwen3-embedding:0.6b", nil, nil, nil, nil)
+	if e.DualBuffer.V || e.KVType.V != "f16" || e.KVType.Src != SrcDefaults {
+		t.Fatalf("section over default: %+v %+v", e.DualBuffer, e.KVType)
+	}
+}
+
+func TestWaitTimeoutForever(t *testing.T) {
+	c := mustParse(t, exampleConfig+"  w:latest:\n    devices: [gpu0, cpu]\n    wait_timeout: -1\n")
+	e := c.Resolve("w", nil, nil, nil, nil)
+	if e.WaitTimeout.V != time.Duration(math.MaxInt64) || !strings.Contains(e.String(), "wait_timeout=-1(model:w:latest)") {
+		t.Fatalf("wait_timeout -1: %v %s", e.WaitTimeout, e.String())
+	}
+}
+
+func TestReserve(t *testing.T) {
+	c := mustParse(t, exampleConfig)
+	// no reserve_mib: the GPU keeps LLAMA_ARG_FIT_TARGET, the CPU max(1 GiB, 5%)
+	if _, ok := c.GPUReserveMiB("gpu0"); ok {
+		t.Fatal("gpu0 has no reserve_mib")
+	}
+	if got := c.RAMReserve(100 << 30); got != 5<<30 {
+		t.Fatalf("cpu default 5%%: %d", got)
+	}
+	if got := c.RAMReserve(8 << 30); got != 1<<30 {
+		t.Fatalf("cpu default 1 GiB: %d", got)
+	}
+	r := mustParse(t, "default: {}\ndevices:\n  gpu0: { backend: rocm, match: x, reserve_mib: 1536 }\n  gpu1: { backend: vulkan, match: y, reserve_mib: 0 }\n  cpu: { backend: cpu, reserve_mib: 2048 }\n")
+	if mib, ok := r.GPUReserveMiB("gpu0"); !ok || mib != 1536 {
+		t.Fatalf("gpu0 override: %d %v", mib, ok)
+	}
+	if mib, ok := r.GPUReserveMiB("gpu1"); !ok || mib != 0 {
+		t.Fatalf("gpu1 zero override: %d %v", mib, ok)
+	}
+	if _, ok := r.GPUReserveMiB("cpu"); ok {
+		t.Fatal("the cpu reserve is no fit target")
+	}
+	if got := r.RAMReserve(100 << 30); got != 2048<<20 {
+		t.Fatalf("cpu override: %d", got)
+	}
+	var none *Config
+	if _, ok := none.GPUReserveMiB("gpu0"); ok || none.RAMReserve(8<<30) != 1<<30 {
+		t.Fatal("nil config")
 	}
 }
 
@@ -185,7 +263,7 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Fatalf("devices: %s", got)
 	}
 	line := e.String()
-	for _, want := range []string{"devices=[gpu1,cpu](model:qwen3-embedding:*)", "dual_buffer=false(model:qwen3-embedding:*)", "keep_alive=-1(model:qwen3-embedding:*)", "parallel=2(env)", "kv_type=f16(defaults)", "on_busy=wait(builtin)", "wait_timeout=1m0s(builtin)"} {
+	for _, want := range []string{"devices=[gpu1,cpu](model:qwen3-embedding:*)", "dual_buffer=false(model:qwen3-embedding:*)", "keep_alive=-1(model:qwen3-embedding:*)", "parallel=2(env)", "kv_type=f16(default)", "on_busy=wait(builtin)", "wait_timeout=1m0s(builtin)"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line misses %q: %s", want, line)
 		}
@@ -273,58 +351,83 @@ func TestMatchDevices(t *testing.T) {
 	}
 
 	// two cards of one type: a name match is ambiguous, the PCI address is not
-	two := mustParse(t, "devices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"cc:00.0\" }\n")
+	two := mustParse(t, "default: {}\ndevices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"cc:00.0\" }\n")
 	found2 := append(found[:1:1], ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, Name: "ROCm1", Description: "AMD Radeon Test GPU A", PCIID: "0000:cc:00.0"})
 	dm = two.MatchDevices(found2)
 	if len(dm.Errors) != 1 || dm.Present("a") || dm.ByName["b"].Info.Name != "ROCm1" {
 		t.Fatalf("two cards: %s %v", dm, dm.Errors)
 	}
 	// two entries for one card
-	dup := mustParse(t, "devices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"aa:00.0\" }\n")
+	dup := mustParse(t, "default: {}\ndevices:\n  a: { backend: rocm, match: \"Test GPU A\" }\n  b: { backend: rocm, match: \"aa:00.0\" }\n")
 	dm = dup.MatchDevices(found[:1])
 	if len(dm.Errors) != 1 || dm.Present("a") || dm.Present("b") {
 		t.Fatalf("dup: %s %v", dm, dm.Errors)
 	}
 }
 
-func TestStoreLastValid(t *testing.T) {
+func TestStoreLoadOnce(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, ConfigFileName)
+	// no file: no config, no error
+	if c, err := NewStore(p).Load(); c != nil || err != nil {
+		t.Fatalf("missing file: %v %v", c, err)
+	}
+	if err := os.WriteFile(p, []byte("default:\n  threads: 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	s := NewStore(p)
 	if s.Current() != nil {
-		t.Fatal("missing file must give nil")
+		t.Fatal("nothing is read before Load")
 	}
-	write := func(body string, at time.Time) {
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chtimes(p, at, at); err != nil {
-			t.Fatal(err)
-		}
+	c, err := s.Load()
+	if err != nil || c == nil || *c.Defaults.Threads != 3 || s.Current() != c {
+		t.Fatalf("load: %+v %v", c, err)
 	}
-	t0 := time.Now().Add(-time.Hour)
-	write("defaults:\n  threads: 3\n", t0)
-	c := s.Current()
-	if c == nil || *c.Defaults.Threads != 3 {
-		t.Fatalf("first: %+v", c)
+	// a change while running is not read
+	if err := os.WriteFile(p, []byte("default:\n  threads: 5\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	write("defaults:\n  threads: [\n", t0.Add(time.Minute))
-	if c2 := s.Current(); c2 != c {
-		t.Fatalf("broken file must keep the last valid config")
+	if c2, _ := s.Load(); c2 != c || *s.Current().Defaults.Threads != 3 {
+		t.Fatal("the config is read once")
 	}
-	write("defaults:\n  threads: 5\n", t0.Add(2*time.Minute))
-	if c3 := s.Current(); c3 == nil || *c3.Defaults.Threads != 5 {
-		t.Fatalf("fixed: %+v", c3)
+	// a broken file: Load fails with the path and the reason (the server does not start)
+	if err := os.WriteFile(p, []byte("default:\n  threads: [\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	os.Remove(p)
-	if s.Current() != nil {
-		t.Fatal("removed file must give nil")
+	if c, err := NewStore(p).Load(); c != nil || err == nil || !strings.Contains(err.Error(), p) || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("broken file: %v %v", c, err)
+	}
+	if err := os.WriteFile(p, []byte("default:\n  devices: [gpu9]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(p, nil)
+	if err := m.Load(); err == nil || !strings.Contains(err.Error(), "gpu9") {
+		t.Fatalf("manager load: %v", err)
+	}
+	if m.Config() != nil {
+		t.Fatal("no config after a failed load")
 	}
 	if got := DefaultPath(func(k string) string { return "" }, dir); got != p {
 		t.Fatalf("default path %s", got)
 	}
 	if got := DefaultPath(func(k string) string { return map[string]string{"OLLAMA_DUALBUF_CONFIG": "/x.yaml"}[k] }, dir); got != "/x.yaml" {
 		t.Fatalf("env path %s", got)
+	}
+}
+
+func TestUnavailableDeviceSkipped(t *testing.T) {
+	m := NewManager(filepath.Join(t.TempDir(), ConfigFileName), nil)
+	c := mustParse(t, exampleConfig)
+	// only the ROCm card is seen: gpu1 is skipped, the lists keep their other devices in order
+	m.NoteDevices([]ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", Description: "AMD Radeon Test GPU A", PCIID: "0000:aa:00.0"}})
+	if got := strings.Join(m.Present(c, []string{"gpu1", "cpu"}), ","); got != "cpu" {
+		t.Fatalf("gpu1 must be skipped: %s", got)
+	}
+	if got := strings.Join(m.Present(c, []string{"gpu0", "gpu1", "cpu"}), ","); got != "gpu0,cpu" {
+		t.Fatalf("present: %s", got)
+	}
+	if dm := m.Devices(c); len(dm.Missing) != 1 || dm.Missing[0] != "gpu1" {
+		t.Fatalf("missing: %v", dm.Missing)
 	}
 }
 

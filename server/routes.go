@@ -2514,6 +2514,13 @@ func Serve(ln net.Listener) error {
 
 	cleanupCompatMigrations()
 
+	// dual-buffer fork: the multi-model config (dualbuf.yaml) is read once, here; a broken one stops the start
+	dualbuf := newDualbufManager()
+	if err := dualbuf.Load(); err != nil {
+		slog.Error("the server does not start", "error", err)
+		return err
+	}
+
 	if !envconfig.NoPrune() {
 		if _, err := manifest.Manifests(false); err != nil {
 			slog.Warn("corrupt manifests detected, skipping prune operation.  Re-pull or delete to clear", "error", err)
@@ -2558,6 +2565,7 @@ func Serve(ln net.Listener) error {
 	ctx, done := context.WithCancel(context.Background())
 	schedCtx, schedDone := context.WithCancel(ctx)
 	sched := InitScheduler(schedCtx)
+	sched.dualbuf = dualbuf
 	s.sched = sched
 	s.modelCaches.Start(ctx)
 

@@ -11,11 +11,11 @@ import (
 )
 
 // Source names where an effective value came from, weakest first:
-// builtin < env < defaults < modelfile < model:<key> < request.
+// builtin < env < default < modelfile < model:<key> < request.
 const (
 	SrcBuiltin   = "builtin"
 	SrcEnv       = "env"
-	SrcDefaults  = "defaults"
+	SrcDefaults  = "default"
 	SrcModelfile = "modelfile"
 	SrcRequest   = "request"
 )
@@ -31,7 +31,7 @@ func (v *Value[T]) set(x T, src string) { v.V, v.Src = x, src }
 // Effective is the resolved setting set of one model load.
 type Effective struct {
 	Model   string // the model name it was resolved for
-	Section string // the models key that matched, "" for the defaults only
+	Section string // the models key that matched, "" for the default section only
 
 	Devices        Value[[]string]
 	OnBusy         Value[string]
@@ -56,9 +56,9 @@ type Env func(key string) string
 // DefaultWaitTimeout applies to on_busy: wait without a wait_timeout.
 const DefaultWaitTimeout = 60 * time.Second
 
-// SectionFor returns the models key for a model name: the exact name, else the most specific
-// matching pattern (the longest one, ties by key order). The name is tried as given and with
-// ":latest" when it has no tag.
+// SectionFor returns the models key for a model name: the exact name:tag, else the first matching pattern in
+// the order of the file; false when none matches (the model gets the default section). The name is tried as
+// given, without the default registry and namespace, and with ":latest" when it has no tag.
 func (c *Config) SectionFor(name string) (string, bool) {
 	if c == nil || len(c.Models) == 0 {
 		return "", false
@@ -74,18 +74,22 @@ func (c *Config) SectionFor(name string) (string, bool) {
 			}
 		}
 	}
-	keys := make([]string, 0, len(c.Models))
-	for k := range c.Models {
-		if strings.ContainsAny(k, "*?[") {
+	// the patterns in file order: the first that matches wins
+	order := c.modelOrder
+	if len(order) != len(c.Models) {
+		// not from Parse (a config built in code): key order
+		order = make([]string, 0, len(c.Models))
+		for k := range c.Models {
+			order = append(order, k)
+		}
+		sort.Strings(order)
+	}
+	var keys []string
+	for _, k := range order {
+		if _, ok := c.Models[k]; ok && strings.ContainsAny(k, "*?[") {
 			keys = append(keys, k)
 		}
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if len(keys[i]) != len(keys[j]) {
-			return len(keys[i]) > len(keys[j])
-		}
-		return keys[i] < keys[j]
-	})
 	for _, k := range keys {
 		for _, n := range cands {
 			if ok, _ := path.Match(strings.ToLower(k), strings.ToLower(n)); ok {
@@ -121,7 +125,7 @@ func nameCandidates(name string) []string {
 	return out
 }
 
-// Resolve computes the effective settings of a model: env < defaults < Modelfile < model section < request.
+// Resolve computes the effective settings of a model: env < default < Modelfile < model section < request.
 // modelfile and request are the raw option maps (num_ctx, num_batch, num_thread are read from them; the
 // request may also carry the fork keys dual_buffer, dynamic_kv, zones, kv_type, parallel, n_ubatch,
 // flash_attention, kv_save). reqKeepAlive is the request's keep_alive, nil when not given.
@@ -369,7 +373,9 @@ func (e Effective) String() string {
 	}
 	w("devices", devs, e.Devices.Src)
 	w("on_busy", e.OnBusy.V, e.OnBusy.Src)
-	if e.OnBusy.V == OnBusyWait {
+	if e.OnBusy.V == OnBusyWait && e.WaitTimeout.V == time.Duration(math.MaxInt64) {
+		w("wait_timeout", "-1", e.WaitTimeout.Src)
+	} else if e.OnBusy.V == OnBusyWait {
 		w("wait_timeout", e.WaitTimeout.V.String(), e.WaitTimeout.Src)
 	} else {
 		w("wait_timeout", "ignored", e.WaitTimeout.Src)

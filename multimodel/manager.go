@@ -46,7 +46,19 @@ func NewManager(path string, env Env) *Manager {
 	return m
 }
 
-// Config is the current config (see Store.Current); it also becomes the source of the running limits.
+// Load reads the config file once (at the server start); a broken file is an error and the server must not start.
+func (m *Manager) Load() error {
+	if m == nil {
+		return nil
+	}
+	_, err := m.Store.Load()
+	if err == nil {
+		m.Config()
+	}
+	return err
+}
+
+// Config is the config read at the start (see Store.Current); it also becomes the source of the running limits.
 func (m *Manager) Config() *Config {
 	if m == nil {
 		return nil
@@ -101,7 +113,7 @@ func (m *Manager) Devices(c *Config) DeviceMap {
 			slog.Error("dualbuf device match", "error", e)
 		}
 		if len(dm.Missing) > 0 && m.haveDevs {
-			slog.Warn("dualbuf devices not found, the models skip them", "missing", dm.Missing)
+			slog.Warn("dualbuf: configured devices are not available (not in the machine, not visible in the container, or the driver does not see them): skipped, the models use the other devices of their list", "missing", dm.Missing)
 		}
 	}
 	return dm
