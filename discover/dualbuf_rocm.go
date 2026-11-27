@@ -1,9 +1,9 @@
 package discover
 
-// Dual-buffer fork (multimodel): with a config that names rocm cards, the ROCm discovery runs once per card, in a ROCm
-// view of that card only (the other cards' render nodes hidden from the ROCm runtime, the card's own gfx override), so
-// an AMD card of another backend or one the ROCm runtime cannot use does not stop it. The card is chosen by its PCI
-// address, not by an ordinal. Without such a config the stock discovery runs.
+// Dual-buffer fork (multimodel): with a config that names rocm cards, the ROCm discovery runs in a ROCm view of those
+// cards only (the other cards' render nodes hidden from the ROCm runtime, each card's own gfx override), so an AMD card
+// of another backend or one the ROCm runtime cannot use does not stop it. The cards are chosen by their PCI address,
+// not by an ordinal. Without such a config the stock discovery runs.
 
 import (
 	"context"
@@ -11,30 +11,32 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ollama/ollama/ml"
 )
 
-// DualbufROCmCard is a rocm card of the multi-model config: its device name, PCI address and the environment of a ROCm
-// process that uses it (hidden render nodes, gfx override).
-type DualbufROCmCard struct {
-	Device string
-	PCI    string
-	Env    map[string]string
+// DualbufROCmView is a set of rocm cards of the multi-model config a ROCm process sees together (normally every one):
+// their device names and PCI addresses, and the environment of such a process (hidden render nodes, gfx overrides).
+type DualbufROCmView struct {
+	Devices []string
+	PCIs    []string
+	Env     map[string]string
 }
 
-// DualbufROCmCards is set by the server when the config names rocm cards; known are the devices the other libraries
-// found (to resolve a name match to a PCI address). nil, or no cards: the stock ROCm discovery.
-var DualbufROCmCards func(known []ml.DeviceInfo) []DualbufROCmCard
+// DualbufROCmViews is set by the server when the config names rocm cards; known are the devices the other libraries
+// found (to resolve a name match to a PCI address). nil, or no views: the stock ROCm discovery.
+var DualbufROCmViews func(known []ml.DeviceInfo) []DualbufROCmView
 
 // hideLibrary is the preload library that hides render nodes while the HIP backend loads (llama/compat/ggml-hide-dri.c).
 const hideLibrary = "libggml-hide-dri.so"
 
-// dualbufROCmEnv adds the preload library of the ROCm library directory to a card's environment.
-func dualbufROCmEnv(card DualbufROCmCard, rocmDir string) map[string]string {
-	env := maps.Clone(card.Env)
+// dualbufROCmEnv adds the preload library of the ROCm library directory to a view's environment.
+func dualbufROCmEnv(view DualbufROCmView, rocmDir string) map[string]string {
+	env := maps.Clone(view.Env)
 	if env == nil {
 		env = map[string]string{}
 	}
@@ -51,51 +53,57 @@ func dualbufROCmEnv(card DualbufROCmCard, rocmDir string) map[string]string {
 	return env
 }
 
-// dualbufDiscoverROCm discovers each card in its own ROCm view; a card the ROCm runtime does not start is left out
-// with a warning that names it and the reason.
-func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []string, cards []DualbufROCmCard) []ml.DeviceInfo {
+// dualbufDiscoverROCm discovers each view's cards in that view; a card the ROCm runtime does not start is left out with
+// a warning that names it and the reason. A device's ID is its PCI address (never an ordinal of this machine), its
+// filter ID its ROCm ordinal in the view (the same in every process of the view).
+func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []string, views []DualbufROCmView) []ml.DeviceInfo {
 	var out []ml.DeviceInfo
-	for _, card := range cards {
-		env := dualbufROCmEnv(card, dirs[len(dirs)-1])
+	for _, view := range views {
+		env := dualbufROCmEnv(view, dirs[len(dirs)-1])
 		c, cancel := context.WithTimeout(ctx, timeout)
 		devs, status, err := bootstrapDevicesWithStatusWatchdog(c, dirs, env)
 		cancel()
-		found := false
+		found := map[string]bool{}
+		ordinal := 0
 		for _, d := range devs {
 			if d.Library != "ROCm" {
 				continue
 			}
-			if d.PCIID != "" && !strings.EqualFold(normPCIID(d.PCIID), card.PCI) {
-				slog.Warn("dualbuf: the ROCm view of a card shows another card, it is not used", "device", card.Device, "pci", card.PCI, "seen", d.PCIID)
+			idx := ordinal
+			ordinal++
+			pci := normPCIID(d.PCIID)
+			if pci == "" && len(view.PCIs) == 1 {
+				pci = view.PCIs[0]
+			}
+			i := slices.Index(view.PCIs, pci)
+			if i < 0 {
+				slog.Warn("dualbuf: the ROCm view shows a card that is not a rocm device of the config, it is not used", "pci", d.PCIID, "view", view.PCIs)
 				continue
 			}
-			// one card per view: ordinal 0 there; the ID is its PCI address (unique, never an ordinal of this machine)
-			d.ID = card.PCI
-			d.FilterID = "0"
-			if d.PCIID == "" {
-				d.PCIID = card.PCI
-			}
+			d.ID = pci
+			d.FilterID = strconv.Itoa(idx)
+			d.PCIID = pci
 			if d.RunnerEnvOverrides == nil {
 				d.RunnerEnvOverrides = map[string]string{}
 			}
 			maps.Copy(d.RunnerEnvOverrides, env)
 			out = append(out, d)
-			found = true
-		}
-		if found {
-			slog.Info("dualbuf: ROCm card found in its own view", "device", card.Device, "pci", card.PCI,
-				"gfx_override", env["HSA_OVERRIDE_GFX_VERSION"], "hidden_render_nodes", env["GGML_HIP_HIDE_RENDER_NODES"])
-			continue
+			found[pci] = true
+			slog.Info("dualbuf: ROCm card found in the ROCm view", "device", view.Devices[i], "pci", pci, "rocm_ordinal", idx,
+				"hidden_render_nodes", env["GGML_HIP_HIDE_RENDER_NODES"])
 		}
 		reason := lastDiscoveryStatusError(status)
 		if reason == "" && err != nil {
 			reason = err.Error()
 		}
 		if reason == "" {
-			reason = "the ROCm runtime reports no usable device (a missing or wrong gfx_override, no /dev/kfd, or the card is not supported)"
+			reason = "the ROCm runtime reports no usable device for it (a missing or wrong gfx_override, no /dev/kfd, or the card is not supported)"
 		}
-		slog.Warn("dualbuf: the ROCm card does not start, it is left out", "device", card.Device, "pci", card.PCI,
-			"gfx_override", env["HSA_OVERRIDE_GFX_VERSION"], "reason", reason)
+		for i, p := range view.PCIs {
+			if !found[p] {
+				slog.Warn("dualbuf: the ROCm card does not start, it is left out", "device", view.Devices[i], "pci", p, "reason", reason)
+			}
+		}
 	}
 	return out
 }

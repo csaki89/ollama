@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -246,10 +247,10 @@ func (s *Scheduler) dualbufPlacementGPUs(req *LlmRequest, systemInfo ml.SystemIn
 								if x.DeviceID != d.Info.DeviceID {
 									continue
 								}
-								if x.Library == "ROCm" && (g.Library == "ROCm" || slices.ContainsFunc(db.extraGPUs, func(e ml.DeviceInfo) bool { return e.Library == "ROCm" })) {
-									// every ROCm card has a ROCm view of its own (hidden render nodes, gfx override): one per
-									// process, a move between two ROCm cards is a reload
-									slog.Info("dualbuf: a second ROCm card is not loaded into the process", "model", dualbufModelName(req.model), "device", t)
+								if x.Library == "ROCm" && !dualbufSameROCmView(x, append([]ml.DeviceInfo{g}, db.extraGPUs...)) {
+									// the ROCm cards of a process share one ROCm view (hidden render nodes, gfx overrides): a card
+									// of another view (another gfx_override without a KFD topology) is a reload away
+									slog.Info("dualbuf: a ROCm card of another ROCm view is not loaded into the process", "model", dualbufModelName(req.model), "device", t)
 									continue
 								}
 								db.extraGPUs = append(db.extraGPUs, x)
@@ -1070,15 +1071,36 @@ func dualbufStartup(m *multimodel.Manager) {
 	if !multimodel.HasSysfs() {
 		return
 	}
-	discover.DualbufROCmCards = func(known []ml.DeviceInfo) []discover.DualbufROCmCard {
-		cards, notes := cfg.ROCmCards(multimodel.RenderNodes(multimodel.SysfsRoot), known)
+	discover.DualbufROCmViews = func(known []ml.DeviceInfo) []discover.DualbufROCmView {
+		nodes := multimodel.RenderNodes(multimodel.SysfsRoot)
+		cards, notes := cfg.ROCmCards(nodes, known)
 		for _, n := range notes {
 			slog.Warn("dualbuf: a rocm device is left out", "reason", n)
 		}
-		out := make([]discover.DualbufROCmCard, 0, len(cards))
-		for _, c := range cards {
-			out = append(out, discover.DualbufROCmCard{Device: c.Device, PCI: c.PCI, Env: c.Env()})
+		views, note := multimodel.ROCmViews(cards, nodes, multimodel.KFDNodes(multimodel.SysfsRoot), multimodel.DevicePresent)
+		if note != "" {
+			slog.Warn("dualbuf: " + note)
+		}
+		out := make([]discover.DualbufROCmView, 0, len(views))
+		for _, v := range views {
+			dv := discover.DualbufROCmView{Env: v.Env}
+			for _, c := range v.Cards {
+				dv.Devices = append(dv.Devices, c.Device)
+				dv.PCIs = append(dv.PCIs, c.PCI)
+			}
+			out = append(out, dv)
 		}
 		return out
 	}
+}
+
+// dualbufSameROCmView: a ROCm card can join the ROCm cards of a process only if they share its ROCm view (the same
+// environment: hidden render nodes and gfx overrides).
+func dualbufSameROCmView(x ml.DeviceInfo, in []ml.DeviceInfo) bool {
+	for _, d := range in {
+		if d.Library == "ROCm" && !maps.Equal(d.RunnerEnvOverrides, x.RunnerEnvOverrides) {
+			return false
+		}
+	}
+	return true
 }

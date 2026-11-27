@@ -164,11 +164,11 @@ func TestDualbufStartupGFXOverride(t *testing.T) {
 	var buf bytes.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(old); discover.DualbufROCmCards = nil })
+	t.Cleanup(func() { slog.SetDefault(old); discover.DualbufROCmViews = nil })
 	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 
 	dualbufStartup(dualbufTestScheduler(t, "").dualbuf)
-	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "10.3.0" || discover.DualbufROCmCards != nil {
+	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "10.3.0" || discover.DualbufROCmViews != nil {
 		t.Fatal("no config: the stock behaviour, the variable applies")
 	}
 	cfg := "default: {}\ndevices:\n  gpu_rocm: { backend: rocm, match: \"0000:aa:00.0\", gfx_override: 10.3.0 }\n"

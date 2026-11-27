@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 	"time"
 
@@ -170,5 +171,18 @@ func TestDualbufParkForCPURequest(t *testing.T) {
 	// a request on its GPU unparks it
 	if !dualbufNeedsUnpark(r, requestOn(cfg, "gpu0")) {
 		t.Fatal("a GPU request unparks")
+	}
+}
+
+// the ROCm cards of one ROCm view (the same environment) share a process, so a move between them is in process; a card
+// of another view (another gfx_override without a KFD topology) is not loaded with them
+func TestDualbufSameROCmView(t *testing.T) {
+	view := map[string]string{"GGML_HIP_HIDE_RENDER_NODES": "renderD129", "HSA_OVERRIDE_GFX_VERSION_1": "10.3.0"}
+	a := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, RunnerEnvOverrides: view}
+	b := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:cc:00.0", Library: "ROCm"}, RunnerEnvOverrides: maps.Clone(view)}
+	other := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:dd:00.0", Library: "ROCm"}, RunnerEnvOverrides: map[string]string{"GGML_HIP_HIDE_RENDER_NODES": "renderD128,renderD129", "HSA_OVERRIDE_GFX_VERSION": "11.0.0"}}
+	vk := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "Vulkan"}}
+	if !dualbufSameROCmView(b, []ml.DeviceInfo{a, vk}) || dualbufSameROCmView(other, []ml.DeviceInfo{a}) || !dualbufSameROCmView(other, []ml.DeviceInfo{vk}) {
+		t.Fatal("same view: together; another view: apart; with no ROCm card: fine")
 	}
 }

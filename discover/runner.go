@@ -114,7 +114,7 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 				dirs = []string{ml.LibOllamaPath}
 			}
 
-			if DualbufROCmCards != nil && runtime.GOOS == "linux" && dir != "" && isROCmLibraryDir(filepath.Base(dir)) {
+			if DualbufROCmViews != nil && runtime.GOOS == "linux" && dir != "" && isROCmLibraryDir(filepath.Base(dir)) {
 				// dual-buffer fork: the ROCm discovery runs after the others, once per config card (dualbuf_rocm.go)
 				dualbufROCmDirs = append(dualbufROCmDirs, dirs)
 				continue
@@ -132,8 +132,8 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 
 		// dual-buffer fork: the config's rocm cards, each in its own ROCm view (a name match resolved from the devices above)
 		for _, dirs := range dualbufROCmDirs {
-			if cards := DualbufROCmCards(devices); len(cards) > 0 {
-				devices = append(devices, dualbufDiscoverROCm(ctx, 30*time.Second, dirs, cards)...)
+			if views := DualbufROCmViews(devices); len(views) > 0 {
+				devices = append(devices, dualbufDiscoverROCm(ctx, 30*time.Second, dirs, views)...)
 			} else {
 				c, cancel := context.WithTimeout(ctx, 30*time.Second)
 				devices = append(devices, bootstrapDevicesWithMetalRetry(c, ctx, 30*time.Second, dirs, nil)...)

@@ -145,3 +145,20 @@ func TestRenameDeviceBuffers(t *testing.T) {
 		t.Fatalf("renamed: %v", b)
 	}
 }
+
+// two ROCm cards of one view in a process: both visible to the ROCm runtime by their view ordinals, the active one first
+func TestDualbufExtraDevicesTwoROCm(t *testing.T) {
+	view := map[string]string{"GGML_HIP_HIDE_RENDER_NODES": "renderD129"}
+	active := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:cc:00.0", Library: "ROCm"}, FilterID: "1", RunnerEnvOverrides: view}
+	other := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "0", RunnerEnvOverrides: view}
+	_, env := dualbufExtraDevices([]ml.DeviceInfo{active}, []ml.DeviceInfo{other}, nil, nil)
+	got := ""
+	for k, v := range env {
+		if strings.Contains(k, "VISIBLE_DEVICES") && strings.Contains(v, ",") {
+			got = v
+		}
+	}
+	if got != "1,0" || env["GGML_HIP_HIDE_RENDER_NODES"] != "renderD129" {
+		t.Fatalf("env %v", env)
+	}
+}
