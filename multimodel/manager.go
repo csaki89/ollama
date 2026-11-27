@@ -25,6 +25,7 @@ type Manager struct {
 	dmLogged string
 	parked   map[string]*Parked
 	hostSeen map[string]uint64 // measured host RAM of the last instance per key
+	split    map[string]bool   // model key + device: the model computes on the CPU too when placed there
 }
 
 // Parked is a model without a process whose KV (and, with keep_in_ram: pinned, its model file pages) is in RAM.
@@ -37,11 +38,16 @@ type Parked struct {
 	Forever   bool
 	LastUsed  time.Time
 	Bytes     uint64 // RAM held: the pinned file and the KV files
+	// KeepAlive: the parked model leaves the RAM when it is not used for this long (as the stock keep_alive); 0 or
+	// Forever: no expiry
+	KeepAlive time.Duration
+
+	expiry *time.Timer
 }
 
 // NewManager makes a manager for the config at path.
 func NewManager(path string, env Env) *Manager {
-	m := &Manager{Store: NewStore(path), Env: env, parked: map[string]*Parked{}, hostSeen: map[string]uint64{}}
+	m := &Manager{Store: NewStore(path), Env: env, parked: map[string]*Parked{}, hostSeen: map[string]uint64{}, split: map[string]bool{}}
 	m.Coord = NewCoordinator(m.maxRunning)
 	return m
 }
@@ -139,6 +145,25 @@ func (m *Manager) Park(p *Parked) {
 	m.mu.Lock()
 	old := m.parked[p.Key]
 	m.parked[p.Key] = p
+	if old != nil && old.expiry != nil {
+		old.expiry.Stop()
+	}
+	if !p.Forever && p.KeepAlive > 0 {
+		// keep_alive runs on while the model is parked: when it passes, the model leaves the RAM as the stock unload does
+		left := time.Until(p.LastUsed.Add(p.KeepAlive))
+		if left < 0 {
+			left = 0
+		}
+		p.expiry = time.AfterFunc(left, func() {
+			m.mu.Lock()
+			same := m.parked[p.Key] == p
+			m.mu.Unlock()
+			if same {
+				slog.Info("dualbuf: keep_alive of the parked model passed", "model", p.Model)
+				m.Drop(p.Key)
+			}
+		})
+	}
 	m.mu.Unlock()
 	if old != nil && old.Pinned != p.Pinned {
 		old.Pinned.Release()
@@ -167,6 +192,9 @@ func (m *Manager) Unpark(key string) *Parked {
 	defer m.mu.Unlock()
 	p := m.parked[key]
 	delete(m.parked, key)
+	if p != nil && p.expiry != nil {
+		p.expiry.Stop()
+	}
 	return p
 }
 
@@ -177,6 +205,7 @@ func (m *Manager) ParkedList() []*Parked {
 	out := make([]*Parked, 0, len(m.parked))
 	for _, p := range m.parked {
 		c := *p
+		c.expiry = nil
 		out = append(out, &c)
 	}
 	return out
@@ -213,4 +242,18 @@ func (m *Manager) HostEstimate(key string, fallback uint64) uint64 {
 		return b
 	}
 	return fallback
+}
+
+// SetSplit records whether the model computes on the CPU too when placed on device (seen at its load).
+func (m *Manager) SetSplit(key, device string, split bool) {
+	m.mu.Lock()
+	m.split[key+"\x00@"+device] = split
+	m.mu.Unlock()
+}
+
+// Split reports whether the model was seen computing on the CPU too on device.
+func (m *Manager) Split(key, device string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.split[key+"\x00@"+device]
 }

@@ -2,132 +2,188 @@ package multimodel
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"time"
 )
 
-// Coordinator keeps the running limit per device (max_running): at most that many requests generate on a
-// device at once. A request takes a place before it gets its runner and keeps it until it ends. The waiting
-// requests are served in arrival order.
+// ErrQueueFull: the waiting requests reached the queue limit (OLLAMA_MAX_QUEUE); the server answers it as the
+// stock scheduler does.
+var ErrQueueFull = errors.New("dualbuf: the request queue is full")
+
+// Coordinator decides where and when a request of a configured model runs (docs/MULTIMODEL-DESIGN.md 2.4):
+//   - a device is busy while active requests run on it up to its max_running (active models: a model has one
+//     active request at a time); a split model (GPU + CPU) makes every device it computes on busy, the CPU too;
+//   - one model, one active request: the later requests of a working model wait, whatever their on_busy;
+//   - per device arrival order: a later request does not take a device an earlier waiting request would use;
+//     a request touching none of its devices may start before it;
+//   - tiers: a request first accepts only the first device of its list; when it is busy, on_busy next accepts
+//     the next tier at once, on_busy wait after wait_timeout (-1: never), tier by tier to the end of the
+//     list; when any accepted tier is free the request starts there, on the highest one; at the end it waits
+//     until one frees up. No error, except a full queue (OLLAMA_MAX_QUEUE).
 type Coordinator struct {
-	mu      sync.Mutex
-	running map[string]int
-	waiters []*waiter
-	seq     uint64
-	limit   func(device string) int // 0 = no limit
-	now     func() time.Time
+	mu       sync.Mutex
+	running  map[string]int  // active models per device
+	active   map[string]bool // models with an active request
+	waiters  []*waiter       // arrival order
+	seq      uint64
+	limit    func(device string) int // max_running, 0 = no limit
+	maxQueue int                     // 0 = no limit
+	now      func() time.Time
 }
 
 type waiter struct {
-	seq   uint64
-	wants []string // in preference order
-	got   string
-	ready chan struct{}
+	seq    uint64
+	key    string
+	name   string
+	tiers  []string
+	accept int // the first accept tiers are acceptable
+	extra  func(device string) []string
+	start  time.Time
+	got    string
+	held   []string
+	ready  chan struct{}
+	steps  *time.Timer
+	cont   bool // the CPU place of a request already running (Grant.Also): capacity only, before the others
 }
 
 // NewCoordinator returns a coordinator; limit gives max_running of a device (0: no limit).
 func NewCoordinator(limit func(device string) int) *Coordinator {
-	return &Coordinator{running: map[string]int{}, limit: limit, now: time.Now}
+	return &Coordinator{running: map[string]int{}, active: map[string]bool{}, limit: limit, now: time.Now}
 }
 
-// Request is what a request asks for: its model's device list (only present devices) and the busy rule.
+// SetMaxQueue sets the limit of waiting requests (OLLAMA_MAX_QUEUE; 0 = none).
+func (c *Coordinator) SetMaxQueue(n int) {
+	c.mu.Lock()
+	c.maxQueue = n
+	c.mu.Unlock()
+}
+
+// Request is what a request asks for.
 type Request struct {
-	Model       string
-	Devices     []string
-	OnBusy      string
-	WaitTimeout time.Duration
+	Model       string        // the model name (log lines)
+	Key         string        // the model identity (one active request per key); "" = Model
+	Devices     []string      // the model's present devices, highest tier first
+	OnBusy      string        // wait or next
+	WaitTimeout time.Duration // per tier for on_busy wait; math.MaxInt64 = never step down
+	// Extra are the other devices the model computes on when placed on a device (the CPU of a split model)
+	Extra func(device string) []string
 }
 
 // Grant is a place on a device, held until Release.
 type Grant struct {
 	Device string
-	Reason string        // free, waited, next, queued
+	Tier   int           // index of Device in the model's list
+	Reason string        // free (first tier at once), waited (first tier after a wait), next (a lower tier)
 	Waited time.Duration // time spent waiting for the place
 	c      *Coordinator
+	key    string
 	held   []string
 	once   sync.Once
 }
 
-// Acquire takes a place for the request:
-//   - the first device of the list that is free wins;
-//   - if the first device is busy: on_busy wait waits for it up to WaitTimeout, on_busy next goes on at once;
-//   - the other devices of the list are taken only when free, without waiting;
-//   - when no device is free the request is queued and starts on the first device of its list that frees up,
-//     in arrival order. Only the context ends the wait (no error, no overload).
+// Acquire waits for the request's place (see Coordinator). It returns ErrQueueFull when the queue is full and
+// the context error when the request ends while it waits.
 func (c *Coordinator) Acquire(ctx context.Context, r Request) (*Grant, error) {
-	start := c.now()
 	if len(r.Devices) == 0 {
 		return &Grant{Reason: "no devices"}, nil
 	}
+	key := r.Key
+	if key == "" {
+		key = r.Model
+	}
 	c.mu.Lock()
+	if c.maxQueue > 0 && len(c.waiters) >= c.maxQueue {
+		c.mu.Unlock()
+		return nil, ErrQueueFull
+	}
 	c.seq++
-	seq := c.seq
-
-	if c.takeLocked(r.Devices[0], seq) {
-		c.mu.Unlock()
-		return c.grant(r, r.Devices[0], "free", start), nil
+	w := &waiter{seq: c.seq, key: key, name: r.Model, tiers: append([]string(nil), r.Devices...), accept: 1, extra: r.Extra,
+		start: c.now(), ready: make(chan struct{})}
+	if r.OnBusy == OnBusyNext {
+		w.accept = len(w.tiers)
 	}
-
-	if r.OnBusy == OnBusyWait && r.WaitTimeout > 0 {
-		w := c.addLocked(seq, r.Devices[:1])
-		c.mu.Unlock()
-		t := time.NewTimer(r.WaitTimeout)
-		select {
-		case <-w.ready:
-			t.Stop()
-			return c.grant(r, w.got, "waited", start), nil
-		case <-ctx.Done():
-			t.Stop()
-			if c.cancel(w) {
-				return nil, ctx.Err()
-			}
-			return c.grant(r, w.got, "waited", start), nil
-		case <-t.C:
-			if !c.cancel(w) {
-				return c.grant(r, w.got, "waited", start), nil
-			}
-		}
-		c.mu.Lock()
-	}
-
-	for _, d := range r.Devices[1:] {
-		if c.takeLocked(d, seq) {
-			c.mu.Unlock()
-			return c.grant(r, d, "next", start), nil
-		}
-	}
-
-	w := c.addLocked(seq, r.Devices)
-	c.mu.Unlock()
-	slog.Info("dualbuf: no device free, the request is queued", "model", r.Model, "devices", r.Devices)
+	c.waiters = append(c.waiters, w)
+	c.dispatchLocked()
 	select {
 	case <-w.ready:
-		return c.grant(r, w.got, "queued", start), nil
+		c.mu.Unlock()
+		return c.grant(r, w), nil
+	default:
+	}
+	if r.OnBusy != OnBusyNext && r.WaitTimeout > 0 && r.WaitTimeout != time.Duration(math.MaxInt64) && len(w.tiers) > 1 {
+		c.stepLocked(w, r.WaitTimeout)
+	}
+	c.mu.Unlock()
+	slog.Info("dualbuf: the request waits for its place", "model", r.Model, "devices", r.Devices, "on_busy", r.OnBusy)
+	select {
+	case <-w.ready:
+		return c.grant(r, w), nil
 	case <-ctx.Done():
 		if c.cancel(w) {
 			return nil, ctx.Err()
 		}
-		return c.grant(r, w.got, "queued", start), nil
+		return c.grant(r, w), nil
 	}
 }
 
-// Also takes a second place for a granted request (the CPU of a model split between the GPU and the CPU),
-// waiting in arrival order; the places are always taken GPU first, then CPU, so no wait can go round.
+// stepLocked makes the next tier acceptable after d, again until the end of the list.
+func (c *Coordinator) stepLocked(w *waiter, d time.Duration) {
+	w.steps = time.AfterFunc(d, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if !c.waitingLocked(w) {
+			return
+		}
+		if w.accept < len(w.tiers) {
+			w.accept++
+			slog.Info("dualbuf: wait_timeout passed, the next tier is accepted too", "model", w.name, "devices", w.tiers[:w.accept])
+			c.dispatchLocked()
+		}
+		if c.waitingLocked(w) && w.accept < len(w.tiers) {
+			c.stepLocked(w, d)
+		}
+	})
+}
+
+func (c *Coordinator) waitingLocked(w *waiter) bool {
+	return slices.Contains(c.waiters, w)
+}
+
+func (c *Coordinator) grant(r Request, w *waiter) *Grant {
+	tier := slices.Index(w.tiers, w.got)
+	g := &Grant{Device: w.got, Tier: tier, Waited: c.now().Sub(w.start), c: c, key: w.key, held: w.held}
+	switch {
+	case tier > 0:
+		g.Reason = "next"
+	case g.Waited > time.Millisecond:
+		g.Reason = "waited"
+	default:
+		g.Reason = "free"
+	}
+	slog.Info("dualbuf placement", "model", r.Model, "device", g.Device, "reason", g.Reason, "waited", g.Waited.Round(time.Millisecond), "devices", r.Devices)
+	return g
+}
+
+// Also takes a further place for a granted request (the CPU of a model found to be split at its load); it goes
+// before the waiting requests (the request already runs) and waits only for the capacity.
 func (g *Grant) Also(ctx context.Context, device string) error {
 	c := g.c
-	if c == nil || device == "" || slices.Contains(g.held, device) {
+	if c == nil || device == "" {
 		return nil
 	}
 	c.mu.Lock()
-	c.seq++
-	if c.takeLocked(device, c.seq) {
-		g.held = append(g.held, device)
+	if slices.Contains(g.held, device) {
 		c.mu.Unlock()
 		return nil
 	}
-	w := c.addLocked(c.seq, []string{device})
+	c.seq++
+	w := &waiter{seq: 0, key: "", tiers: []string{device}, accept: 1, ready: make(chan struct{}), cont: true}
+	c.waiters = slices.Insert(c.waiters, 0, w)
+	c.dispatchLocked()
 	c.mu.Unlock()
 	select {
 	case <-w.ready:
@@ -137,7 +193,7 @@ func (g *Grant) Also(ctx context.Context, device string) error {
 		}
 	}
 	c.mu.Lock()
-	g.held = append(g.held, device)
+	g.held = append(g.held, w.held...)
 	c.mu.Unlock()
 	return nil
 }
@@ -153,6 +209,7 @@ func (g *Grant) Release() {
 		for _, d := range g.held {
 			c.running[d]--
 		}
+		delete(c.active, g.key)
 		c.dispatchLocked()
 		c.mu.Unlock()
 	})
@@ -169,11 +226,18 @@ func (g *Grant) ReleaseOnDone(ctx context.Context) {
 	}()
 }
 
-// Running is the number of requests running on a device.
+// Running is the number of active models on a device.
 func (c *Coordinator) Running(device string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.running[device]
+}
+
+// Active reports whether a model has an active request.
+func (c *Coordinator) Active(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.active[key]
 }
 
 // Queued is the number of waiting requests.
@@ -183,45 +247,37 @@ func (c *Coordinator) Queued() int {
 	return len(c.waiters)
 }
 
-func (c *Coordinator) grant(r Request, device, reason string, start time.Time) *Grant {
-	g := &Grant{Device: device, Reason: reason, Waited: c.now().Sub(start), c: c, held: []string{device}}
-	slog.Info("dualbuf placement", "model", r.Model, "device", device, "reason", reason, "waited", g.Waited.Round(time.Millisecond), "devices", r.Devices)
-	return g
+// HasWaiter reports whether a request of the model waits.
+func (c *Coordinator) HasWaiter(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, w := range c.waiters {
+		if w.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// Demote: the model was moved down to device to make room; its waiting requests accept that tier (and the
+// ones above it) from now on, so they are served there.
+func (c *Coordinator) Demote(key, device string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, w := range c.waiters {
+		if w.key != key {
+			continue
+		}
+		if i := slices.Index(w.tiers, device); i >= 0 && w.accept < i+1 {
+			w.accept = i + 1
+		}
+	}
+	c.dispatchLocked()
 }
 
 func (c *Coordinator) freeLocked(d string) bool {
 	l := c.limit(d)
 	return l <= 0 || c.running[d] < l
-}
-
-// takeLocked takes d when it is free and no earlier waiter wants it.
-func (c *Coordinator) takeLocked(d string, seq uint64) bool {
-	if !c.freeLocked(d) {
-		return false
-	}
-	for _, w := range c.waiters {
-		if w.seq < seq && slices.Contains(w.wants, d) {
-			return false
-		}
-	}
-	c.running[d]++
-	return true
-}
-
-func (c *Coordinator) addLocked(seq uint64, wants []string) *waiter {
-	w := &waiter{seq: seq, wants: append([]string(nil), wants...), ready: make(chan struct{})}
-	i, _ := slices.BinarySearchFunc(c.waiters, seq, func(x *waiter, s uint64) int {
-		switch {
-		case x.seq < s:
-			return -1
-		case x.seq > s:
-			return 1
-		}
-		return 0
-	})
-	c.waiters = slices.Insert(c.waiters, i, w)
-	c.dispatchLocked()
-	return w
 }
 
 // cancel removes a waiter; false if it got a place meanwhile (the caller then owns it).
@@ -233,39 +289,93 @@ func (c *Coordinator) cancel(w *waiter) bool {
 		return false
 	default:
 	}
+	if w.steps != nil {
+		w.steps.Stop()
+	}
 	c.waiters = slices.DeleteFunc(c.waiters, func(x *waiter) bool { return x == w })
 	c.dispatchLocked()
 	return true
 }
 
-// dispatchLocked gives free places to the waiters in arrival order, each to the first free device of its list.
+// needs is what a waiter takes on tier device d: d and the other devices the model computes on there.
+func (w *waiter) needs(d string) []string {
+	out := []string{d}
+	if w.extra != nil {
+		for _, e := range w.extra(d) {
+			if !slices.Contains(out, e) {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
+// dispatchLocked gives the free places to the waiters in arrival order: each one gets the highest acceptable
+// tier whose devices are all free and none of them is wanted by an earlier waiting request.
 func (c *Coordinator) dispatchLocked() {
-	for i := 0; i < len(c.waiters); {
-		w := c.waiters[i]
-		granted := false
-		for _, d := range w.wants {
-			if !c.freeLocked(d) {
+	for {
+		progress := false
+		blocked := map[string]bool{}
+		for i := 0; i < len(c.waiters); i++ {
+			w := c.waiters[i]
+			if w.cont {
+				// the CPU place of a running request: capacity only
+				if d := w.tiers[0]; c.freeLocked(d) {
+					c.running[d]++
+					w.got, w.held = d, []string{d}
+					c.removeLocked(w)
+					progress = true
+					break
+				}
 				continue
 			}
-			blocked := false
-			for _, e := range c.waiters[:i] {
-				if slices.Contains(e.wants, d) {
-					blocked = true
+			if !c.active[w.key] {
+				for _, d := range w.tiers[:w.accept] {
+					need := w.needs(d)
+					ok := true
+					for _, n := range need {
+						if blocked[n] || !c.freeLocked(n) {
+							ok = false
+							break
+						}
+					}
+					if !ok {
+						continue
+					}
+					for _, n := range need {
+						c.running[n]++
+					}
+					c.active[w.key] = true
+					w.got, w.held = d, need
+					c.removeLocked(w)
+					progress = true
+					break
+				}
+				if progress {
 					break
 				}
 			}
-			if blocked {
+			// a waiting request keeps every device it would use from the later ones; one that waits for its own
+			// working model waits for the model, not for a device (it keeps its turn once the model is free)
+			if c.active[w.key] {
 				continue
 			}
-			c.running[d]++
-			w.got = d
-			close(w.ready)
-			c.waiters = slices.Delete(c.waiters, i, i+1)
-			granted = true
-			break
+			for _, d := range w.tiers[:w.accept] {
+				for _, n := range w.needs(d) {
+					blocked[n] = true
+				}
+			}
 		}
-		if !granted {
-			i++
+		if !progress {
+			return
 		}
 	}
+}
+
+func (c *Coordinator) removeLocked(w *waiter) {
+	if w.steps != nil {
+		w.steps.Stop()
+	}
+	c.waiters = slices.DeleteFunc(c.waiters, func(x *waiter) bool { return x == w })
+	close(w.ready)
 }

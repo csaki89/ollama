@@ -2,12 +2,24 @@ package multimodel
 
 import (
 	"context"
+	"errors"
+	"math"
 	"testing"
 	"time"
 )
 
+// simulated devices and requests: max_running 1 everywhere unless a test says otherwise
+
 func limits(m map[string]int) func(string) int {
 	return func(d string) int { return m[d] }
+}
+
+func one(devs ...string) func(string) int {
+	m := map[string]int{}
+	for _, d := range devs {
+		m[d] = 1
+	}
+	return limits(m)
 }
 
 func mustAcquire(t *testing.T, c *Coordinator, r Request) *Grant {
@@ -44,157 +56,283 @@ func waitQueued(t *testing.T, c *Coordinator, n int) {
 	}
 }
 
+func got(t *testing.T, ch chan result, want string) *Grant {
+	t.Helper()
+	select {
+	case r := <-ch:
+		if r.err != nil || r.g.Device != want {
+			t.Fatalf("got %+v %v, want %s", r.g, r.err, want)
+		}
+		return r.g
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no place, want %s", want)
+	}
+	return nil
+}
+
+func still(t *testing.T, ch chan result) {
+	t.Helper()
+	select {
+	case r := <-ch:
+		t.Fatalf("must still wait, got %+v %v", r.g, r.err)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
 var gpuCPU = []string{"gpu0", "cpu"}
 
-func TestCoordFreeAndNoLimit(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
-	a := mustAcquire(t, c, Request{Devices: gpuCPU})
-	if a.Device != "gpu0" || a.Reason != "free" {
-		t.Fatalf("a: %+v", a)
+func req(key string, on string, wait time.Duration, devs ...string) Request {
+	return Request{Model: key, Key: key, Devices: devs, OnBusy: on, WaitTimeout: wait}
+}
+
+const forever = time.Duration(math.MaxInt64)
+
+func TestCoordFreeAndRelease(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	g := mustAcquire(t, c, req("a", OnBusyWait, time.Minute, gpuCPU...))
+	if g.Device != "gpu0" || g.Reason != "free" || g.Tier != 0 || c.Running("gpu0") != 1 || !c.Active("a") {
+		t.Fatalf("grant %+v", g)
 	}
-	// cpu has no limit: any number may run there
-	b := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
-	d := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
-	if b.Device != "cpu" || d.Device != "cpu" || c.Running("cpu") != 2 {
-		t.Fatalf("cpu: %+v %+v", b, d)
+	g.Release()
+	g.Release()
+	if c.Running("gpu0") != 0 || c.Active("a") {
+		t.Fatalf("after release: %d", c.Running("gpu0"))
 	}
-	a.Release()
-	a.Release() // once
-	if c.Running("gpu0") != 0 {
-		t.Fatalf("running after release: %d", c.Running("gpu0"))
-	}
-	if g := mustAcquire(t, c, Request{}); g.Device != "" {
-		t.Fatalf("no devices: %+v", g)
+	// no limit: always free
+	u := NewCoordinator(limits(nil))
+	g1, g2 := mustAcquire(t, u, req("a", OnBusyWait, 0, "gpu0")), mustAcquire(t, u, req("b", OnBusyWait, 0, "gpu0"))
+	if g1.Device != "gpu0" || g2.Device != "gpu0" {
+		t.Fatal("no limit")
 	}
 }
 
-func TestCoordWaitThenGet(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	a := mustAcquire(t, c, Request{Devices: gpuCPU})
-	ch := acquireAsync(c, context.Background(), Request{Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 2 * time.Second})
-	waitQueued(t, c, 1)
-	a.Release()
-	r := <-ch
-	if r.err != nil || r.g.Device != "gpu0" || r.g.Reason != "waited" {
-		t.Fatalf("waited: %+v %v", r.g, r.err)
+// an idle loaded model does not make a device busy: the coordinator only counts active requests
+func TestCoordIdleModelNotBusy(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	mustAcquire(t, c, req("a", OnBusyWait, time.Minute, gpuCPU...)).Release() // a stays loaded, idle
+	if g := mustAcquire(t, c, req("b", OnBusyWait, time.Minute, gpuCPU...)); g.Device != "gpu0" || g.Reason != "free" {
+		t.Fatalf("b: %+v", g)
 	}
 }
 
-func TestCoordWaitTimeoutNext(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	mustAcquire(t, c, Request{Devices: gpuCPU})
-	start := time.Now()
-	g := mustAcquire(t, c, Request{Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 50 * time.Millisecond})
-	if g.Device != "cpu" || g.Reason != "next" || time.Since(start) < 50*time.Millisecond {
-		t.Fatalf("timeout -> cpu: %+v after %v", g, time.Since(start))
+// a split model makes the GPU and the CPU busy while it works
+func TestCoordSplitModelBusy(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	split := req("a", OnBusyWait, time.Minute, gpuCPU...)
+	split.Extra = func(d string) []string {
+		if d == "gpu0" {
+			return []string{"cpu"}
+		}
+		return nil
 	}
-}
+	g := mustAcquire(t, c, split)
+	if g.Device != "gpu0" || c.Running("cpu") != 1 || c.Running("gpu0") != 1 {
+		t.Fatalf("split: %+v cpu %d", g, c.Running("cpu"))
+	}
+	b := acquireAsync(c, context.Background(), req("b", OnBusyNext, 0, "cpu"))
+	still(t, b)
+	g.Release()
+	got(t, b, "cpu").Release()
 
-func TestCoordNextNoWait(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	mustAcquire(t, c, Request{Devices: gpuCPU})
-	start := time.Now()
-	g := mustAcquire(t, c, Request{Devices: gpuCPU, OnBusy: OnBusyNext, WaitTimeout: time.Hour})
-	if g.Device != "cpu" || g.Reason != "next" || time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("next: %+v after %v", g, time.Since(start))
-	}
-}
-
-func TestCoordQueueArrivalOrder(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	gpu := mustAcquire(t, c, Request{Devices: gpuCPU})
-	cpu := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
-	d := acquireAsync(c, context.Background(), Request{Model: "d", Devices: gpuCPU, OnBusy: OnBusyNext})
-	waitQueued(t, c, 1)
-	e := acquireAsync(c, context.Background(), Request{Model: "e", Devices: gpuCPU, OnBusy: OnBusyNext})
-	waitQueued(t, c, 2)
-	// a later request that only wants the cpu does not overtake d and e
-	f := acquireAsync(c, context.Background(), Request{Model: "f", Devices: []string{"cpu"}})
-	waitQueued(t, c, 3)
-
-	cpu.Release() // first freed device: cpu -> d (the earliest)
-	rd := <-d
-	if rd.g.Device != "cpu" || rd.g.Reason != "queued" {
-		t.Fatalf("d: %+v", rd.g)
-	}
-	gpu.Release() // gpu0 -> e
-	re := <-e
-	if re.g.Device != "gpu0" {
-		t.Fatalf("e: %+v", re.g)
-	}
-	select {
-	case r := <-f:
-		t.Fatalf("f must still wait for the cpu: %+v", r.g)
-	case <-time.After(20 * time.Millisecond):
-	}
-	rd.g.Release()
-	if rf := <-f; rf.g.Device != "cpu" {
-		t.Fatalf("f: %+v", rf.g)
-	}
-}
-
-func TestCoordWaiterKeepsItsTurn(t *testing.T) {
-	// a request waiting for its first device is not overtaken there by a later one
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	a := mustAcquire(t, c, Request{Devices: gpuCPU})
-	b := acquireAsync(c, context.Background(), Request{Model: "b", Devices: gpuCPU, OnBusy: OnBusyWait, WaitTimeout: 2 * time.Second})
-	waitQueued(t, c, 1)
-	late := acquireAsync(c, context.Background(), Request{Model: "late", Devices: []string{"gpu0"}})
-	waitQueued(t, c, 2)
-	a.Release()
-	if r := <-b; r.g.Device != "gpu0" {
-		t.Fatalf("b: %+v", r.g)
-	}
-	select {
-	case r := <-late:
-		t.Fatalf("late overtook: %+v", r.g)
-	case <-time.After(20 * time.Millisecond):
-	}
-}
-
-func TestCoordCancel(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
-	mustAcquire(t, c, Request{Devices: []string{"gpu0"}})
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := acquireAsync(c, ctx, Request{Devices: []string{"gpu0"}})
-	waitQueued(t, c, 1)
-	cancel()
-	if r := <-ch; r.err == nil {
-		t.Fatalf("cancel: %+v", r.g)
-	}
-	if c.Queued() != 0 {
-		t.Fatalf("queue after cancel: %d", c.Queued())
-	}
-}
-
-func TestCoordAlsoCPU(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1, "cpu": 1}))
-	cpuOnly := mustAcquire(t, c, Request{Devices: []string{"cpu"}})
-	g := mustAcquire(t, c, Request{Devices: gpuCPU})
+	// found split only at the load: Also takes the CPU, waiting for the capacity
+	g = mustAcquire(t, c, req("a", OnBusyWait, time.Minute, gpuCPU...))
+	busy := mustAcquire(t, c, req("x", OnBusyWait, time.Minute, "cpu"))
 	done := make(chan error, 1)
 	go func() { done <- g.Also(context.Background(), "cpu") }()
 	select {
 	case <-done:
-		t.Fatal("the split model must wait for the cpu place")
-	case <-time.After(20 * time.Millisecond):
+		t.Fatal("the CPU is busy")
+	case <-time.After(30 * time.Millisecond):
 	}
-	cpuOnly.Release()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if c.Running("cpu") != 1 || c.Running("gpu0") != 1 {
-		t.Fatalf("running: cpu %d gpu0 %d", c.Running("cpu"), c.Running("gpu0"))
+	busy.Release()
+	if err := <-done; err != nil || c.Running("cpu") != 1 {
+		t.Fatalf("also: %v %d", err, c.Running("cpu"))
 	}
 	g.Release()
 	if c.Running("cpu") != 0 || c.Running("gpu0") != 0 {
-		t.Fatalf("after release: cpu %d gpu0 %d", c.Running("cpu"), c.Running("gpu0"))
+		t.Fatal("release of the split places")
+	}
+}
+
+// one model, one active request: the later requests of a working model wait, whatever their on_busy
+func TestCoordOneModelOneRequest(t *testing.T) {
+	c := NewCoordinator(limits(map[string]int{"gpu0": 2, "cpu": 2}))
+	g := mustAcquire(t, c, req("a", OnBusyWait, time.Minute, gpuCPU...))
+	second := acquireAsync(c, context.Background(), req("a", OnBusyNext, 0, gpuCPU...))
+	still(t, second)
+	if !c.HasWaiter("a") {
+		t.Fatal("waiter of a")
+	}
+	// another model still runs next to it
+	mustAcquire(t, c, req("b", OnBusyWait, time.Minute, gpuCPU...)).Release()
+	g.Release()
+	got(t, second, "gpu0").Release()
+}
+
+// per device arrival order: a later request does not take a device an earlier one waits for; a request that
+// touches none of its devices goes ahead
+func TestCoordArrivalOrderPerDevice(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "gpu1", "cpu"))
+	hold := mustAcquire(t, c, req("h", OnBusyWait, time.Minute, "gpu0"))
+	x := acquireAsync(c, context.Background(), req("x", OnBusyWait, forever, "gpu0", "cpu"))
+	waitQueued(t, c, 1)
+	y := acquireAsync(c, context.Background(), req("y", OnBusyNext, 0, "gpu0"))
+	waitQueued(t, c, 2)
+	// z uses only gpu1: not touched by the waiting ones, it starts at once
+	if g := mustAcquire(t, c, req("z", OnBusyWait, time.Minute, "gpu1")); g.Device != "gpu1" {
+		t.Fatalf("z: %+v", g)
+	} else {
+		g.Release()
+	}
+	// w wants the cpu: x accepts only gpu0 (wait_timeout -1), so the cpu is free for w
+	if g := mustAcquire(t, c, req("w", OnBusyNext, 0, "cpu")); g.Device != "cpu" {
+		t.Fatalf("w: %+v", g)
+	} else {
+		g.Release()
+	}
+	hold.Release()
+	gx := got(t, x, "gpu0")
+	still(t, y)
+	gx.Release()
+	got(t, y, "gpu0").Release()
+}
+
+// a waiting request that accepts the cpu (on_busy next) keeps it from a later one
+func TestCoordWaiterKeepsAcceptedDevices(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	g0 := mustAcquire(t, c, req("h0", OnBusyWait, time.Minute, "gpu0"))
+	gc := mustAcquire(t, c, req("hc", OnBusyWait, time.Minute, "cpu"))
+	x := acquireAsync(c, context.Background(), req("x", OnBusyNext, 0, gpuCPU...))
+	waitQueued(t, c, 1)
+	y := acquireAsync(c, context.Background(), req("y", OnBusyNext, 0, "cpu"))
+	waitQueued(t, c, 2)
+	gc.Release()
+	got(t, x, "cpu").Release()
+	got(t, y, "cpu").Release()
+	g0.Release()
+}
+
+// on_busy wait: tier by tier after wait_timeout, the accepted set grows; a freed higher tier is taken first
+func TestCoordWaitTimeoutTiers(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "gpu1", "cpu"))
+	h0 := mustAcquire(t, c, req("h0", OnBusyWait, time.Minute, "gpu0"))
+	h1 := mustAcquire(t, c, req("h1", OnBusyWait, time.Minute, "gpu1"))
+	hc := mustAcquire(t, c, req("hc", OnBusyWait, time.Minute, "cpu"))
+	start := time.Now()
+	ch := acquireAsync(c, context.Background(), req("a", OnBusyWait, 40*time.Millisecond, "gpu0", "gpu1", "cpu"))
+	// after one timeout gpu1 is accepted too, after two the cpu; all busy: it waits
+	time.Sleep(120 * time.Millisecond)
+	still(t, ch)
+	// the cpu frees first: accepted by now, it is taken
+	hc.Release()
+	g := got(t, ch, "cpu")
+	if g.Reason != "next" || g.Tier != 2 || time.Since(start) < 80*time.Millisecond {
+		t.Fatalf("cpu after two timeouts: %+v", g)
+	}
+	g.Release()
+
+	// before the second timeout only gpu0 and gpu1 are accepted: a free cpu is not taken
+	ch = acquireAsync(c, context.Background(), req("b", OnBusyWait, 60*time.Millisecond, "gpu0", "gpu1", "cpu"))
+	time.Sleep(80 * time.Millisecond) // one timeout: gpu0, gpu1
+	still(t, ch)
+	// two tiers free at once: the higher one wins
+	c.mu.Lock()
+	c.running["gpu0"]--
+	c.running["gpu1"]--
+	c.dispatchLocked()
+	c.mu.Unlock()
+	if g := got(t, ch, "gpu0"); g.Tier != 0 {
+		t.Fatalf("highest free: %+v", g)
+	}
+	_ = h0
+	_ = h1
+}
+
+// wait_timeout -1: the request never steps down
+func TestCoordWaitForever(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	h := mustAcquire(t, c, req("h", OnBusyWait, time.Minute, "gpu0"))
+	ch := acquireAsync(c, context.Background(), req("a", OnBusyWait, forever, gpuCPU...))
+	still(t, ch)
+	h.Release()
+	if g := got(t, ch, "gpu0"); g.Reason != "waited" {
+		t.Fatalf("forever: %+v", g)
+	}
+}
+
+// on_busy next: the next tier at once, without waiting
+func TestCoordNext(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "gpu1", "cpu"))
+	mustAcquire(t, c, req("h", OnBusyWait, time.Minute, "gpu0"))
+	if g := mustAcquire(t, c, req("a", OnBusyNext, time.Hour, "gpu0", "gpu1", "cpu")); g.Device != "gpu1" || g.Reason != "next" || g.Waited > 20*time.Millisecond {
+		t.Fatalf("next: %+v", g)
+	}
+	// every tier busy: at the end of the list it waits until one frees up
+	ch := acquireAsync(c, context.Background(), req("b", OnBusyNext, 0, "gpu0", "gpu1"))
+	still(t, ch)
+}
+
+// a cold start (nothing loaded yet) is placed by the same rule
+func TestCoordColdStart(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	if g := mustAcquire(t, c, req("new", OnBusyWait, time.Minute, gpuCPU...)); g.Device != "gpu0" || g.Reason != "free" {
+		t.Fatalf("cold start: %+v", g)
+	}
+}
+
+// demote: the waiting requests of a moved model accept its new tier
+func TestCoordDemote(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	h := mustAcquire(t, c, req("b", OnBusyWait, time.Minute, "gpu0"))
+	ch := acquireAsync(c, context.Background(), req("v", OnBusyWait, forever, gpuCPU...))
+	still(t, ch)
+	c.Demote("v", "cpu")
+	if g := got(t, ch, "cpu"); g.Tier != 1 {
+		t.Fatalf("demoted: %+v", g)
+	}
+	h.Release()
+}
+
+// promote: a request of a model that ran on a lower tier goes to the highest free tier (not one step up)
+func TestCoordPromoteHighestFree(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "gpu1", "cpu"))
+	h := mustAcquire(t, c, req("h", OnBusyWait, time.Minute, "gpu0"))
+	g := mustAcquire(t, c, req("a", OnBusyNext, 0, "gpu0", "gpu1", "cpu"))
+	if g.Device != "gpu1" {
+		t.Fatalf("a: %+v", g)
+	}
+	g.Release()
+	h.Release()
+	if g := mustAcquire(t, c, req("a", OnBusyNext, 0, "gpu0", "gpu1", "cpu")); g.Device != "gpu0" {
+		t.Fatalf("promote to the highest free tier: %+v", g)
+	}
+}
+
+func TestCoordCancelAndQueueLimit(t *testing.T) {
+	c := NewCoordinator(one("gpu0"))
+	c.SetMaxQueue(1)
+	h := mustAcquire(t, c, req("h", OnBusyWait, time.Minute, "gpu0"))
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := acquireAsync(c, ctx, req("a", OnBusyWait, forever, "gpu0"))
+	waitQueued(t, c, 1)
+	if _, err := c.Acquire(context.Background(), req("b", OnBusyWait, forever, "gpu0")); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("queue limit: %v", err)
+	}
+	cancel()
+	if r := <-ch; !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("cancel: %+v", r)
+	}
+	waitQueued(t, c, 0)
+	h.Release()
+	if c.Running("gpu0") != 0 {
+		t.Fatal("a cancelled waiter holds nothing")
 	}
 }
 
 func TestCoordReleaseOnDone(t *testing.T) {
-	c := NewCoordinator(limits(map[string]int{"gpu0": 1}))
+	c := NewCoordinator(one("gpu0"))
 	ctx, cancel := context.WithCancel(context.Background())
-	g := mustAcquire(t, c, Request{Devices: []string{"gpu0"}})
+	g := mustAcquire(t, c, req("a", OnBusyWait, time.Minute, "gpu0"))
 	g.ReleaseOnDone(ctx)
 	cancel()
 	deadline := time.Now().Add(time.Second)
