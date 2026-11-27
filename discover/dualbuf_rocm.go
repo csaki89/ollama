@@ -60,6 +60,7 @@ func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []stri
 	var out []ml.DeviceInfo
 	for _, view := range views {
 		env := dualbufROCmEnv(view, dirs[len(dirs)-1])
+		slog.Info("dualbuf: ROCm view for the discovery", "cards", dualbufViewCards(view), "hidden_render_nodes", env["GGML_HIP_HIDE_RENDER_NODES"], "env", DualbufROCmEnvSummary(env))
 		c, cancel := context.WithTimeout(ctx, timeout)
 		devs, status, err := bootstrapDevicesWithStatusWatchdog(c, dirs, env)
 		cancel()
@@ -101,11 +102,35 @@ func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []stri
 		}
 		for i, p := range view.PCIs {
 			if !found[p] {
-				slog.Warn("dualbuf: the ROCm card does not start, it is left out", "device", view.Devices[i], "pci", p, "reason", reason)
+				slog.Warn("dualbuf: the ROCm card does not start, it is left out", "device", view.Devices[i], "pci", p, "reason", reason,
+					"view", dualbufViewCards(view), "hidden_render_nodes", env["GGML_HIP_HIDE_RENDER_NODES"], "env", DualbufROCmEnvSummary(env))
 			}
 		}
 	}
 	return out
+}
+
+// dualbufViewCards lists a view's cards as device=PCI.
+func dualbufViewCards(view DualbufROCmView) string {
+	parts := make([]string, 0, len(view.PCIs))
+	for i, p := range view.PCIs {
+		parts = append(parts, view.Devices[i]+"="+p)
+	}
+	return strings.Join(parts, " ")
+}
+
+// DualbufROCmEnvSummary is the ROCm view part of an environment, as the runtime gets it: the gfx override variables,
+// the hidden render nodes, the visible ROCm devices and the preload library (sorted KEY=VALUE).
+func DualbufROCmEnvSummary(env map[string]string) string {
+	var parts []string
+	for k, v := range env {
+		if strings.HasPrefix(k, "HSA_OVERRIDE_GFX_VERSION") || k == "GGML_HIP_HIDE_RENDER_NODES" || k == "ROCR_VISIBLE_DEVICES" ||
+			k == "HIP_VISIBLE_DEVICES" || k == "LD_PRELOAD" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, " ")
 }
 
 func normPCIID(s string) string {

@@ -994,6 +994,8 @@ func NewLlamaServerRunner(
 	for k, v := range config.ExtraEnv {
 		serverEnvs[k] = v
 	}
+	// dual-buffer fork: the ROCm view the runner gets (hidden render nodes, gfx override, visible ROCm devices)
+	dualbufLogROCmView(modelPath, serverEnvs)
 
 	launch := llamaServerLaunchConfig{
 		modelPath:    splitModel.modelPath,

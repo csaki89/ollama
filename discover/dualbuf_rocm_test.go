@@ -28,3 +28,15 @@ func TestDualbufROCmEnv(t *testing.T) {
 		t.Fatal("pci")
 	}
 }
+
+// the ROCm view part of an environment, as the logs show it
+func TestDualbufROCmEnvSummary(t *testing.T) {
+	env := map[string]string{"HSA_OVERRIDE_GFX_VERSION": "10.3.0", "GGML_HIP_HIDE_RENDER_NODES": "renderD129", "LD_PRELOAD": "/x/libggml-hide-dri.so", "OTHER": "y"}
+	if got := DualbufROCmEnvSummary(env); got != "GGML_HIP_HIDE_RENDER_NODES=renderD129 HSA_OVERRIDE_GFX_VERSION=10.3.0 LD_PRELOAD=/x/libggml-hide-dri.so" {
+		t.Fatalf("summary %q", got)
+	}
+	v := DualbufROCmView{Devices: []string{"a", "b"}, PCIs: []string{"0000:aa:00.0", "0000:cc:00.0"}}
+	if dualbufViewCards(v) != "a=0000:aa:00.0 b=0000:cc:00.0" {
+		t.Fatal(dualbufViewCards(v))
+	}
+}

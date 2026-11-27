@@ -497,3 +497,19 @@ func dualbufExtraDevices(gpus, extra []ml.DeviceInfo, gpuLibs []string, env map[
 	}
 	return gpuLibs, out
 }
+
+// dualbufLogROCmView logs the ROCm view a runner starts with (INFO): the hidden render nodes, the gfx override
+// variables, the visible ROCm devices and the preload library, as the runtime gets them. Nothing without a view.
+func dualbufLogROCmView(model string, env map[string]string) {
+	if _, ok := env["GGML_HIP_HIDE_RENDER_NODES"]; !ok {
+		return
+	}
+	var parts []string
+	for k, v := range env {
+		if strings.HasPrefix(k, "HSA_OVERRIDE_GFX_VERSION") || k == "ROCR_VISIBLE_DEVICES" || k == "HIP_VISIBLE_DEVICES" || k == "LD_PRELOAD" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	sort.Strings(parts)
+	slog.Info("dualbuf: ROCm view of the runner", "model", model, "hidden_render_nodes", env["GGML_HIP_HIDE_RENDER_NODES"], "env", strings.Join(parts, " "))
+}

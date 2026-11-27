@@ -1077,7 +1077,7 @@ func dualbufStartup(m *multimodel.Manager) {
 		for _, n := range notes {
 			slog.Warn("dualbuf: a rocm device is left out", "reason", n)
 		}
-		views, note := multimodel.ROCmViews(cards, nodes, multimodel.KFDNodes(multimodel.SysfsRoot), multimodel.DevicePresent)
+		views, note := multimodel.ROCmViews(cards, nodes)
 		if note != "" {
 			slog.Warn("dualbuf: " + note)
 		}

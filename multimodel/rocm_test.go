@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/ollama/ollama/ml"
@@ -82,74 +82,43 @@ func TestROCmCards(t *testing.T) {
 	}
 }
 
-// one view with every rocm card: only the other cards hidden (another backend's card, one the config does not name),
-// each card's gfx_override as HSA_OVERRIDE_GFX_VERSION_<its node index in the view>; the thunk counts the CPU nodes
-// and the reachable GPUs in the topology order
+// one view per gfx_override value (normally one, with every rocm card): only the other cards hidden (another backend's
+// card, one the config does not name; with several values the other values' cards too), the global
+// HSA_OVERRIDE_GFX_VERSION of the value in the view, never the per-node form
 func TestROCmViews(t *testing.T) {
 	nodes := map[string][]string{"0000:aa:00.0": {"renderD128"}, "0000:bb:00.0": {"renderD129"}, "0000:cc:00.0": {"renderD130"}, "0000:dd:00.0": {"renderD131"}}
-	cards := []ROCmCard{
-		{Device: "r1", PCI: "0000:aa:00.0", GFXOverride: "10.3.0", minor: 128},
-		{Device: "r2", PCI: "0000:cc:00.0", GFXOverride: "11.0.0", minor: 130},
-		{Device: "r3", PCI: "0000:dd:00.0", minor: 131},
-	}
-	// topology: CPU, the vulkan card (bb, hidden), r1, a card not in the container (minor 140), r2, r3
-	kfd := []kfdNode{{cpu: true}, {minor: 129}, {minor: 128}, {minor: 140}, {minor: 130}, {minor: 131}}
-	present := func(n string) bool { return n != "renderD140" }
-	views, note := ROCmViews(cards, nodes, kfd, present)
-	if note != "" || len(views) != 1 || len(views[0].Cards) != 3 {
-		t.Fatalf("views %+v note %q", views, note)
+	same := []ROCmCard{{Device: "r1", PCI: "0000:aa:00.0", GFXOverride: "10.3.0"}, {Device: "r2", PCI: "0000:cc:00.0", GFXOverride: "10.3.0"}}
+	views, note := ROCmViews(same, nodes)
+	if note != "" || len(views) != 1 || len(views[0].Cards) != 2 {
+		t.Fatalf("one view: %+v %q", views, note)
 	}
 	env := views[0].Env
-	if env["GGML_HIP_HIDE_RENDER_NODES"] != "renderD129" {
-		t.Fatalf("only the non-rocm card is hidden: %v", env)
-	}
-	// node indices: CPU 0, r1 1 (bb hidden, 140 absent: not counted), r2 2, r3 3 (no override)
-	if env["HSA_OVERRIDE_GFX_VERSION_1"] != "10.3.0" || env["HSA_OVERRIDE_GFX_VERSION_2"] != "11.0.0" || len(env) != 3 {
-		t.Fatalf("per card overrides: %v", env)
-	}
-	if _, ok := env["HSA_OVERRIDE_GFX_VERSION"]; ok {
-		t.Fatal("no global override")
+	if env["GGML_HIP_HIDE_RENDER_NODES"] != "renderD129,renderD131" || env["HSA_OVERRIDE_GFX_VERSION"] != "10.3.0" || len(env) != 2 {
+		t.Fatalf("view env: %v", env)
 	}
 
-	// without a topology: cards with different overrides cannot share a view; one view per value, the global variable
-	views, note = ROCmViews(cards, nodes, nil, present)
+	mixed := []ROCmCard{{Device: "r1", PCI: "0000:aa:00.0", GFXOverride: "10.3.0"}, {Device: "r2", PCI: "0000:cc:00.0", GFXOverride: "11.0.0"}, {Device: "r3", PCI: "0000:dd:00.0"}}
+	views, note = ROCmViews(mixed, nodes)
 	if note == "" || len(views) != 3 {
-		t.Fatalf("grouped: %+v %q", views, note)
+		t.Fatalf("split by value: %+v %q", views, note)
 	}
 	if views[0].Env["HSA_OVERRIDE_GFX_VERSION"] != "10.3.0" || views[0].Env["GGML_HIP_HIDE_RENDER_NODES"] != "renderD129,renderD130,renderD131" {
-		t.Fatalf("first group: %v", views[0].Env)
+		t.Fatalf("first view: %v", views[0].Env)
+	}
+	if views[1].Env["HSA_OVERRIDE_GFX_VERSION"] != "11.0.0" {
+		t.Fatalf("second view: %v", views[1].Env)
 	}
 	if _, ok := views[2].Env["HSA_OVERRIDE_GFX_VERSION"]; ok {
 		t.Fatal("a card without an override gets none")
 	}
-	// the same override everywhere: one view, the global variable is the same thing
-	same := []ROCmCard{{PCI: "0000:aa:00.0", GFXOverride: "10.3.0", minor: 128}, {PCI: "0000:cc:00.0", GFXOverride: "10.3.0", minor: 130}}
-	if views, note := ROCmViews(same, nodes, nil, present); note != "" || len(views) != 1 || views[0].Env["HSA_OVERRIDE_GFX_VERSION"] != "10.3.0" {
-		t.Fatalf("same override: %+v %q", views, note)
-	}
-	if v, _ := ROCmViews(nil, nodes, kfd, present); v != nil {
-		t.Fatal("no cards, no view")
-	}
-}
-
-func TestKFDNodes(t *testing.T) {
-	root := t.TempDir()
-	write := func(n int, gpu, props string) {
-		d := filepath.Join(root, "class", "kfd", "kfd", "topology", "nodes", strconv.Itoa(n))
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
+	for _, v := range views {
+		for k := range v.Env {
+			if strings.HasPrefix(k, "HSA_OVERRIDE_GFX_VERSION_") {
+				t.Fatalf("the per-node form is not used: %v", v.Env)
+			}
 		}
-		os.WriteFile(filepath.Join(d, "gpu_id"), []byte(gpu+"\n"), 0o644)
-		os.WriteFile(filepath.Join(d, "properties"), []byte(props), 0o644)
 	}
-	write(0, "0", "cpu_cores_count 8\n")
-	write(2, "4321", "simd_count 80\ndrm_render_minor 129\n")
-	write(10, "1234", "drm_render_minor 128\n")
-	got := KFDNodes(root)
-	if len(got) != 3 || !got[0].cpu || got[1].minor != 129 || got[2].minor != 128 {
-		t.Fatalf("nodes %+v (numeric order)", got)
-	}
-	if KFDNodes(filepath.Join(root, "none")) != nil {
-		t.Fatal("no topology")
+	if v, _ := ROCmViews(nil, nodes); v != nil {
+		t.Fatal("no cards, no view")
 	}
 }
