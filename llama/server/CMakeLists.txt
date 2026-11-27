@@ -549,7 +549,7 @@ if(OLLAMA_RUNNER_DIR)
             )
             install(RUNTIME_DEPENDENCY_SET rocm_deps
                 DIRECTORIES ${HIP_BIN_INSTALL_DIR} ${HIP_LIB_INSTALL_DIR}
-                PRE_INCLUDE_REGEXES hipblas rocblas amdhip64 rocsolver amd_comgr hsa-runtime64 rocsparse tinfo rocprofiler-register roctx64 rocroller drm drm_amdgpu numa elf
+                PRE_INCLUDE_REGEXES hipblas rocblas amdhip64 rocsolver amd_comgr hsa-runtime64 rocsparse tinfo rocprofiler-register roctx64 rocroller drm drm_amdgpu numa elf rocm_kpack tensilelite origami rocm_sysdeps
                 PRE_EXCLUDE_REGEXES ".*"
                 POST_EXCLUDE_REGEXES "system32"
                 RUNTIME DESTINATION "${_base_dest}/${OLLAMA_RUNNER_DIR}" COMPONENT llama-server
