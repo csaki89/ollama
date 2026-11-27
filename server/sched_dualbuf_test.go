@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
+	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/multimodel"
 )
 
@@ -178,5 +181,58 @@ func TestDualbufStartupGFXOverride(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "HSA_OVERRIDE_GFX_VERSION is ignored") || !strings.Contains(buf.String(), "gfx_override") {
 		t.Fatalf("warning: %s", buf.String())
+	}
+}
+
+// envValues are the values of a variable in a subprocess environment
+func envValues(env []string, key string) []string {
+	var out []string
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// the gfx override the discovery and runner subprocesses get (both are set up by llm.SetupLlamaServerCommandEnv):
+// without a config the global HSA_OVERRIDE_GFX_VERSION; with one the rocm device's gfx_override (from its ROCm view),
+// and the global one no longer
+func TestDualbufSubprocessGFXOverride(t *testing.T) {
+	t.Cleanup(func() { discover.DualbufROCmViews = nil })
+	exe := filepath.Join(t.TempDir(), "llama-server")
+	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+
+	// no config: the stock environment
+	dualbufStartup(dualbufTestScheduler(t, "").dualbuf)
+	stock := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}}
+	cmd := exec.Command(exe)
+	llm.SetupLlamaServerCommandEnv(cmd, exe, nil, ml.GetDevicesEnv([]ml.DeviceInfo{stock}))
+	if got := envValues(cmd.Env, "HSA_OVERRIDE_GFX_VERSION"); len(got) != 1 || got[0] != "10.3.0" {
+		t.Fatalf("no config: %v", got)
+	}
+
+	// config: the device's override through its view
+	cfg := "default: {}\ndevices:\n  gpu_rocm: { backend: rocm, match: \"0000:aa:00.0\", gfx_override: 11.0.0 }\n"
+	s := dualbufTestScheduler(t, cfg)
+	dualbufStartup(s.dualbuf)
+	cards, _ := s.dualbuf.Config().ROCmCards(map[string][]string{"0000:aa:00.0": {"renderD128"}, "0000:bb:00.0": {"renderD129"}}, nil)
+	views, _ := multimodel.ROCmViews(cards, map[string][]string{"0000:aa:00.0": {"renderD128"}, "0000:bb:00.0": {"renderD129"}})
+	if len(views) != 1 {
+		t.Fatalf("views %+v", views)
+	}
+	// the discovery gets the view's environment as its extra environment, the runner the device's overrides
+	for name, extra := range map[string]map[string]string{
+		"discovery": views[0].Env,
+		"runner":    ml.GetDevicesEnv([]ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "0", RunnerEnvOverrides: views[0].Env}}),
+	} {
+		cmd := exec.Command(exe)
+		llm.SetupLlamaServerCommandEnv(cmd, exe, nil, extra)
+		if got := envValues(cmd.Env, "HSA_OVERRIDE_GFX_VERSION"); len(got) != 1 || got[0] != "11.0.0" {
+			t.Fatalf("%s: %v", name, got)
+		}
+		if got := envValues(cmd.Env, "GGML_HIP_HIDE_RENDER_NODES"); len(got) != 1 || got[0] != "renderD129" {
+			t.Fatalf("%s hidden: %v", name, got)
+		}
 	}
 }

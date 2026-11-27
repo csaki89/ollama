@@ -149,7 +149,7 @@ jobs:
           docker image inspect "$img" --format 'size: {{.Size}} bytes'
           docker run --rm --entrypoint /bin/ollama "$img" --version
           if [ "${{ github.ref_name }}" = multimodel ]; then
-            docker run --rm --entrypoint /bin/sh "$img" -c 'set -e; ls -la /usr/lib/ollama/vulkan; test -f /usr/lib/ollama/vulkan/libggml-vulkan.so; ls /usr/share/vulkan/icd.d/; ls /usr/share/vulkan/icd.d/radeon_icd*.json; test -f /usr/lib/ollama/rocm_v7_2/libggml-hide-dri.so'
+            docker run --rm --entrypoint /bin/sh "$img" -c 'set -e; ls -la /usr/lib/ollama/vulkan; test -f /usr/lib/ollama/vulkan/libggml-vulkan.so; ls /usr/share/vulkan/icd.d/; ls /usr/share/vulkan/icd.d/radeon_icd*.json; test -f /usr/lib/ollama/rocm_v7_2/libollama-hide-dri.so; test -f /usr/lib/ollama/rocm_v7_2/libggml-hip.so'
           fi
           docker run --rm --entrypoint /bin/sh "$img" -c '
             echo "== /usr/lib/ollama (sizes)"; du -sh /usr/lib/ollama /usr/lib/ollama/*/

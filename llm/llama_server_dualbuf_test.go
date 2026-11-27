@@ -162,3 +162,17 @@ func TestDualbufExtraDevicesTwoROCm(t *testing.T) {
 		t.Fatalf("env %v", env)
 	}
 }
+
+// the ROCm library directory holds the render-node hiding library too: the GPU backend is still libggml-hip.so (the
+// older name libggml-hide-dri.so sorted first and was taken as the backend: no ROCm device at all)
+func TestFindGPUBackendSkipsHideLibrary(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"libggml-base.so", "libggml-hide-dri.so", "libollama-hide-dri.so", "libggml-hip.so"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := findLlamaServerGPUBackend(dir); filepath.Base(got) != "libggml-hip.so" {
+		t.Fatalf("backend %q", got)
+	}
+}

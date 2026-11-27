@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/ml"
 )
 
@@ -32,7 +33,7 @@ type DualbufROCmView struct {
 var DualbufROCmViews func(known []ml.DeviceInfo) []DualbufROCmView
 
 // hideLibrary is the preload library that hides render nodes while the HIP backend loads (llama/compat/ggml-hide-dri.c).
-const hideLibrary = "libggml-hide-dri.so"
+const hideLibrary = "libollama-hide-dri.so"
 
 // dualbufROCmEnv adds the preload library of the ROCm library directory to a view's environment.
 func dualbufROCmEnv(view DualbufROCmView, rocmDir string) map[string]string {
@@ -139,4 +140,36 @@ func normPCIID(s string) string {
 		s = "0000:" + s
 	}
 	return s
+}
+
+// dualbufLogNoDevice: a discovery pass of a GPU library that finds no device logs its output (DEBUG: all of it; INFO: its
+// error lines), and the error lines become the pass' status error (the "left out" warning shows them).
+func dualbufLogNoDevice(libDirs []string, devs []ml.DeviceInfo, output string, status *llm.StatusWriter) {
+	if len(libDirs) < 2 || len(devs) > 0 {
+		return
+	}
+	errs := discoveryErrorLines(output)
+	slog.Debug("llama-server discovery: no device found", "libDirs", libDirs, "output", output)
+	if len(errs) > 0 {
+		slog.Info("llama-server discovery: no device found", "libDirs", libDirs, "errors", strings.Join(errs, " | "))
+		if status != nil {
+			status.AppendError(strings.Join(errs, " | "))
+		}
+	}
+}
+
+// discoveryErrorLines are the lines of a discovery output that tell why no device came up (at most 4).
+func discoveryErrorLines(output string) []string {
+	var out []string
+	for _, line := range strings.Split(output, "\n") {
+		l := strings.ToLower(line)
+		if strings.Contains(l, "error") || strings.Contains(l, "failed") || strings.Contains(l, "unable") ||
+			strings.Contains(l, "not found") || strings.Contains(l, "no rocm") || strings.Contains(l, "no cuda") || strings.Contains(l, "no vulkan") {
+			out = append(out, strings.TrimSpace(line))
+			if len(out) == 4 {
+				break
+			}
+		}
+	}
+	return out
 }

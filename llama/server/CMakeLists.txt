@@ -545,6 +545,8 @@ if(OLLAMA_RUNNER_DIR)
         # while the HIP backend loads (llama/compat/ggml-hide-dri.c)
         add_library(ggml-hide-dri SHARED ${CMAKE_CURRENT_SOURCE_DIR}/../compat/ggml-hide-dri.c)
         target_link_libraries(ggml-hide-dri PRIVATE ${CMAKE_DL_LIBS})
+        # not libggml-*: Ollama picks the GPU backend of a library directory by that name pattern
+        set_target_properties(ggml-hide-dri PROPERTIES OUTPUT_NAME ollama-hide-dri)
         install(TARGETS ggml-hide-dri OPTIONAL
             LIBRARY DESTINATION "${_base_dest}/${OLLAMA_RUNNER_DIR}" COMPONENT llama-server)
     endif()

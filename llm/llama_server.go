@@ -602,7 +602,9 @@ func isLlamaServerGPUBackend(path string) bool {
 			return false
 		}
 	}
-	return true
+	// dual-buffer fork: the render-node hiding preload library of a ROCm directory is no backend (an older build named
+	// it libggml-hide-dri.so, which sorted before libggml-hip.so and was taken as the backend)
+	return !strings.Contains(name, "hide-dri")
 }
 
 func embeddingBatchSize(opts api.Options, numParallel int) int {

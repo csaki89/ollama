@@ -161,7 +161,10 @@ func llamaServerDiscoverDevices(ctx context.Context, libDirs []string, extraEnvs
 	}
 
 	llamaOutput := string(listOutput) + "\n" + strings.Join(stderrLines, "\n")
-	return parseLlamaServerDevicesWithNative(llamaOutput, nativeStderr, libDirs, nativeDevices), status, nil
+	devs := parseLlamaServerDevicesWithNative(llamaOutput, nativeStderr, libDirs, nativeDevices)
+	// dual-buffer fork: a GPU library that finds no device says why (its output)
+	dualbufLogNoDevice(libDirs, devs, llamaOutput, status)
+	return devs, status, nil
 }
 
 func llamaServerDiscoveryOutput(ctx context.Context) io.Writer {
