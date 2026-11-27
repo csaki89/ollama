@@ -46,7 +46,8 @@ static int hidden(const char * path) {
 
 #define REAL(name, ret, ...) \
     static ret (*real_##name)(__VA_ARGS__) = NULL; \
-    if (!real_##name) { real_##name = (ret (*)(__VA_ARGS__)) dlsym(RTLD_NEXT, #name); } \n    if (!real_##name) { errno = ENOSYS; return -1; }
+    if (!real_##name) { real_##name = (ret (*)(__VA_ARGS__)) dlsym(RTLD_NEXT, #name); } \
+    if (!real_##name) { errno = ENOSYS; return -1; }
 
 static mode_t open_mode(int flags, va_list ap) {
 #ifdef O_TMPFILE
