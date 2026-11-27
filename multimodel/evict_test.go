@@ -105,3 +105,34 @@ func TestManagerParkAndPresent(t *testing.T) {
 		t.Fatal("host estimate")
 	}
 }
+
+// keep_alive runs on while a model is parked without a process: when it passes the model leaves the RAM;
+// keep_alive -1 never expires
+func TestParkedKeepAlive(t *testing.T) {
+	m := NewManager(filepath.Join(t.TempDir(), ConfigFileName), nil)
+	m.Park(&Parked{Key: "short", Model: "a", LastUsed: time.Now(), KeepAlive: 40 * time.Millisecond})
+	m.Park(&Parked{Key: "forever", Model: "b", LastUsed: time.Now().Add(-time.Hour), KeepAlive: time.Millisecond, Forever: true})
+	m.Park(&Parked{Key: "unparked", Model: "c", LastUsed: time.Now(), KeepAlive: 40 * time.Millisecond})
+	if m.Unpark("unparked") == nil {
+		t.Fatal("unpark")
+	}
+	if len(m.ParkedList()) != 2 {
+		t.Fatalf("parked: %d", len(m.ParkedList()))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(m.ParkedList()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the parked model did not expire")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if l := m.ParkedList(); l[0].Key != "forever" {
+		t.Fatalf("left: %s", l[0].Key)
+	}
+	// parked again: the earlier timer of the key is replaced
+	m.Park(&Parked{Key: "short", Model: "a", LastUsed: time.Now(), KeepAlive: time.Hour})
+	time.Sleep(80 * time.Millisecond)
+	if len(m.ParkedList()) != 2 {
+		t.Fatal("a re-park keeps the new keep_alive")
+	}
+}
