@@ -356,14 +356,14 @@ func probeROCmSysfsLinux() ([]nativeProbeDevice, error) {
 		return nil, err
 	}
 
-	override := hsaOverrideGFXTarget()
 	// Sysfs stays in physical KFD order; ROCm visibility envs can reindex the
 	// backend device list, so filtered sysfs data must merge by PCI ID only.
 	backendIndex := !rocmVisibleDevicesEnvSet()
 	devices := make([]nativeProbeDevice, 0, len(sysfsDevices))
 	for i, sysfsDevice := range sysfsDevices {
 		gfxTarget := sysfsDevice.gfxTarget
-		if override != "" {
+		// the override in effect for this card: its per-node HSA_OVERRIDE_GFX_VERSION_<KFD node>, else the global one
+		if override := rocmNodeGFXTarget(os.Getenv, sysfsDevice.node); override != "" {
 			gfxTarget = override
 		}
 		devices = append(devices, nativeProbeDevice{

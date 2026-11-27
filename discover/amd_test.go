@@ -147,6 +147,49 @@ func TestApplyLinuxROCmRefinement(t *testing.T) {
 			wantPCIIDs:     []string{"0000:c3:00.0", "0000:e3:00.0"},
 		},
 		{
+			// the ROCm runtime leaves out a card it does not support: the reported one is paired by its PCI address
+			name: "runtime reports fewer devices than kfd nodes",
+			nodes: []fakeROCmNode{
+				{
+					node:        1,
+					renderMinor: 128,
+					pciID:       "0000:bb:00.0",
+					gfxVersion:  "80003",
+					vramTotal:   2 << 30,
+					gttTotal:    32 << 30,
+				},
+				{
+					node:        2,
+					renderMinor: 129,
+					pciID:       "0000:aa:00.0",
+					gfxVersion:  "100301",
+					vramTotal:   12 << 30,
+					gttTotal:    16 << 30,
+					vramVendor:  true,
+					boardInfo:   true,
+				},
+			},
+			devices: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", GFXTarget: "gfx1030", PCIID: "0000:aa:00.0", Integrated: true},
+			},
+			applied:        true,
+			wantIntegrated: []bool{false},
+			wantPCIIDs:     []string{"0000:aa:00.0"},
+		},
+		{
+			// with fewer reported devices there is no index or gfx fallback: without a PCI address nothing is paired
+			name: "runtime reports fewer devices and no pci address",
+			nodes: []fakeROCmNode{
+				{node: 1, renderMinor: 128, pciID: "0000:bb:00.0", gfxVersion: "80003", vramTotal: 2 << 30, gttTotal: 32 << 30},
+				{node: 2, renderMinor: 129, pciID: "0000:aa:00.0", gfxVersion: "100301", vramTotal: 12 << 30, gttTotal: 16 << 30, vramVendor: true, boardInfo: true},
+			},
+			devices: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", GFXTarget: "gfx803", Integrated: true},
+			},
+			wantIntegrated: []bool{true},
+			wantPCIIDs:     []string{""},
+		},
+		{
 			name: "missing kfd data leaves devices unchanged",
 			devices: []ml.DeviceInfo{{
 				DeviceID:   ml.DeviceID{ID: "0", Library: "ROCm"},
@@ -215,7 +258,7 @@ func TestFilterUnsupportedROCmDevicesRespectsHSAOverride(t *testing.T) {
 		GFXTarget:    "gfx1031",
 		ComputeMajor: 0x10,
 		ComputeMinor: 0x31,
-	}}, []string{libDir})
+	}}, []string{libDir}, nil)
 	if len(devices) != 1 {
 		t.Fatalf("got %d devices, want 1", len(devices))
 	}
@@ -285,5 +328,51 @@ func writeFakeSysfsFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// the gfx support check takes the override in effect for the card: its per-node HSA_OVERRIDE_GFX_VERSION_<KFD node>
+// (from the discovery environment), else the global one; another node's override does not apply to it
+func TestFilterUnsupportedROCmDevicesPerNodeOverride(t *testing.T) {
+	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "")
+	libDir := t.TempDir()
+	rocblasDir := filepath.Join(libDir, "rocblas", "library")
+	if err := os.MkdirAll(rocblasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rocblasDir, "TensileLibrary_lazy_gfx1030.dat"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	card := func() []ml.DeviceInfo {
+		return []ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, Name: "ROCm0", GFXTarget: "gfx1031", PCIID: "0000:aa:00.0"}}
+	}
+	nodes := map[string]int{"0000:bb:00.0": 1, "0000:aa:00.0": 2}
+
+	got := filterUnsupportedROCmDevicesWith(card(), []string{libDir}, map[string]string{"HSA_OVERRIDE_GFX_VERSION_2": "10.3.0"}, nodes)
+	if len(got) != 1 || got[0].GFXTarget != "gfx1030" {
+		t.Fatalf("per-node override: %+v", got)
+	}
+	if got := filterUnsupportedROCmDevicesWith(card(), []string{libDir}, map[string]string{"HSA_OVERRIDE_GFX_VERSION_1": "10.3.0"}, nodes); len(got) != 0 {
+		t.Fatalf("another node's override: %+v", got)
+	}
+	if got := filterUnsupportedROCmDevicesWith(card(), []string{libDir}, map[string]string{"HSA_OVERRIDE_GFX_VERSION": "10.3.0"}, nodes); len(got) != 1 {
+		t.Fatalf("global override: %+v", got)
+	}
+	if got := filterUnsupportedROCmDevicesWith(card(), []string{libDir}, nil, nodes); len(got) != 0 {
+		t.Fatalf("no override: %+v", got)
+	}
+}
+
+func TestROCmNodeGFXTarget(t *testing.T) {
+	env := map[string]string{"HSA_OVERRIDE_GFX_VERSION_2": "10.3.0", "HSA_OVERRIDE_GFX_VERSION": "11.0.0"}
+	getenv := func(k string) string { return env[k] }
+	if got := rocmNodeGFXTarget(getenv, 2); got != "gfx1030" {
+		t.Fatalf("node 2: %q", got)
+	}
+	if got := rocmNodeGFXTarget(getenv, 1); got != "gfx1100" {
+		t.Fatalf("node 1 falls back to the global one: %q", got)
+	}
+	if got := rocmNodeGFXTarget(getenv, -1); got != "gfx1100" {
+		t.Fatalf("unknown node: %q", got)
 	}
 }

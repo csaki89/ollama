@@ -71,6 +71,17 @@ func hsaOverrideGFXTarget() string {
 	return rocmGFXTargetOverride(os.Getenv("HSA_OVERRIDE_GFX_VERSION"))
 }
 
+// rocmNodeGFXTarget is the gfx target the ROCm runtime uses for the card of a KFD topology node: its own
+// HSA_OVERRIDE_GFX_VERSION_<node>, else the global HSA_OVERRIDE_GFX_VERSION ("" = none, node < 0: the global one only).
+func rocmNodeGFXTarget(getenv func(string) string, node int) string {
+	if node >= 0 {
+		if gfx := rocmGFXTargetOverride(getenv("HSA_OVERRIDE_GFX_VERSION_" + strconv.Itoa(node))); gfx != "" {
+			return gfx
+		}
+	}
+	return rocmGFXTargetOverride(getenv("HSA_OVERRIDE_GFX_VERSION"))
+}
+
 func rocmGFXTargetOverride(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -130,6 +141,7 @@ func rocblasGFXTargets(libDirs []string) map[string]bool {
 }
 
 type rocmLinuxSysfsDevice struct {
+	node       int // KFD topology node
 	pciID      string
 	gfxTarget  string
 	integrated bool
@@ -160,10 +172,12 @@ func applyLinuxROCmRefinement(devices []ml.DeviceInfo, sysfsRoot string) bool {
 		slog.Debug("linux rocm device refinement unavailable", "error", err)
 		return false
 	}
-	if len(sysfsDevices) != len(rocmIndexes) {
-		slog.Debug("linux rocm device refinement skipped: device count mismatch",
+	// the ROCm runtime may leave out KFD nodes (a card it does not support): then the devices are paired by PCI
+	// address only, and the KFD nodes it does not report are skipped
+	byIDOnly := len(sysfsDevices) != len(rocmIndexes)
+	if byIDOnly {
+		slog.Debug("linux rocm device refinement: device count mismatch, matching by PCI address",
 			"llama_server_count", len(rocmIndexes), "kfd_count", len(sysfsDevices))
-		return false
 	}
 
 	byPCI := map[string]rocmLinuxSysfsDevice{}
@@ -177,7 +191,14 @@ func applyLinuxROCmRefinement(devices []ml.DeviceInfo, sysfsRoot string) bool {
 	refined := 0
 	for i, rocmIndex := range rocmIndexes {
 		device := &devices[rocmIndex]
-		sysfsDevice, ok := matchROCmLinuxSysfsDevice(*device, i, sysfsDevices, byPCI, byGFX)
+		var sysfsDevice rocmLinuxSysfsDevice
+		var ok bool
+		if byIDOnly {
+			sysfsDevice, ok = byPCI[strings.ToLower(device.PCIID)]
+			ok = ok && device.PCIID != ""
+		} else {
+			sysfsDevice, ok = matchROCmLinuxSysfsDevice(*device, i, sysfsDevices, byPCI, byGFX)
+		}
 		if !ok {
 			slog.Debug("linux rocm device refinement skipped: no stable match",
 				"device", device.Name, "pci_id", device.PCIID, "gfx", device.GFXTarget)
@@ -278,6 +299,7 @@ func readROCmLinuxSysfsDevices(sysfsRoot string) ([]rocmLinuxSysfsDevice, error)
 			slog.Debug("linux rocm sysfs device skipped", "node", entry.Name(), "error", err)
 			continue
 		}
+		device.node, _ = strconv.Atoi(entry.Name())
 		device.gfxTarget = gfxTargetFromKFDVersion(properties.gfxTargetVersion)
 		devices = append(devices, device)
 	}
@@ -443,14 +465,43 @@ func gfxTargetFromKFDVersion(version uint64) string {
 }
 
 // filterUnsupportedROCmDevices removes ROCm devices whose gfx target doesn't have
-// matching rocblas kernels bundled.
-func filterUnsupportedROCmDevices(devices []ml.DeviceInfo, libDirs []string) []ml.DeviceInfo {
+// matching rocblas kernels bundled. The gfx target is the one in effect for the card: its per-node
+// HSA_OVERRIDE_GFX_VERSION_<KFD node> or the global HSA_OVERRIDE_GFX_VERSION, from the discovery environment
+// (extraEnvs) or the process'.
+func filterUnsupportedROCmDevices(devices []ml.DeviceInfo, libDirs []string, extraEnvs map[string]string) []ml.DeviceInfo {
+	return filterUnsupportedROCmDevicesWith(devices, libDirs, extraEnvs, rocmKFDNodesByPCI("/sys"))
+}
+
+// rocmKFDNodesByPCI maps the PCI address of every KFD GPU node to its node number (nil when the topology is not there).
+func rocmKFDNodesByPCI(sysfsRoot string) map[string]int {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	sysfsDevices, err := readROCmLinuxSysfsDevices(sysfsRoot)
+	if err != nil {
+		return nil
+	}
+	out := map[string]int{}
+	for _, d := range sysfsDevices {
+		if d.pciID != "" {
+			out[strings.ToLower(d.pciID)] = d.node
+		}
+	}
+	return out
+}
+
+func filterUnsupportedROCmDevicesWith(devices []ml.DeviceInfo, libDirs []string, extraEnvs map[string]string, nodesByPCI map[string]int) []ml.DeviceInfo {
 	supported := rocblasGFXTargets(libDirs)
 	if len(supported) == 0 {
 		return devices
 	}
 
-	override := hsaOverrideGFXTarget()
+	getenv := func(k string) string {
+		if v, ok := extraEnvs[k]; ok {
+			return v
+		}
+		return os.Getenv(k)
+	}
 	var filtered []ml.DeviceInfo
 	for _, dev := range devices {
 		if dev.Library != "ROCm" {
@@ -458,7 +509,11 @@ func filterUnsupportedROCmDevices(devices []ml.DeviceInfo, libDirs []string) []m
 			continue
 		}
 
-		setROCmGFXTarget(&dev, override)
+		node := -1
+		if n, ok := nodesByPCI[strings.ToLower(dev.PCIID)]; ok && dev.PCIID != "" {
+			node = n
+		}
+		setROCmGFXTarget(&dev, rocmNodeGFXTarget(getenv, node))
 		gfx := dev.GFXTarget
 		if gfx == "" {
 			filtered = append(filtered, dev)
@@ -469,7 +524,7 @@ func filterUnsupportedROCmDevices(devices []ml.DeviceInfo, libDirs []string) []m
 		} else {
 			slog.Warn("dropping ROCm device — no rocblas support for gfx target",
 				"device", dev.Name, "gfx_target", gfx, "supported", supported,
-				"hint", "set HSA_OVERRIDE_GFX_VERSION to map to a supported target")
+				"hint", "set HSA_OVERRIDE_GFX_VERSION (or the card's HSA_OVERRIDE_GFX_VERSION_<KFD node>; with a multi-model config its gfx_override) to map to a supported target")
 		}
 	}
 	return filtered
