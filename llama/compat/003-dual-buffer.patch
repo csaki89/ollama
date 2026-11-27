@@ -25,7 +25,7 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel aba5e60cf): the compute power state of an AMD GPU for the Vulkan backend through an empty KFD compute queue, from the first backend until the model is unloaded; llama_move_device and POST /move (the GPU part to another GPU of the process, K/V kept); GGML_BACKEND_PATH as a list of backends
+multimodel (csaki89/llama.cpp multimodel fbf25bb31): the compute power state of an AMD GPU for the Vulkan backend through an empty KFD compute queue, from the first backend until the model is unloaded; llama_move_device and POST /move (the GPU part to another GPU of the process, K/V kept); GGML_BACKEND_PATH as a list of backends; the render nodes of GGML_HIP_HIDE_RENDER_NODES hidden while the HIP backend loads
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 51f226e96..97748754c 100644
@@ -266,6 +266,42 @@ index afb86338a..aefd49b49 100644
      // Split graph without allocating it
      GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
  
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index 4e9681c9f..685d5b2cb 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -218,6 +218,31 @@ struct ggml_backend_registry {
+     }
+ 
+     ggml_backend_reg_t load_backend(const fs::path & path, bool silent) {
++        // dual-buffer fork: while the HIP (ROCm) backend loads and its runtime starts, the render nodes listed in
++        // GGML_HIP_HIDE_RENDER_NODES are hidden from the process (GGML_HIDE_RENDER_NODES, read by the ggml-hide-dri
++        // preload library): the ROCm runtime does not open the other cards, the other backends still see them
++        struct hide_scope {
++            bool on = false;
++            explicit hide_scope(const fs::path & p) {
++#ifndef _WIN32
++                const char * list = getenv("GGML_HIP_HIDE_RENDER_NODES");
++                if (list && *list && path_str(p.filename()).find("hip") != std::string::npos) {
++                    setenv("GGML_HIDE_RENDER_NODES", list, 1);
++                    on = true;
++                }
++#else
++                GGML_UNUSED(p);
++#endif
++            }
++            ~hide_scope() {
++#ifndef _WIN32
++                if (on) {
++                    unsetenv("GGML_HIDE_RENDER_NODES");
++                }
++#endif
++            }
++        } hide(path);
++
+         dl_handle_ptr handle { dl_load_library(path) };
+         if (!handle) {
+             if (!silent) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 3520b4349..cfbc3fead 100644
 --- a/ggml/src/ggml-backend.cpp
