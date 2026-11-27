@@ -5,10 +5,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"os"
+	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -31,7 +34,34 @@ type dualbufLoad struct {
 }
 
 func newDualbufManager() *multimodel.Manager {
-	return multimodel.NewManager(multimodel.DefaultPath(envconfig.Var, envconfig.Models()), envconfig.Var)
+	m := multimodel.NewManager(multimodel.DefaultPath(envconfig.Var, envconfig.Models()), envconfig.Var)
+	// the requests waiting for their place count against the stock queue limit
+	m.Coord.SetMaxQueue(int(envconfig.MaxQueue()))
+	return m
+}
+
+// dualbufString is an atomic string (the demote target of a victim).
+type dualbufString struct{ p atomic.Pointer[string] }
+
+func (a *dualbufString) Load() string {
+	if v := a.p.Load(); v != nil {
+		return *v
+	}
+	return ""
+}
+
+func (a *dualbufString) Store(v string) { a.p.Store(&v) }
+
+func (a *dualbufString) Swap(v string) string {
+	if old := a.p.Swap(&v); old != nil {
+		return *old
+	}
+	return ""
+}
+
+// dualbufHostKey is the key of the measured host RAM: the model and the device it ran on.
+func dualbufHostKey(key, placement string) string {
+	return key + "\x00@" + placement
 }
 
 func dualbufModelName(m *Model) string {
@@ -51,14 +81,10 @@ func dualbufFingerprint(m *Model) string {
 	return m.dualbuf.launch.Fingerprint() + "@" + m.dualbuf.placement
 }
 
-// schedulerModelKey: one instance per model and placed device (the CPU instance of a GPU model is another
-// runner); without a placement the key is Ollama's.
+// schedulerModelKey: one instance per model, wherever it is placed (a placement change reloads, unparks or runs
+// on the parked instance; it never starts a second instance).
 func schedulerModelKey(m *Model) string {
-	key := schedulerModelKeyBase(m)
-	if key != "" && m.dualbuf != nil && m.dualbuf.placement != "" {
-		key += "\x00@" + m.dualbuf.placement
-	}
-	return key
+	return schedulerModelKeyBase(m)
 }
 
 // dualbufConfigFor is the config a request resolves with: while the model is loaded, the snapshot it was
@@ -105,7 +131,19 @@ func (s *Scheduler) dualbufPrepare(ctx context.Context, m *Model, requestOpts ma
 		if len(devices) == 0 {
 			slog.Warn("dualbuf: none of the model's devices was found, Ollama places it", "model", name, "devices", eff.Devices.V)
 		} else {
-			g, err := s.dualbuf.Coord.Acquire(ctx, multimodel.Request{Model: name, Devices: devices, OnBusy: eff.OnBusy.V, WaitTimeout: eff.WaitTimeout.V})
+			key := schedulerModelKeyBase(m)
+			_, hasCPU := cfg.Devices[multimodel.DeviceCPU]
+			extra := func(d string) []string {
+				// a model seen split between this GPU and the CPU makes the CPU busy too
+				if hasCPU && d != multimodel.DeviceCPU && s.dualbuf.Split(key, d) {
+					return []string{multimodel.DeviceCPU}
+				}
+				return nil
+			}
+			g, err := s.dualbuf.Coord.Acquire(ctx, multimodel.Request{Model: name, Key: key, Devices: devices, OnBusy: eff.OnBusy.V, WaitTimeout: eff.WaitTimeout.V, Extra: extra})
+			if errors.Is(err, multimodel.ErrQueueFull) {
+				return nil, nil, nil, ErrMaxQueue
+			}
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -142,8 +180,12 @@ func (s *Scheduler) dualbufStarted(ctx context.Context, m *Model, llama llm.Llam
 	if grant == nil {
 		return
 	}
-	if m != nil && m.dualbuf != nil && m.dualbuf.placement != "" && m.dualbuf.placement != multimodel.DeviceCPU && m.dualbuf.cfg.MaxRunning(multimodel.DeviceCPU) > 0 {
-		if o, ok := llama.(cpuOffloader); ok && o.OffloadsToCPU() {
+	if m != nil && m.dualbuf != nil && m.dualbuf.placement != "" && m.dualbuf.placement != multimodel.DeviceCPU && !m.dualbuf.viaParked {
+		o, ok := llama.(cpuOffloader)
+		split := ok && o.OffloadsToCPU()
+		// remembered for the next requests: they take the GPU and the CPU place together
+		s.dualbuf.SetSplit(schedulerModelKeyBase(m), m.dualbuf.placement, split)
+		if _, hasCPU := m.dualbuf.cfg.Devices[multimodel.DeviceCPU]; split && hasCPU {
 			if err := grant.Also(ctx, multimodel.DeviceCPU); err != nil {
 				slog.Debug("dualbuf: request ended while waiting for the CPU place", "error", err)
 			}
@@ -274,6 +316,7 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 		return false
 	}
 	key := schedulerModelKey(req.model)
+	hostKey := dualbufHostKey(key, db.placement)
 	size := modelFileSize(req.model.modelPaths()...)
 	need := size
 	if db.placement != multimodel.DeviceCPU && len(gpus) > 0 {
@@ -286,7 +329,7 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 			need *= 2
 		}
 	}
-	need = s.dualbuf.HostEstimate(key, need)
+	need = s.dualbuf.HostEstimate(hostKey, need)
 	ram := multimodel.PlanRAM(db.cfg, systemInfo.TotalMemory, systemInfo.FreeMemory)
 	// the runners' driver host memory the cgroup does not see (Vulkan host buffers) is used all the same; a system reading has
 	// it already (also under a ram_limit: the limit replaces the cgroup's, not the usage)
@@ -370,44 +413,96 @@ func (s *Scheduler) dualbufRoom(req *LlmRequest, systemInfo ml.SystemInfo, gpus 
 	return false
 }
 
-// dualbufVictim is the runner to expire for a pending request: the RAM victim chosen by dualbufRoom, else
-// (the model does not fit on its device) the least recently used idle model on the same device, which is
-// parked when swap is on; otherwise Ollama's choice.
+// dualbufVictim is the runner to expire (or park) for a pending request that needs room: the RAM victim chosen by
+// dualbufRoom, else the room is made on the request's device (docs/MULTIMODEL-DESIGN.md 2.6):
+//   - only idle models move: an active one is never a victim (when no idle model is there, it waits);
+//   - the least recently used idle model on the device first (another device's only for OLLAMA_MAX_LOADED_MODELS);
+//   - it is demoted one tier down its own list when a request of it waits and its list has a lower tier (its
+//     waiting request is served there; the load there makes room the same way: chaining), else parked;
+//   - parked: with swap.enabled, and always for a keep_alive -1 model (never unloaded); else unloaded.
+//
+// Without a placement (no config, no device list) Ollama chooses.
 func (s *Scheduler) dualbufVictim(req *LlmRequest) *runnerRef {
 	if v := req.dualbufVictim; v != nil {
 		req.dualbufVictim = nil
 		return v
 	}
 	db := req.model.dualbuf
-	if db == nil || db.placement == "" || db.placement == multimodel.DeviceCPU {
+	if db == nil || db.placement == "" {
 		return s.findRunnerToUnload()
 	}
+	for {
+		if pick := s.dualbufPickVictim(req, true); pick != nil {
+			return pick
+		}
+		if pick := s.dualbufPickVictim(req, false); pick != nil {
+			return pick
+		}
+		// every model that could make room is active: wait until one is idle
+		select {
+		case <-req.ctx.Done():
+			return nil
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// dualbufPickVictim picks the least recently used idle model (on the request's device, or anywhere with
+// sameDevice false) and decides how it moves; nil when there is none.
+func (s *Scheduler) dualbufPickVictim(req *LlmRequest, sameDevice bool) *runnerRef {
+	db := req.model.dualbuf
+	reqKey := schedulerModelKey(req.model)
 	s.loadedMu.Lock()
-	var same []*runnerRef
+	var pick *runnerRef
 	for _, r := range s.loaded {
-		if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && lm.dualbuf.placement == db.placement && !runnerParked(r) {
-			same = append(same, r)
+		if r.modelKey == reqKey || runnerParked(r) {
+			continue
+		}
+		lm := r.model.Load()
+		if sameDevice && (lm == nil || lm.dualbuf == nil || lm.dualbuf.placement != db.placement) {
+			continue
+		}
+		r.refMu.Lock()
+		idle := r.refCount == 0 && !r.loading
+		r.refMu.Unlock()
+		if idle && !s.dualbuf.Coord.Active(r.modelKey) && (pick == nil || r.dualbufLastUsed.Load() < pick.dualbufLastUsed.Load()) {
+			pick = r
 		}
 	}
 	s.loadedMu.Unlock()
-	var pick *runnerRef
-	pickIdle := false
-	for _, r := range same {
-		r.refMu.Lock()
-		idle := r.refCount == 0
-		r.refMu.Unlock()
-		if pick == nil || (idle && !pickIdle) || (idle == pickIdle && r.dualbufLastUsed.Load() < pick.dualbufLastUsed.Load()) {
-			pick, pickIdle = r, idle
+	if pick == nil {
+		return nil
+	}
+	s.dualbufDecideMove(pick, db.cfg)
+	slog.Info("dualbuf: making room on the device", "device", db.placement, "for", dualbufModelName(req.model), "victim", pick.modelPath,
+		"demote_to", pick.dualbufDemoteTo.Load(), "park", pick.dualbufPark.Load())
+	return pick
+}
+
+// dualbufDecideMove sets how an idle victim leaves its place: demoted one tier down when a request of it waits
+// and its list has one, else parked (swap.enabled, or keep_alive -1), else unloaded.
+func (s *Scheduler) dualbufDecideMove(r *runnerRef, cfg *multimodel.Config) {
+	r.refMu.Lock()
+	forever := r.sessionDuration == time.Duration(math.MaxInt64)
+	r.dualbufForever.Store(forever)
+	r.dualbufKeepAlive.Store(int64(r.sessionDuration))
+	r.refMu.Unlock()
+	r.dualbufDemoteTo.Store("")
+	if lm := r.model.Load(); lm != nil && lm.dualbuf != nil && s.dualbuf.Coord.HasWaiter(r.modelKey) {
+		list := s.dualbuf.Present(lm.dualbuf.cfg, lm.dualbuf.eff.Devices.V)
+		if i := slices.Index(list, lm.dualbuf.placement); i >= 0 && i+1 < len(list) {
+			r.dualbufDemoteTo.Store(list[i+1])
 		}
 	}
-	if pick == nil {
-		return s.findRunnerToUnload()
+	r.dualbufPark.Store(cfg.SwapEnabled() || forever)
+}
+
+// dualbufMoved: the victim left its place; a demoted model's waiting requests accept the lower tier now.
+func (s *Scheduler) dualbufMoved(r *runnerRef) {
+	if to := r.dualbufDemoteTo.Swap(""); to != "" && s.dualbuf != nil {
+		slog.Info("dualbuf: model demoted", "model", r.modelPath, "to", to)
+		s.dualbuf.Coord.Demote(r.modelKey, to)
 	}
-	if db.cfg.SwapEnabled() {
-		pick.dualbufPark.Store(true)
-	}
-	slog.Info("dualbuf: making room on the device", "device", db.placement, "for", dualbufModelName(req.model), "victim", pick.modelPath, "idle", pickIdle, "park", db.cfg.SwapEnabled())
-	return pick
 }
 
 // dualbufBeforeUnload saves what has to survive an unload: on a swap (park) the KV goes to RAM and the model
@@ -421,7 +516,9 @@ func (s *Scheduler) dualbufBeforeUnload(runner *runnerRef) {
 		return
 	}
 	db := m.dualbuf
-	park := runner.dualbufPark.Swap(false) && db.cfg.SwapEnabled()
+	// a park keeps the model (swap.enabled, or a keep_alive -1 model, which is never unloaded); else a full unload
+	park := runner.dualbufPark.Swap(false)
+	defer s.dualbufMoved(runner)
 	nvme := db.eff.KVSave.V
 	saveRAM := park && db.cfg.SwapSaveKV()
 	saver, ok := runner.llama.(slotSaver)
@@ -473,7 +570,7 @@ func (s *Scheduler) dualbufBeforeUnload(runner *runnerRef) {
 		return
 	}
 	p := &multimodel.Parked{Key: runner.modelKey, Model: dualbufModelName(m), Placement: db.placement, LastUsed: time.Unix(0, runner.dualbufLastUsed.Load()),
-		Forever: runner.sessionDuration == time.Duration(math.MaxInt64)}
+		Forever: runner.dualbufForever.Load(), KeepAlive: time.Duration(runner.dualbufKeepAlive.Load())}
 	if saved {
 		p.Prefix = prefix
 		p.Bytes += uint64(kvBytes)
@@ -503,7 +600,7 @@ func (s *Scheduler) dualbufAfterLoad(runner *runnerRef) {
 	if m == nil || m.dualbuf == nil {
 		return
 	}
-	s.dualbuf.NoteHost(runner.modelKey, runner.totalSize-min(runner.totalSize, runner.vramSize))
+	s.dualbuf.NoteHost(dualbufHostKey(runner.modelKey, m.dualbuf.placement), runner.totalSize-min(runner.totalSize, runner.vramSize))
 	parked := s.dualbuf.Unpark(runner.modelKey)
 	if parked != nil {
 		defer parked.Pinned.Release()
@@ -658,6 +755,7 @@ func (s *Scheduler) dualbufTryPark(r *runnerRef) bool {
 		return false
 	}
 	r.dualbufPark.Store(false)
+	s.dualbufMoved(r)
 	slog.Info("dualbuf: model parked in process", "model", name, "duration", took.Round(time.Millisecond), "vram_before", format.HumanBytes2(p.ParkedVRAM()))
 	return true
 }
@@ -725,15 +823,15 @@ func (s *Scheduler) dualbufVictimExcept(req *LlmRequest, except *runnerRef) *run
 			continue
 		}
 		r.refMu.Lock()
-		idle := r.refCount == 0
+		idle := r.refCount == 0 && !r.loading
 		r.refMu.Unlock()
-		if idle && (pick == nil || r.dualbufLastUsed.Load() < pick.dualbufLastUsed.Load()) {
+		if idle && !s.dualbuf.Coord.Active(r.modelKey) && (pick == nil || r.dualbufLastUsed.Load() < pick.dualbufLastUsed.Load()) {
 			pick = r
 		}
 	}
 	s.loadedMu.Unlock()
-	if pick != nil && db.cfg.SwapEnabled() {
-		pick.dualbufPark.Store(true)
+	if pick != nil {
+		s.dualbufDecideMove(pick, db.cfg)
 	}
 	return pick
 }

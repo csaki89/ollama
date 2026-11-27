@@ -383,6 +383,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					runnerToExpire = s.dualbufVictim(pending)
 				}
 
+				if runnerToExpire == nil && pending.ctx.Err() != nil {
+					// dual-buffer fork: the request ended while waiting for an idle model to make room
+					break
+				}
 				if runnerToExpire == nil {
 					// While we were performing load calculations, the loaded runner(s) unloaded in parallel
 					// so findRunnerToUnload returned no runners.  We'll try again and the loadedCount should be zero
@@ -1428,6 +1432,10 @@ type runnerRef struct {
 	// dual-buffer fork: last use (unix ns, for the LRU) and whether the next unload parks the model
 	dualbufLastUsed atomic.Int64
 	dualbufPark     atomic.Bool
+	// dual-buffer fork: how a victim moves (sched_dualbuf.go dualbufDecideMove): demote target, its keep alive
+	dualbufDemoteTo  dualbufString
+	dualbufForever   atomic.Bool
+	dualbufKeepAlive atomic.Int64
 }
 
 // The refMu must already be held when calling unload

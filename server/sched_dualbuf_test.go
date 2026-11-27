@@ -70,7 +70,7 @@ func TestDualbufPrepareAndQueue(t *testing.T) {
 	if ka == nil || ka.Duration != 30*time.Minute {
 		t.Fatalf("keep alive from defaults: %+v", ka)
 	}
-	if k := schedulerModelKey(m2); k != "/models/a\x00@cpu" {
+	if k := schedulerModelKey(m2); k != "/models/a" {
 		t.Fatalf("key %q", k)
 	}
 	if dualbufFingerprint(m2) == "" {
