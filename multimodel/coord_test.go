@@ -343,3 +343,77 @@ func TestCoordReleaseOnDone(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// the CPU keeps its strict order: a waiting request that claims it (a split model's CPU, or the CPU accepted after
+// its wait_timeout) keeps it from every later request, a request on another free device starts at once
+func TestCoordCPUStrictOrder(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "gpu1", "cpu"))
+	g0 := mustAcquire(t, c, req("h0", OnBusyWait, time.Minute, "gpu0"))
+	gc := mustAcquire(t, c, req("hc", OnBusyWait, time.Minute, "cpu"))
+	// a split model on gpu0 (it also computes on the CPU): it waits for gpu0 and claims the cpu
+	split := req("split", OnBusyWait, forever, "gpu0")
+	split.Extra = func(d string) []string {
+		if d == "gpu0" {
+			return []string{"cpu"}
+		}
+		return nil
+	}
+	s := acquireAsync(c, context.Background(), split)
+	waitQueued(t, c, 1)
+	// the CPU accepted after one wait_timeout
+	x := acquireAsync(c, context.Background(), req("x", OnBusyWait, 20*time.Millisecond, "gpu0", "cpu"))
+	waitQueued(t, c, 2)
+	time.Sleep(50 * time.Millisecond)
+	y := acquireAsync(c, context.Background(), req("y", OnBusyNext, 0, "cpu"))
+	waitQueued(t, c, 3)
+	// gpu1 is claimed by none of them
+	if g := mustAcquire(t, c, req("z", OnBusyWait, time.Minute, "gpu1")); g.Device != "gpu1" {
+		t.Fatalf("z: %+v", g)
+	} else {
+		g.Release()
+	}
+	// the cpu frees: the split model still waits for gpu0, and it claims the cpu first: neither x nor y takes it
+	gc.Release()
+	still(t, x)
+	still(t, y)
+	g0.Release()
+	gs := got(t, s, "gpu0")
+	if len(gs.held) != 2 {
+		t.Fatalf("the split model holds gpu0 and the cpu: %v", gs.held)
+	}
+	gs.Release()
+	// in order: x (gpu0 first, it is free), then y on the cpu
+	got(t, x, "gpu0").Release()
+	got(t, y, "cpu").Release()
+}
+
+// a waiting request starts on the event itself: the release of a place, the expiry of its wait_timeout (no polling)
+func TestCoordStartsOnEvents(t *testing.T) {
+	c := NewCoordinator(one("gpu0", "cpu"))
+	var released [][]string
+	c.SetOnRelease(func(d []string) { released = append(released, d) })
+	g0 := mustAcquire(t, c, req("h0", OnBusyWait, time.Minute, "gpu0"))
+	ch := acquireAsync(c, context.Background(), req("a", OnBusyWait, forever, "gpu0"))
+	waitQueued(t, c, 1)
+	at := time.Now()
+	g0.Release()
+	ga := got(t, ch, "gpu0")
+	if d := time.Since(at); d > 50*time.Millisecond {
+		t.Fatalf("started %v after the release", d)
+	}
+	ga.Release()
+	if len(released) != 2 || released[0][0] != "gpu0" {
+		t.Fatalf("release callback: %v", released)
+	}
+
+	// the timeout: the next tier is accepted and checked at once
+	g0 = mustAcquire(t, c, req("h0", OnBusyWait, time.Minute, "gpu0"))
+	start := time.Now()
+	ch = acquireAsync(c, context.Background(), req("b", OnBusyWait, 60*time.Millisecond, "gpu0", "cpu"))
+	gb := got(t, ch, "cpu")
+	if d := time.Since(start); d < 60*time.Millisecond || d > 150*time.Millisecond {
+		t.Fatalf("started %v after the request, want right after its 60ms wait_timeout", d)
+	}
+	gb.Release()
+	g0.Release()
+}

@@ -33,6 +33,8 @@ type Coordinator struct {
 	limit    func(device string) int // max_running, 0 = no limit
 	maxQueue int                     // 0 = no limit
 	now      func() time.Time
+	// onRelease is told the devices a finished request gave back (the server's loads waiting for room try again)
+	onRelease func(devices []string)
 }
 
 type waiter struct {
@@ -59,6 +61,13 @@ func NewCoordinator(limit func(device string) int) *Coordinator {
 func (c *Coordinator) SetMaxQueue(n int) {
 	c.mu.Lock()
 	c.maxQueue = n
+	c.mu.Unlock()
+}
+
+// SetOnRelease sets the function told the devices of each released grant (called without the coordinator's lock).
+func (c *Coordinator) SetOnRelease(f func(devices []string)) {
+	c.mu.Lock()
+	c.onRelease = f
 	c.mu.Unlock()
 }
 
@@ -211,7 +220,12 @@ func (g *Grant) Release() {
 		}
 		delete(c.active, g.key)
 		c.dispatchLocked()
+		held := slices.Clone(g.held)
+		onRelease := c.onRelease
 		c.mu.Unlock()
+		if onRelease != nil {
+			onRelease(held)
+		}
 	})
 }
 
