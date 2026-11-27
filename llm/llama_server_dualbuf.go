@@ -12,10 +12,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/ml"
 )
 
 // Dual-buffer fork (multimodel): per model llama-server settings and what the scheduler reads back.
@@ -368,4 +371,129 @@ func (s *llamaServerRunner) parkAction(ctx context.Context, park bool) (time.Dur
 		return took, fmt.Errorf("%s: %s: %s", path, resp.Status, strings.TrimSpace(string(data)))
 	}
 	return took, nil
+}
+
+// Move puts the model's GPU part on another GPU of the process (POST /move): parked first if it is not, the K/V goes
+// over through the host, the GPU weights load from the model file onto the new device, the CPU layers stay. to is the
+// target's discovered device; its PCI bus id names it to llama-server (else its name). The runner's device memory is
+// accounted on the new device from then on.
+func (s *llamaServerRunner) Move(ctx context.Context, to ml.DeviceInfo) (time.Duration, error) {
+	target := to.PCIID
+	if target == "" {
+		target = to.Name
+	}
+	body, _ := json.Marshal(map[string]string{"device": target})
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/move", s.port), bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var r struct {
+		Success  bool    `json:"success"`
+		Parked   bool    `json:"parked"`
+		Device   string  `json:"device"`
+		From     string  `json:"from"`
+		Message  string  `json:"message"`
+		Demoted  uint64  `json:"demoted_bytes"`
+		HostUnch *uint64 `json:"host_uncharged_bytes"`
+	}
+	_ = json.Unmarshal(data, &r)
+	took := time.Since(start)
+	s.memoryMu.Lock()
+	s.dualbufPark.parked = r.Parked
+	s.dualbufPark.demoted = r.Demoted
+	if r.HostUnch != nil {
+		s.dualbufPark.hostUncharged = *r.HostUnch
+	}
+	if r.Device != "" && r.Device != r.From {
+		// the device the model is on now: its buffers and the VRAM accounting go there
+		moved := to
+		moved.Name = r.Device
+		s.gpus = []ml.DeviceInfo{moved}
+		if s.output != nil && s.output.buffers != nil {
+			renameDeviceBuffers(s.output.buffers, r.From, r.Device)
+		}
+		if old, ok := s.vramByDevice[r.From]; ok {
+			delete(s.vramByDevice, r.From)
+			s.vramByDevice[r.Device] = old
+		}
+	}
+	if s.output != nil && s.output.buffers != nil {
+		s.output.updateRunnerMemoryLocked()
+	}
+	s.memoryMu.Unlock()
+	if resp.StatusCode != http.StatusOK || !r.Success {
+		return took, fmt.Errorf("move to %s: %s: %s", target, resp.Status, strings.TrimSpace(string(data)))
+	}
+	return took, nil
+}
+
+// renameDeviceBuffers moves the parsed buffer sizes of a device to its new name (a move to another GPU).
+func renameDeviceBuffers(buffers map[memoryBufferKey]memoryBuffer, from, to string) {
+	if from == "" || to == "" || from == to {
+		return
+	}
+	for key, b := range buffers {
+		if deviceName(key.backend) != from {
+			continue
+		}
+		delete(buffers, key)
+		nk := key
+		nk.backend = to + strings.TrimPrefix(key.backend, from)
+		buffers[nk] = b
+	}
+}
+
+// dualbufExtraDevices: a model that can move between GPUs loads the backends of the other GPUs of its list too
+// (llama-server --park, POST /move). Every card is visible to its own backend only, and the active device's backend
+// comes first (it is device 0 for --main-gpu 0). Without extra devices it changes nothing.
+func dualbufExtraDevices(gpus, extra []ml.DeviceInfo, gpuLibs []string, env map[string]string) ([]string, map[string]string) {
+	if len(extra) == 0 || len(gpus) == 0 {
+		return gpuLibs, env
+	}
+	all := append(slices.Clone(gpus), extra...)
+	gpuLibs = ml.LibraryPaths(all)
+	out := map[string]string{}
+	// ROCm filters by itself (and keeps its ordinals); Vulkan and CUDA are filtered one device at a time
+	var rocm []ml.DeviceInfo
+	for _, d := range all {
+		if d.Library == "ROCm" {
+			rocm = append(rocm, d)
+		}
+	}
+	for k, v := range ml.GetDevicesEnv(rocm) {
+		out[k] = v
+	}
+	for _, d := range all {
+		if d.Library == "ROCm" {
+			continue
+		}
+		for k, v := range ml.GetDevicesEnv([]ml.DeviceInfo{d}) {
+			if old, ok := out[k]; ok && (k == "GGML_VK_VISIBLE_DEVICES" || k == "CUDA_VISIBLE_DEVICES") {
+				out[k] = old + "," + v
+			} else {
+				out[k] = v
+			}
+		}
+	}
+	var backends []string
+	for _, dir := range gpuLibs {
+		if dir == ml.LibOllamaPath {
+			continue
+		}
+		if b := findLlamaServerGPUBackend(dir); b != "" && !slices.Contains(backends, b) {
+			backends = append(backends, b)
+		}
+	}
+	if len(backends) > 0 {
+		out["GGML_BACKEND_PATH"] = strings.Join(backends, string(filepath.ListSeparator))
+	}
+	return gpuLibs, out
 }

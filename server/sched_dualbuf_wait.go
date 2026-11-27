@@ -125,7 +125,7 @@ func (s *Scheduler) dualbufMustWait(ctx context.Context, pending *LlmRequest, ru
 		}
 		pending.dualbufWaitFor = nil
 	}
-	if runner != nil && !runner.needsReload(ctx, pending) && !dualbufNeedsUnpark(runner, pending) {
+	if runner != nil && !runner.needsReload(ctx, pending) && !dualbufNeedsChange(runner, pending) {
 		return false
 	}
 	claims := s.dualbufClaims(pending)

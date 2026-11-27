@@ -984,6 +984,8 @@ func NewLlamaServerRunner(
 
 	mediaMarker := newLlamaServerMediaMarker()
 	extraEnvs := ml.GetDevicesEnv(gpus)
+	// dual-buffer fork: the backends of the other GPUs a model moves to in process
+	gpuLibs, extraEnvs = dualbufExtraDevices(gpus, config.ExtraDevices, gpuLibs, extraEnvs)
 	serverEnvs := make(map[string]string, len(extraEnvs)+1)
 	for k, v := range extraEnvs {
 		serverEnvs[k] = v

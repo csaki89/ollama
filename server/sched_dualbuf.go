@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +33,8 @@ type dualbufLoad struct {
 	firstDevice string   // the first present device of the model's list
 	tiers       []string // the present devices of the model's list, highest tier first
 	viaParked   bool     // a CPU request served by the parked GPU instance of the model (no unpark, no CPU instance)
+	// the other GPUs of the list a model that moves in process loads the backends for (set at the placement)
+	extraGPUs []ml.DeviceInfo
 }
 
 // movesInProcess: a GPU placement whose list has another tier: the tier changes run in the process (park to the CPU,
@@ -84,6 +87,10 @@ func dualbufModelName(m *Model) string {
 func dualbufFingerprint(m *Model) string {
 	if m == nil || m.dualbuf == nil {
 		return ""
+	}
+	if m.dualbuf.movesInProcess() {
+		// the tier changes of its list run in the process (park, unpark, move): the placement is not a reload
+		return m.dualbuf.launch.Fingerprint() + "@moves:" + strings.Join(m.dualbuf.tiers, ",")
 	}
 	return m.dualbuf.launch.Fingerprint() + "@" + m.dualbuf.placement
 }
@@ -171,6 +178,12 @@ func (s *Scheduler) dualbufPrepare(ctx context.Context, m *Model, requestOpts ma
 						db.viaParked = true
 						slog.Info("dualbuf: the CPU request runs on the parked instance", "model", name, "instance", db.placement)
 					}
+				} else if lr := s.dualbufMovableFor(m); lr != nil {
+					// the GPU instance parks first and runs it on the CPU in its process (with its K/V), no reload
+					lm := lr.model.Load()
+					db.placement = lm.dualbuf.placement
+					db.viaParked = true
+					slog.Info("dualbuf: the CPU request parks the model's GPU instance and runs there", "model", name, "instance", db.placement)
 				} else {
 					opts.NumGPU = 0
 				}
@@ -220,6 +233,22 @@ func (s *Scheduler) dualbufPlacementGPUs(req *LlmRequest, systemInfo ml.SystemIn
 		for _, g := range gpus {
 			if g.DeviceID == want.Info.DeviceID {
 				sel, o := singleLlamaServerGPUPlacement(g, opts)
+				db.extraGPUs = nil
+				if db.movesInProcess() {
+					// the other GPUs of its list: the process loads their backends, the model can move there
+					for _, t := range db.tiers {
+						if t == db.placement || t == multimodel.DeviceCPU {
+							continue
+						}
+						if d, ok := dm.ByName[t]; ok {
+							for _, x := range gpus {
+								if x.DeviceID == d.Info.DeviceID {
+									db.extraGPUs = append(db.extraGPUs, x)
+								}
+							}
+						}
+					}
+				}
 				slog.Info("dualbuf: model placed on its device", "model", dualbufModelName(req.model), "device", db.placement,
 					"id", g.ID, "library", g.Library, "description", g.Description, "pci_id", g.PCIID, "free", format.HumanBytes2(g.FreeMemory))
 				return sel, o
@@ -281,6 +310,7 @@ func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServer
 	}
 	config.ArgOverrides = db.launch.Args
 	config.KVCacheType = db.launch.KVType
+	config.ExtraDevices = db.extraGPUs
 	if db.movesInProcess() || (db.cfg.SwapEnabled() && db.cfg.Swap.KeepInRAM == multimodel.KeepInRAMPinned && db.placement != multimodel.DeviceCPU) {
 		// in-process moves and swap: pinned GPU-format copies of the GPU weights (llama-server POST /park, /unpark)
 		config.ExtraEnv["LLAMA_ARG_PARK"] = "1"
@@ -720,6 +750,22 @@ func (s *Scheduler) dualbufParkedCountLocked() int {
 	return n
 }
 
+// dualbufMovableFor is the model's loaded GPU instance that can park in process (a CPU request then runs on it).
+func (s *Scheduler) dualbufMovableFor(m *Model) *runnerRef {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	for _, r := range s.loaded {
+		lm := r.model.Load()
+		if lm == nil || lm.ModelPath != m.ModelPath || lm.dualbuf == nil || !lm.dualbuf.movesInProcess() || runnerParked(r) {
+			continue
+		}
+		if p, ok := runnerParker(r); ok && p.CanPark() {
+			return r
+		}
+	}
+	return nil
+}
+
 // dualbufParkedFor is a parked GPU instance of the model (for a request placed on the CPU: it runs there without a reload).
 func (s *Scheduler) dualbufParkedFor(m *Model) *runnerRef {
 	s.loadedMu.Lock()
@@ -738,6 +784,30 @@ func dualbufNeedsUnpark(r *runnerRef, req *LlmRequest) bool {
 		return false
 	}
 	return req.model.dualbuf == nil || !req.model.dualbuf.viaParked
+}
+
+// dualbufNeedsMove: the request is placed on another GPU of the runner's list than the one the runner is on (or parked
+// from): the runner moves there in its process (POST /move), the K/V with it.
+func dualbufNeedsMove(r *runnerRef, req *LlmRequest) bool {
+	db := req.model.dualbuf
+	lm := r.model.Load()
+	if db == nil || db.viaParked || lm == nil || lm.dualbuf == nil || !lm.dualbuf.movesInProcess() {
+		return false
+	}
+	return db.placement != "" && db.placement != multimodel.DeviceCPU && db.placement != lm.dualbuf.placement &&
+		slices.Contains(lm.dualbuf.tiers, db.placement)
+}
+
+// dualbufNeedsPark: a CPU request served by the model's GPU instance, which is still on its device: it parks first (the
+// model runs on the CPU in its process, with its K/V).
+func dualbufNeedsPark(r *runnerRef, req *LlmRequest) bool {
+	db := req.model.dualbuf
+	return db != nil && db.viaParked && !runnerParked(r)
+}
+
+// dualbufNeedsChange: the loaded runner serves the request only after an in-process change (unpark, move, park).
+func dualbufNeedsChange(r *runnerRef, req *LlmRequest) bool {
+	return dualbufNeedsUnpark(r, req) || dualbufNeedsMove(r, req) || dualbufNeedsPark(r, req)
 }
 
 // dualbufTryPark parks a victim in process; false if it cannot (no park copies, busy, already parked, the park failed),
@@ -780,14 +850,36 @@ func (s *Scheduler) dualbufTryPark(r *runnerRef) bool {
 	return true
 }
 
-// dualbufUnparkFor brings a parked runner back for a request that wants its device. It returns the runner to expire (or
-// to park) first when the device has no room for it (wait = true); else the runner is unparked and usable.
+// mover: a runner that moves its GPU part to another GPU of its process (llama-server POST /move)
+type mover interface {
+	Move(ctx context.Context, to ml.DeviceInfo) (time.Duration, error)
+}
+
+// dualbufUnparkFor brings a runner to the request's place in its process: a parked runner back to its device (unpark),
+// a runner to another GPU of its list (move, also from parked), a runner on its GPU to the CPU (park, for a CPU
+// request). It returns the runner to expire (or to park) first when the target device has no room (wait = true), the
+// runner itself when the change failed (a reload), or (nil, true) with req.dualbufDeferred when only active models hold
+// the target; else the runner is usable.
 func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *runnerRef, full bool) (*runnerRef, bool) {
-	if !dualbufNeedsUnpark(r, req) {
+	move := dualbufNeedsMove(r, req)
+	if dualbufNeedsPark(r, req) {
+		return s.dualbufParkForCPU(req, r)
+	}
+	if !move && !dualbufNeedsUnpark(r, req) {
 		return nil, false
 	}
-	p, _ := runnerParker(r)
+	p, ok := runnerParker(r)
+	mv, canMove := r.llama.(mover)
+	if move && (!ok || !p.CanPark() || !canMove) {
+		slog.Info("dualbuf: the model cannot move in its process (no park copies), it is loaded again on the new device", "model", r.modelPath, "device", req.model.dualbuf.placement)
+		return r, true
+	}
 	need := p.ParkedVRAM()
+	if move && !p.Parked() {
+		for _, id := range r.gpus {
+			need += r.llama.VRAMByGPU(id)
+		}
+	}
 	s.loadedMu.Lock()
 	snapshot := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
 	for _, x := range s.loaded {
@@ -796,38 +888,101 @@ func (s *Scheduler) dualbufUnparkFor(ctx context.Context, req *LlmRequest, r *ru
 	s.loadedMu.Unlock()
 	gpus := s.getGpuFn(ctx, snapshot)
 	s.updateFreeSpace(gpus)
+	// the target: the runner's own device, or the request's other GPU
+	want := r.gpus
+	var target ml.DeviceInfo
+	if move {
+		dm := s.dualbuf.Devices(req.model.dualbuf.cfg)
+		d, ok := dm.ByName[req.model.dualbuf.placement]
+		if !ok {
+			return r, true
+		}
+		want = []ml.DeviceID{d.Info.DeviceID}
+		target = d.Info
+	}
 	var free uint64
 	found := false
 	for _, g := range gpus {
-		for _, id := range r.gpus {
+		for _, id := range want {
 			if g.DeviceID == id {
 				free += g.FreeMemory
 				found = true
+				if move {
+					target = g
+				}
 			}
 		}
 	}
 	if full || (found && need > free) {
 		// room on the device first: the least recently used idle model there (parked in process when it can)
 		if v := s.dualbufVictimExcept(req, r); v != nil {
-			slog.Info("dualbuf: room for an unpark", "model", r.modelPath, "need", format.HumanBytes2(need), "free", format.HumanBytes2(free), "victim", v.modelPath)
+			slog.Info("dualbuf: room for an unpark or a move", "model", r.modelPath, "need", format.HumanBytes2(need), "free", format.HumanBytes2(free), "victim", v.modelPath)
 			return v, true
 		}
 		if s.dualbufActiveOn(req, r) {
-			// only active models hold the device: the unpark waits aside for one to become idle
+			// only active models hold the device: the change waits aside for one to become idle
 			req.dualbufDeferred = true
 			return nil, true
 		}
 	}
 	r.refMu.Lock()
 	uctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	took, err := p.Unpark(uctx)
+	var took time.Duration
+	var err error
+	if move {
+		took, err = mv.Move(uctx, target)
+	} else {
+		took, err = p.Unpark(uctx)
+	}
 	cancel()
 	r.refMu.Unlock()
 	if err != nil {
-		slog.Warn("dualbuf: unpark failed, the model is loaded again", "model", r.modelPath, "error", err)
+		slog.Warn("dualbuf: the in-process change failed, the model is loaded again", "model", r.modelPath, "move", move, "error", err)
 		return r, true
 	}
-	slog.Info("dualbuf: model unparked", "model", r.modelPath, "duration", took.Round(time.Millisecond), "vram", format.HumanBytes2(need))
+	if !move {
+		slog.Info("dualbuf: model unparked", "model", r.modelPath, "duration", took.Round(time.Millisecond), "vram", format.HumanBytes2(need))
+		return nil, false
+	}
+	// the runner is on the new device now: its placement and device follow (one instance, no reload)
+	lm := r.model.Load()
+	from := lm.dualbuf.placement
+	moved := *lm
+	db := *lm.dualbuf
+	db.placement = req.model.dualbuf.placement
+	moved.dualbuf = &db
+	r.model.Store(&moved)
+	r.refMu.Lock()
+	r.gpus = []ml.DeviceID{target.DeviceID}
+	r.refMu.Unlock()
+	slog.Info("dualbuf: model moved to another GPU in its process", "model", r.modelPath, "from", from, "to", db.placement,
+		"duration", took.Round(time.Millisecond), "vram", format.HumanBytes2(need))
+	s.dualbufWake(from)
+	return nil, false
+}
+
+// dualbufParkForCPU parks the model's GPU instance for a CPU request (it then runs on the CPU in its process, with its
+// K/V); the runner itself (a reload on the CPU) when the park is not possible.
+func (s *Scheduler) dualbufParkForCPU(req *LlmRequest, r *runnerRef) (*runnerRef, bool) {
+	p, ok := runnerParker(r)
+	if !ok || !p.CanPark() {
+		return r, true
+	}
+	r.refMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	took, err := p.Park(ctx)
+	cancel()
+	r.refMu.Unlock()
+	if err != nil {
+		slog.Warn("dualbuf: park for the CPU request failed, the model is loaded again", "model", r.modelPath, "error", err)
+		return r, true
+	}
+	from := ""
+	if lm := r.model.Load(); lm != nil && lm.dualbuf != nil {
+		from = lm.dualbuf.placement
+	}
+	slog.Info("dualbuf: model parked for a CPU request, it runs on the CPU in its process", "model", r.modelPath, "from", from, "duration", took.Round(time.Millisecond))
+	s.dualbufWake(from)
 	return nil, false
 }
 

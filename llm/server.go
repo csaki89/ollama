@@ -89,6 +89,8 @@ type LlamaServerConfig struct {
 	ExtraEnv     map[string]string
 	ArgOverrides map[string][]string
 	KVCacheType  string
+	// the other GPUs a model that moves between GPUs in process loads the backends for (not placed on them)
+	ExtraDevices []ml.DeviceInfo
 }
 
 // IsLlamaCPP reports whether the server is backed by the llama.cpp

@@ -2,7 +2,10 @@ package llm
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ollama/ollama/ml"
@@ -90,5 +93,55 @@ func TestHostUnchargedFromLog(t *testing.T) {
 	s.parseParkLocked([]byte("srv  server_run_i: host memory: 900 MiB in backend host buffers, 0 MiB not charged to the cgroup\n"))
 	if got := s.HostUncharged(); got != 0 {
 		t.Fatalf("a charged (ROCm) report must give 0, got %d", got)
+	}
+}
+
+// a model that moves between GPUs in process: the other GPUs' backends load too, every card visible to its own backend
+// only, the active device's backend first
+func TestDualbufExtraDevices(t *testing.T) {
+	rocmDir, vkDir := t.TempDir(), t.TempDir()
+	for _, f := range []string{filepath.Join(rocmDir, "libggml-hip.so"), filepath.Join(vkDir, "libggml-vulkan.so")} {
+		if err := os.WriteFile(f, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	active := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, LibraryPath: []string{rocmDir}}
+	other := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "2", Library: "Vulkan"}, LibraryPath: []string{vkDir}}
+	libs0 := ml.LibraryPaths([]ml.DeviceInfo{active})
+	env0 := ml.GetDevicesEnv([]ml.DeviceInfo{active})
+	if libs, env := dualbufExtraDevices([]ml.DeviceInfo{active}, nil, libs0, env0); len(libs) != len(libs0) || len(env) != len(env0) {
+		t.Fatal("without extra devices nothing changes")
+	}
+	libs, env := dualbufExtraDevices([]ml.DeviceInfo{active}, []ml.DeviceInfo{other}, libs0, env0)
+	if !slices.Contains(libs, rocmDir) || !slices.Contains(libs, vkDir) {
+		t.Fatalf("library paths %v", libs)
+	}
+	if env["GGML_VK_VISIBLE_DEVICES"] != "2" {
+		t.Fatalf("vulkan sees only its card: %v", env)
+	}
+	rocmSeen := false
+	for k, v := range env {
+		if strings.Contains(k, "VISIBLE_DEVICES") && k != "GGML_VK_VISIBLE_DEVICES" && v == "1" {
+			rocmSeen = true
+		}
+	}
+	if !rocmSeen {
+		t.Fatalf("rocm sees only its card: %v", env)
+	}
+	want := filepath.Join(rocmDir, "libggml-hip.so") + string(filepath.ListSeparator) + filepath.Join(vkDir, "libggml-vulkan.so")
+	if env["GGML_BACKEND_PATH"] != want {
+		t.Fatalf("backends %q, want the active one first %q", env["GGML_BACKEND_PATH"], want)
+	}
+}
+
+func TestRenameDeviceBuffers(t *testing.T) {
+	b := map[memoryBufferKey]memoryBuffer{
+		{backend: "ROCm0", kind: "model"}:  {bytes: 10},
+		{backend: "ROCm0", kind: "KV"}:     {bytes: 2},
+		{backend: "CPU_REPACK", kind: "x"}: {bytes: 3},
+	}
+	renameDeviceBuffers(b, "ROCm0", "Vulkan0")
+	if b[memoryBufferKey{backend: "Vulkan0", kind: "model"}].bytes != 10 || b[memoryBufferKey{backend: "Vulkan0", kind: "KV"}].bytes != 2 || len(b) != 3 {
+		t.Fatalf("renamed: %v", b)
 	}
 }

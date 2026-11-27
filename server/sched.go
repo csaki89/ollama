@@ -257,7 +257,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	s.loadedMu.Lock()
 	runner := s.loaded[key]
 	s.loadedMu.Unlock()
-	if runner != nil && !runner.needsReload(c, req) && !dualbufNeedsUnpark(runner, req) {
+	if runner != nil && !runner.needsReload(c, req) && !dualbufNeedsChange(runner, req) {
 		req.useLoadedRunner(runner, s.finishedReqCh)
 	} else {
 		select {
