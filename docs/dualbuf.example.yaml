@@ -29,6 +29,9 @@ devices:
     match: "<PCI_ADDR>"      # e.g. 0000:aa:00.0
     max_running: 1           # models running on it at once
     # reserve_mib: 1024      # VRAM kept free on this GPU (fit, auto zones); default: LLAMA_ARG_FIT_TARGET
+    # gfx_override: "10.3.0" # rocm only: the gfx version the ROCm runtime uses for this card only (what
+                             # HSA_OVERRIDE_GFX_VERSION does for every card; with a config that variable is ignored).
+                             # The ROCm runtime sees only this card: the other cards' render nodes are hidden from it.
   gpu1:
     backend: vulkan
     match: "<GPU_NAME>"      # a part of the device name
