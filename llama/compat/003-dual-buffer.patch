@@ -25,10 +25,10 @@ to the b12177 pin (14 commits later; none of them touches the patched files exce
 which applies without conflict). The diff is the source diff unchanged. Must be applied after 001
 (it touches src/llama-model-loader.cpp as well).
 
-multimodel (csaki89/llama.cpp multimodel 4c5afcc32): the compute power state of an AMD GPU for the Vulkan backend through an empty KFD compute queue, from the first backend until the model is unloaded (GGML_VK_KFD_COMPUTE_PROFILE=0 off); Vulkan split-boundary read-ahead and small synchronous copies on the compute queue with a spinning wait, replay of the command buffers of unchanged small split graphs (GGML_VK_GRAPH_REPLAY=0 off), a log line of the host memory type the CPU reads (plain RAM when the device has no cached host memory type), a RAM log line at load (driver host memory and what the RAM guards add); Vulkan chunked growable KV buffers (ordinary device buffers of whole K/V rows; the shaders that read or write the K/V have KV_CHUNKED builds that reach the chunks by their buffer device addresses through a chunk table; chunk from the device: granularity, 2 MiB alignment, measured booking and release units, allocation limit), low-latency split boundaries (one submission and one spinning wait per boundary), ggml_backend_dev_memory_measured / _internal_memory / _host_memory / _async_readback (zones booking, RAM guards, scheduler readback), copy fallback without the whole-KV peak, GGML_SCHED_TIMING, --no-zones-flex, --park / POST /park, /unpark, /park/drop.
+multimodel (csaki89/llama.cpp multimodel aba5e60cf): the compute power state of an AMD GPU for the Vulkan backend through an empty KFD compute queue, from the first backend until the model is unloaded; llama_move_device and POST /move (the GPU part to another GPU of the process, K/V kept); GGML_BACKEND_PATH as a list of backends
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 977c3ab..dd5fafa 100644
+index 51f226e96..97748754c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2404,6 +2404,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -104,7 +104,7 @@ index 977c3ab..dd5fafa 100644
          {"-ctk", "--cache-type-k"}, "TYPE",
          string_format(
 diff --git a/common/common.cpp b/common/common.cpp
-index 8494e1f..6112555 100644
+index a2801b82f..92953e192 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1235,6 +1235,10 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
@@ -231,7 +231,7 @@ index 8494e1f..6112555 100644
      if (params.kv_overrides.empty()) {
          mparams.kv_overrides = NULL;
 diff --git a/common/common.h b/common/common.h
-index db52e7f..e16679d 100644
+index 4005275ca..cfbbbb37b 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -590,6 +590,16 @@ struct common_params {
@@ -252,7 +252,7 @@ index db52e7f..e16679d 100644
  
      bool single_turn       = false; // single turn chat conversation
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 8f341af..1f13709 100644
+index afb86338a..aefd49b49 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -370,6 +370,10 @@ extern "C" {
@@ -267,7 +267,7 @@ index 8f341af..1f13709 100644
      GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
  
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 30d2f26..6bd4ca0 100644
+index 3520b4349..cfbc3fead 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1193,6 +1193,10 @@ struct ggml_backend_sched {
@@ -458,7 +458,7 @@ index 30d2f26..6bd4ca0 100644
      GGML_ASSERT(sched);
      int backend_index = tensor_backend_id(node);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index 0138540..75fc611 100644
+index 101afeba2..fc3d8816f 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -73,7 +73,7 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
@@ -471,7 +471,7 @@ index 0138540..75fc611 100644
      size_t temp_storage_bytes = 0;
  
 diff --git a/ggml/src/ggml-cuda/batch-get.cu b/ggml/src/ggml-cuda/batch-get.cu
-index f6f9d0f..81df301 100644
+index 60c4747b9..dee4a8177 100644
 --- a/ggml/src/ggml-cuda/batch-get.cu
 +++ b/ggml/src/ggml-cuda/batch-get.cu
 @@ -176,7 +176,7 @@ bool ggml_cuda_get_tensor_n(int device,
@@ -493,7 +493,7 @@ index f6f9d0f..81df301 100644
      }
      // Wait for GPU writes before releasing the CPU mapping and descriptor buffers.
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 5fb8090..c15e322 100644
+index bc83ea375..1cf7a61ce 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1207,6 +1207,13 @@ const ggml_cuda_device_info & ggml_cuda_info();
@@ -511,7 +511,7 @@ index 5fb8090..c15e322 100644
      virtual ~ggml_cuda_pool() = default;
  
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
-index eb06132..ff0db5e 100644
+index f8dcd95ab..c7adadfc1 100644
 --- a/ggml/src/ggml-cuda/concat.cu
 +++ b/ggml/src/ggml-cuda/concat.cu
 @@ -158,8 +158,8 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
@@ -526,7 +526,7 @@ index eb06132..ff0db5e 100644
          GGML_ASSERT(!ggml_is_quantized(src0->type));
  
 diff --git a/ggml/src/ggml-cuda/count-equal.cu b/ggml/src/ggml-cuda/count-equal.cu
-index 05c95a2..6679f17 100644
+index 411d08c0d..9ed45f203 100644
 --- a/ggml/src/ggml-cuda/count-equal.cu
 +++ b/ggml/src/ggml-cuda/count-equal.cu
 @@ -46,7 +46,7 @@ void ggml_cuda_count_equal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -539,7 +539,7 @@ index 05c95a2..6679f17 100644
      const dim3 blocks_dim(WARP_SIZE, 1, 1);
      const dim3 blocks_num(std::min((int64_t)4*nsm, (ne + CUDA_COUNT_EQUAL_CHUNK_SIZE - 1)/CUDA_COUNT_EQUAL_CHUNK_SIZE), 1, 1);
 diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
-index dda1540..25194dc 100644
+index 90a06b97b..b3ff00c65 100644
 --- a/ggml/src/ggml-cuda/cpy.cu
 +++ b/ggml/src/ggml-cuda/cpy.cu
 @@ -472,10 +472,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
@@ -556,7 +556,7 @@ index dda1540..25194dc 100644
      } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
          if (can_be_transposed) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6b98189..62834d5 100644
+index 9c467ce95..89af7376a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -88,6 +88,7 @@
@@ -1581,7 +1581,7 @@ index 6b98189..62834d5 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index f6443e0..b952b7a 100644
+index 367657508..d16674fe6 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -215,7 +215,7 @@ void ggml_cuda_mul_mat_q(
@@ -1594,7 +1594,7 @@ index f6443e0..b952b7a 100644
          }
      }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 264e5ac..7b49f6d 100644
+index 8f79123af..94a1bfc94 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1545,7 +1545,7 @@ void ggml_cuda_mul_mat_vec_q(
@@ -1607,7 +1607,7 @@ index 264e5ac..7b49f6d 100644
      }
  
 diff --git a/ggml/src/ggml-cuda/solve_tri.cu b/ggml/src/ggml-cuda/solve_tri.cu
-index 5588921..b9d7105 100644
+index d96783420..eeb2c5f90 100644
 --- a/ggml/src/ggml-cuda/solve_tri.cu
 +++ b/ggml/src/ggml-cuda/solve_tri.cu
 @@ -51,7 +51,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
@@ -1620,7 +1620,7 @@ index 5588921..b9d7105 100644
  
      const int id = ggml_cuda_get_device();
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index 7ea4abc..4abe2c9 100644
+index b0f609990..89cf26547 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
 @@ -270,7 +270,7 @@ static void top_k_argsort_cuda(
@@ -1633,7 +1633,7 @@ index 7ea4abc..4abe2c9 100644
  
          src += (size_t) ncols * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
-index bc8bed1..93756be 100644
+index 682b90e16..b77f51e6a 100644
 --- a/ggml/src/ggml-vulkan/CMakeLists.txt
 +++ b/ggml/src/ggml-vulkan/CMakeLists.txt
 @@ -68,6 +68,7 @@ if (Vulkan_FOUND)
@@ -1645,7 +1645,7 @@ index bc8bed1..93756be 100644
  
      # hide symbols, so dlclosed duplicate copies cannot interpose them
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
-index cd9d074..795d90e 100644
+index 3e04eef61..6fd89add5 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp
 @@ -1,6 +1,11 @@
@@ -2659,7 +2659,7 @@ index cd9d074..795d90e 100644
 +    return nullptr;
 +}
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-common.h b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
-index 0af8a5c..5667127 100644
+index b5491fc4b..de63da1b5 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-common.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-common.h
 @@ -34,7 +34,7 @@ bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t low
@@ -2722,7 +2722,7 @@ index 0af8a5c..5667127 100644
  #if !defined(_WIN32)
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-kfd.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-kfd.cpp
 new file mode 100644
-index 0000000..ee61a39
+index 000000000..ee61a397e
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-kfd.cpp
 @@ -0,0 +1,573 @@
@@ -3300,7 +3300,7 @@ index 0000000..ee61a39
 +    kfd_maybe_release(device, it->second);
 +}
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
-index 1299609..c08dad1 100644
+index 5b30f0267..0a0808bf5 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
 @@ -64,6 +64,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
@@ -3478,7 +3478,7 @@ index 1299609..c08dad1 100644
  };
  
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index b46cba3..f8f57f0 100644
+index 8347cd1b1..7ffdf4771 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -336,6 +336,49 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
@@ -4688,7 +4688,7 @@ index b46cba3..f8f57f0 100644
      if (compute_queue) compute_queue->cmd_pool.destroy(device);
      if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/contig_copy.comp b/ggml/src/ggml-vulkan/vulkan-shaders/contig_copy.comp
-index f9dc9f7..dfb88a9 100644
+index b3b182fb0..e51f3e678 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/contig_copy.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/contig_copy.comp
 @@ -2,6 +2,19 @@
@@ -4752,7 +4752,7 @@ index f9dc9f7..dfb88a9 100644
              idx += num_threads;
          }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy.comp
-index edbdc65..a87a6a2 100644
+index d55e13253..01617ed26 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/copy.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy.comp
 @@ -2,6 +2,19 @@
@@ -4795,7 +4795,7 @@ index edbdc65..a87a6a2 100644
  #endif
  }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
-index 3dac7f0..db180de 100644
+index 6a6921474..9af303737 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_from_quant.comp
 @@ -2,6 +2,19 @@
@@ -4819,7 +4819,7 @@ index 3dac7f0..db180de 100644
  
  #if defined(DATA_A_IQ4_NL) || defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
-index fd82155..9ea53d0 100644
+index 776e9b8a5..bd4765b2f 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
 @@ -28,6 +28,14 @@ layout (binding = 2) writeonly buffer Q {A_TYPE data_q[];};
@@ -5012,7 +5012,7 @@ index fd82155..9ea53d0 100644
  #endif
  
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
-index 136619a..9ce9db0 100644
+index 911ceac22..4dcbe431a 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
 @@ -4,16 +4,23 @@
@@ -5660,7 +5660,7 @@ index 136619a..9ce9db0 100644
  vec2 get_dm(uint ib, uint a_offset) {
      return vec2(1, 0);
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp
-index 3d4213f..eaeb206 100644
+index 3b3fbbe89..3cd1978b0 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp
 @@ -7,6 +7,14 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -5695,7 +5695,7 @@ index 3d4213f..eaeb206 100644
      }
  }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-index 03f4b8d..70918fb 100644
+index 2c5e85908..f74fb046f 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 @@ -42,6 +42,16 @@ layout (binding = 2) readonly buffer V {float16_t data_v[];};
@@ -5761,7 +5761,7 @@ index 03f4b8d..70918fb 100644
                  [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                      Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-index 7207e67..fa25328 100644
+index aa9dd624b..0e5022339 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
 @@ -39,6 +39,17 @@ layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
@@ -5844,7 +5844,7 @@ index 7207e67..fa25328 100644
                          const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
                          coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl
-index 48f5561..bb76399 100644
+index 4fcf7c1f4..7ab515d3e 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_dequant.glsl
 @@ -38,85 +38,124 @@ layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_
@@ -5998,7 +5998,7 @@ index 48f5561..bb76399 100644
  FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
      if (binding_idx == BINDING_IDX_K) {
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_mmq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_mmq_funcs.glsl
-index 0c4760e..a60b88c 100644
+index 49900aa5a..1b5a818aa 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_mmq_funcs.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_mmq_funcs.glsl
 @@ -5,39 +5,39 @@
@@ -6174,7 +6174,7 @@ index 0c4760e..a60b88c 100644
          }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/kv_chunk.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/kv_chunk.glsl
 new file mode 100644
-index 0000000..cca54ae
+index 000000000..cca54aedf
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/kv_chunk.glsl
 @@ -0,0 +1,56 @@
@@ -6235,7 +6235,7 @@ index 0000000..cca54ae
 +
 +#endif // GGML_KV_CHUNK_GLSL
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
-index 1427b54..10934e8 100644
+index 6a2525849..46d93b5e4 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm.comp
 @@ -28,6 +28,10 @@ layout (binding = 3) readonly buffer R_Y {int rope_data_pos[];};
@@ -6253,14 +6253,13 @@ index 1427b54..10934e8 100644
  #elif RMS_NORM_SET_ROWS_FUSION
  
  layout (binding = 3) readonly buffer I {uvec2 data_i[];};
--
 +#include "kv_chunk.glsl"
 +#if defined(KVC_DST_BINDING)
 +#define RMS_D(I) KVC_DST_AT(I)
 +#endif
 +
 +#endif
-+
+ 
 +// the destination element (chunked K/V in the SET_ROWS fusion: through the chunk table, kv_chunk.glsl)
 +#ifndef RMS_D
 +#define RMS_D(I) data_d[I]
@@ -6295,7 +6294,7 @@ index 1427b54..10934e8 100644
              }
  #if RMS_NORM_ROPE_FUSION
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rope_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/rope_funcs.glsl
-index 0fab688..d941361 100644
+index feb55b203..78d123756 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/rope_funcs.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/rope_funcs.glsl
 @@ -1,4 +1,11 @@
@@ -6407,7 +6406,7 @@ index 0fab688..d941361 100644
  }
  
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rope_head.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/rope_head.glsl
-index 9cb85ff..90a84d2 100644
+index 51a127bcd..43ef22099 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/rope_head.glsl
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/rope_head.glsl
 @@ -12,6 +12,15 @@ layout (binding = 2) readonly buffer Z {float rope_data_ff[];};
@@ -6427,7 +6426,7 @@ index 9cb85ff..90a84d2 100644
  layout (push_constant) uniform parameter {
      rope_params pc;
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index b9e880e..8c79193 100644
+index dba9d8ca8..d051ba570 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 @@ -1244,6 +1244,108 @@ void process_shaders() {
@@ -6540,7 +6539,7 @@ index b9e880e..8c79193 100644
          c.wait();
      }
 diff --git a/include/llama.h b/include/llama.h
-index 988b178..6953d40 100644
+index 3877b69e2..31b855df4 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -348,11 +348,28 @@ extern "C" {
@@ -6584,7 +6583,7 @@ index 988b178..6953d40 100644
          // Abort callback
          // if it returns true, execution of llama_decode() will be aborted
          // currently works only with CPU execution
-@@ -821,6 +843,29 @@ extern "C" {
+@@ -821,6 +843,37 @@ extern "C" {
      // Check if the memory supports shifting
      LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
  
@@ -6599,6 +6598,14 @@ index 988b178..6953d40 100644
 +    // Returns false if the model has no park copies or a step failed (an unpark that failed leaves the model parked).
 +    LLAMA_API bool llama_park(struct llama_context * ctx, bool park);
 +    LLAMA_API bool llama_is_parked(const struct llama_context * ctx);
++    // Move (needs the park copies): the model's GPU part goes to another GPU device of this process, given by name ("Vulkan1")
++    // or PCI bus id ("0000:03:00.0"): parked first if it is not, the K/V goes over through the host, the host copies move to the
++    // new device's host buffer, the old device's backend is freed, and the GPU weights load from the model file onto the new
++    // device (the zones are measured there again). The CPU layers stay. Returns false if the model cannot move (it stays
++    // where it was) or the unpark on the new device failed (it stays parked there).
++    LLAMA_API bool llama_move_device(struct llama_context * ctx, const char * device);
++    // the GPU device the model is on (or parked from), NULL = none
++    LLAMA_API const char * llama_active_device(const struct llama_context * ctx);
 +    // Parked, the first decode repacks the park copies for the CPU (a demote, if the RAM allows); the repacked copies stay
 +    // (parked and unparked) until dropped here. Returns the bytes freed / held.
 +    LLAMA_API size_t llama_park_drop_demoted(struct llama_context * ctx);
@@ -6615,10 +6622,10 @@ index 988b178..6953d40 100644
      // State / sessions
      //
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 3eda87a..e6aa712 100644
+index ea20062a6..7f84efde1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -9,6 +9,12 @@
+@@ -9,14 +9,24 @@
  #include "llama-memory.h"
  #include "llama-mmap.h"
  #include "llama-model.h"
@@ -6631,7 +6638,10 @@ index 3eda87a..e6aa712 100644
  #include "llama-moe-cache.h"
  #include "llama-ext.h"
  #include "llama-sampler.h"
-@@ -17,6 +23,8 @@
+ #include "llama.h"
+ 
++#include <cctype>
++
  #include <algorithm>
  #include <cinttypes>
  #include <cmath>
@@ -6640,7 +6650,7 @@ index 3eda87a..e6aa712 100644
  #include <cstring>
  #include <limits>
  #include <stdexcept>
-@@ -178,6 +186,48 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+@@ -178,6 +188,57 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -6650,6 +6660,15 @@ index 3eda87a..e6aa712 100644
 +    llama_kv_cache * kv = nullptr;
 +    std::vector<std::pair<const char *, llama_memory_i *>> fixed;
 +};
++
++static bool strcasecmp_ascii(const char * a, const char * b) {
++    for (; *a && *b; ++a, ++b) {
++        if (std::tolower((unsigned char) *a) != std::tolower((unsigned char) *b)) {
++            return false;
++        }
++    }
++    return *a == *b;
++}
 +
 +// the kernel's free VRAM of the card (amdgpu sysfs), below
 +static bool zones_sysfs_free(size_t total, size_t & free_out);
@@ -6689,7 +6708,7 @@ index 3eda87a..e6aa712 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -194,6 +244,38 @@ llama_context::llama_context(
+@@ -194,6 +255,38 @@ llama_context::llama_context(
      t_start_us = model.t_start_us;
      t_load_us  = model.t_load_us;
  
@@ -6728,7 +6747,7 @@ index 3eda87a..e6aa712 100644
      const auto & hparams = model.hparams;
  
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
-@@ -534,6 +616,7 @@ llama_context::llama_context(
+@@ -534,6 +627,7 @@ llama_context::llama_context(
      }
  
      // init the memory module
@@ -6736,7 +6755,7 @@ index 3eda87a..e6aa712 100644
      if (!hparams.vocab_only) {
          llama_memory_params params_mem = {
              /*.type_k    =*/ params.type_k,
-@@ -544,7 +627,52 @@ llama_context::llama_context(
+@@ -544,7 +638,52 @@ llama_context::llama_context(
              /*.no_alloc  =*/ model.no_alloc(),
          };
  
@@ -6790,7 +6809,7 @@ index 3eda87a..e6aa712 100644
      }
  
      // init backends
-@@ -784,10 +912,592 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+@@ -784,10 +923,592 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
  
@@ -7383,7 +7402,7 @@ index 3eda87a..e6aa712 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -942,6 +1652,8 @@ void llama_context::sched_reserve() {
+@@ -942,6 +1663,8 @@ void llama_context::sched_reserve() {
  
      LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
              __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -7392,7 +7411,7 @@ index 3eda87a..e6aa712 100644
  }
  
  void llama_context::synchronize() {
-@@ -2003,6 +2715,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2003,6 +2726,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          return encode(batch_inp);
      }
  
@@ -7408,7 +7427,7 @@ index 3eda87a..e6aa712 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -2089,6 +2810,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2089,6 +2821,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
      embd_seq.clear();
  
@@ -7445,7 +7464,7 @@ index 3eda87a..e6aa712 100644
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -2097,8 +2848,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2097,8 +2859,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -7454,7 +7473,7 @@ index 3eda87a..e6aa712 100644
      bool did_optimize = false;
  
      // handle any pending shifts/copies
-@@ -4273,6 +5022,8 @@ llama_context_params llama_context_default_params() {
+@@ -4273,6 +5033,8 @@ llama_context_params llama_context_default_params() {
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.moe_cache_size              =*/ 0,
@@ -7463,7 +7482,7 @@ index 3eda87a..e6aa712 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4758,6 +5509,136 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+@@ -4758,6 +5520,314 @@ bool llama_memory_can_shift(llama_memory_t mem) {
      return mem->get_can_shift();
  }
  
@@ -7473,6 +7492,35 @@ index 3eda87a..e6aa712 100644
 +
 +bool llama_park(llama_context * ctx, bool park) {
 +    return ctx ? ctx->park(park) : false;
++}
++
++bool llama_move_device(llama_context * ctx, const char * device) {
++    if (!ctx || !device) {
++        return false;
++    }
++    // a device name (e.g. "Vulkan1") or a PCI bus id ("0000:03:00.0", ggml_backend_dev_props.device_id)
++    ggml_backend_dev_t dev = ggml_backend_dev_by_name(device);
++    for (size_t i = 0; !dev && i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t d = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++        ggml_backend_dev_props props;
++        ggml_backend_dev_get_props(d, &props);
++        if (props.device_id && strcasecmp_ascii(props.device_id, device)) {
++            dev = d;
++        }
++    }
++    if (!dev) {
++        LLAMA_LOG_ERROR("%s: no device %s\n", __func__, device);
++        return false;
++    }
++    return ctx->move_device(dev);
++}
++
++const char * llama_active_device(const llama_context * ctx) {
++    ggml_backend_dev_t dev = ctx ? ctx->active_device() : nullptr;
++    return dev ? ggml_backend_dev_name(dev) : nullptr;
 +}
 +
 +bool llama_is_parked(const llama_context * ctx) {
@@ -7561,8 +7609,9 @@ index 3eda87a..e6aa712 100644
 +        parked = true;
 +        park_demote_tried = false;
 +    } else {
-+        // weights back from the pinned copies (DMA), the flex layers to their placement before the park
-+        ok = model.park_move(true, &w_bytes);
++        // weights back from the pinned copies (DMA), the flex layers to their placement before the park (after a move to
++        // another device: from the model file)
++        ok = model.park_move(true, &w_bytes, park_from_file);
 +        t1 = ggml_time_us();
 +        for (auto * kv : kvs) {
 +            ok = kv->park_kv(false) && ok;
@@ -7597,11 +7646,159 @@ index 3eda87a..e6aa712 100644
 +    return ok;
 +}
 +
++ggml_backend_dev_t llama_context::active_device() const {
++    for (const auto & d : model.devices) {
++        if (d.dev && ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            return d.dev;
++        }
++    }
++    return nullptr;
++}
++
++bool llama_context::move_device(ggml_backend_dev_t to) {
++    if (!to || ggml_backend_dev_type(to) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++        LLAMA_LOG_ERROR("%s: the target is not a GPU device\n", __func__);
++        return false;
++    }
++    ggml_backend_dev_t from = active_device();
++    if (model.devices.size() != 1 || !from) {
++        LLAMA_LOG_WARN("%s: the model is on %zu devices, only a model on one GPU moves\n", __func__, model.devices.size());
++        return false;
++    }
++    if (from == to) {
++        return park(false);
++    }
++    if (!model.park_available()) {
++        LLAMA_LOG_WARN("%s: the model has no park copies (load it with --park / llama_model_params.park), it does not move\n", __func__);
++        return false;
++    }
++    const auto parts = zones_parts(memory.get());
++    std::vector<llama_kv_cache *> kvs;
++    if (parts.kv) {
++        kvs.push_back(parts.kv);
++    }
++    const char * why = nullptr;
++    for (const auto & [name, part] : parts.fixed) {
++        if (auto * kv = dynamic_cast<llama_kv_cache *>(part)) {
++            kvs.push_back(kv);
++        } else {
++            why = name;
++        }
++    }
++    if (cparams.ctx_other) {
++        why = "the memory shared with another context";
++    } else if (moe_cache) {
++        why = "the MoE cache";
++    } else if (buf_layer_inp_dev) {
++        why = "the layer input device buffer";
++    } else if (!sampling.samplers.empty()) {
++        why = "the backend samplers";
++    } else if (memory && !parts.kv && parts.fixed.empty()) {
++        why = "this memory type";
++    }
++    if (why) {
++        LLAMA_LOG_WARN("%s: %s cannot move to another device, the model stays on %s\n", __func__, why, ggml_backend_dev_name(from));
++        return false;
++    }
++    ggml_backend_t backend_to = ggml_backend_dev_init(to, nullptr);
++    if (!backend_to) {
++        LLAMA_LOG_ERROR("%s: failed to initialize the %s backend\n", __func__, ggml_backend_dev_name(to));
++        return false;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    const bool was_parked = parked;
++    // off the old device: the weights to their host copies, the K/V to the host
++    if (!parked && !park(true)) {
++        ggml_backend_free(backend_to);
++        return false;
++    }
++    const int64_t t1 = ggml_time_us();
++    for (auto * kv : kvs) {
++        if (!kv->move_device(from, to)) {
++            for (auto * k : kvs) {
++                k->move_device(to, from);
++            }
++            ggml_backend_free(backend_to);
++            return false;
++        }
++    }
++    // the model is shared read-only with the context; its placement changes here, under the parked state
++    if (!const_cast<llama_model &>(model).move_device(from, to)) {
++        for (auto * kv : kvs) {
++            kv->move_device(to, from);
++        }
++        ggml_backend_free(backend_to);
++        return false;
++    }
++
++    // the new device's backend takes the old one's place (the scheduler that uses the old one goes first); the CPU backend's
++    // buffer (the intermediate state) and the output buffer use the new device's host buffer
++    synchronize();
++    sched.reset();
++    for (auto & res : gf_res_prev) {
++        res.reset();
++    }
++    gf_res_prev_active = nullptr;
++    for (auto & b : backends) {
++        if (ggml_backend_get_device(b.get()) == from) {
++            b.reset(backend_to); // frees the old device's backend
++            backend_to = nullptr;
++            break;
++        }
++    }
++    if (backend_to) {
++        backends.emplace_back(backend_to);
++    }
++    set_n_threads_fns.clear();
++    for (auto & backend : backends) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        if (reg) {
++            auto fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
++            if (fn) {
++                set_n_threads_fns.emplace_back(backend.get(), fn);
++            }
++        }
++    }
++    set_abort_callback(abort_callback, abort_callback_data);
++    backend_buft.clear();
++    backend_ptrs.clear();
++    backend_buf_exp_size.clear();
++    for (auto & backend : backends) {
++        auto * buft = ggml_backend_get_default_buffer_type(backend.get());
++        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            if (auto * host_buft = ggml_backend_dev_host_buffer_type(to)) {
++                buft = host_buft;
++            }
++        }
++        backend_buft.push_back(buft);
++        backend_ptrs.push_back(backend.get());
++        backend_buf_exp_size.push_back(0);
++    }
++    buf_output.reset();
++    logits.data = nullptr;
++    embd.data   = nullptr;
++    embd_nextn.data = nullptr;
++    output_reserve(n_seq_max());
++    sched_need_reserve = true;
++    const int64_t t2 = ggml_time_us();
++
++    // back on the new device: the GPU weights from the model file, the K/V from the host (the zones are measured there again)
++    park_from_file = true;
++    const bool ok = park(false);
++    park_from_file = false;
++    LLAMA_LOG_INFO("%s: %s -> %s%s: %s %.1f ms, retarget %.1f ms, unpark %.1f ms (the GPU weights from the model file)\n", __func__,
++        ggml_backend_dev_name(from), ggml_backend_dev_name(to), ok ? "" : " (the unpark failed: the model stays parked)",
++        was_parked ? "was parked," : "park", (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (ggml_time_us() - t2) / 1000.0);
++    return ok;
++}
++
  // llama state API
  
  // deprecated
 diff --git a/src/llama-context.h b/src/llama-context.h
-index cf2949a..e3612c1 100644
+index 39c5619df..9679bf588 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -19,6 +19,7 @@
@@ -7612,7 +7809,7 @@ index cf2949a..e3612c1 100644
  
  class llama_io_read_i;
  class llama_io_write_i;
-@@ -379,6 +380,92 @@ private:
+@@ -379,6 +380,96 @@ private:
  
      bool sched_need_reserve = true;
  
@@ -7643,8 +7840,12 @@ index cf2949a..e3612c1 100644
 +    bool park(bool to_park);
 +    bool is_parked() const { return parked; }
 +    size_t park_drop_demoted();
++    // llama_move_device: the model's GPU part to another GPU device of the process (parked first, back unparked there)
++    bool move_device(ggml_backend_dev_t to);
++    ggml_backend_dev_t active_device() const; // the model's GPU (parked from it while parked), NULL = none
 +
 +private:
++    bool park_from_file  = false; // the unpark of a move reads the GPU weights from the model file
 +    bool parked          = false;
 +    bool park_op_offload = true; // cparams.op_offload before the park
 +    bool park_demote_tried = false; // the demote of this park was tried (once, at the first decode while parked)
@@ -7706,7 +7907,7 @@ index cf2949a..e3612c1 100644
      // true until then, because the first output_reserve() runs before any graph is reserved
      bool graph_has_logits = true;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 0a8bf37..0fb6650 100644
+index a1ec67e26..df74a0cd8 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -109,6 +109,9 @@ llama_kv_cache::llama_kv_cache(
@@ -8627,10 +8828,33 @@ index 0a8bf37..0fb6650 100644
  //
  // llama_kv_cache_context
  //
-@@ -3096,3 +3977,58 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
+@@ -3096,3 +3977,81 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
  void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
      kv->get_prev_tokens(ubatch, n, res);
  }
++
++bool llama_kv_cache::move_device(ggml_backend_dev_t from, ggml_backend_dev_t to) {
++    for (const auto & layer : layers) {
++        ggml_backend_buffer_t buf = layer.k->buffer;
++        if (buf && !ggml_backend_buffer_is_host(buf) && ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)) == from) {
++            LLAMA_LOG_ERROR("%s: the K/V of layer %u is on %s: the model must be parked first\n", __func__, layer.il, ggml_backend_dev_name(from));
++            return false;
++        }
++    }
++    ggml_backend_buffer_type_t buft_to = ggml_backend_dev_buffer_type(to);
++    for (auto & b : park_bufts) {
++        if (b && ggml_backend_buft_get_device(b) == from) {
++            b = buft_to;
++        }
++    }
++    for (auto & [il, fk] : flex_kv_layers) {
++        if (fk.buft_gpu && ggml_backend_buft_get_device(fk.buft_gpu) == from) {
++            fk.buft_gpu = buft_to;
++            fk.spare.reset(); // the old device's host buffer
++        }
++    }
++    return true;
++}
 +
 +bool llama_kv_cache::park_kv(bool to_host) {
 +    if (layers.empty()) {
@@ -8687,7 +8911,7 @@ index 0a8bf37..0fb6650 100644
 +    return true;
 +}
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 4dea50a..e72f6ac 100644
+index 5aafbebb3..14b47dd9a 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -5,6 +5,8 @@
@@ -8699,7 +8923,7 @@ index 4dea50a..e72f6ac 100644
  #include <unordered_map>
  #include <vector>
  
-@@ -258,7 +260,63 @@ public:
+@@ -258,7 +260,67 @@ public:
      // note: used by n-gram input embeddings
      void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
  
@@ -8711,6 +8935,10 @@ index 4dea50a..e72f6ac 100644
 +    // llama_park: the K/V of every layer on a device to the device host buffer (to_host), or back to the buffer type it had there
 +    // (growable sections again where possible); a full relayout at the current size, the used rows are copied
 +    bool park_kv(bool to_host);
++
++    // llama_move_device: parked, the K/V goes back to the new device instead of the old one (and the flex layers' K/V moves
++    // there); false if a layer is still on the old device
++    bool move_device(ggml_backend_dev_t from, ggml_backend_dev_t to);
 +
 +    // dynamic KV (DESIGN-3zone.md 6.2): the cache grows in chunks up to max_size; false if this cache cannot (shared layers, transposed V, ...)
 +    bool set_dynamic(uint32_t max_size, size_t chunk_bytes);
@@ -8764,7 +8992,7 @@ index 4dea50a..e72f6ac 100644
      const llama_hparams & hparams;
  
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
-index bcb82bd..f7c8604 100644
+index 85a8e0f75..4ed90bffe 100644
 --- a/src/llama-kv-cells.h
 +++ b/src/llama-kv-cells.h
 @@ -112,6 +112,25 @@ public:
@@ -8794,10 +9022,10 @@ index bcb82bd..f7c8604 100644
          assert(i < pos.size());
          assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 3a63afa..bb79a60 100644
+index 485483ba1..c18115fe9 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1142,8 +1142,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1132,8 +1132,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
      // set below, before buft_for_tensor() runs
      bool is_lazy = false;
  
@@ -8808,7 +9036,7 @@ index 3a63afa..bb79a60 100644
  
          auto it = ctx_map.find(key);
          if (it == ctx_map.end()) {
-@@ -1174,6 +1174,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1164,6 +1164,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return it->second.get();
      };
  
@@ -8824,7 +9052,7 @@ index 3a63afa..bb79a60 100644
      auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
          if (!t_meta) {
              if (flags & TENSOR_NOT_REQUIRED) {
-@@ -1309,6 +1318,78 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1299,6 +1308,78 @@ struct ggml_tensor * llama_model_loader::create_tensor(
              n_tensors_moved++;
          }
  
@@ -8903,7 +9131,7 @@ index 3a63afa..bb79a60 100644
          return buft;
      };
  
-@@ -1388,7 +1469,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1378,7 +1459,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return nullptr;
      }
  
@@ -8916,7 +9144,7 @@ index 3a63afa..bb79a60 100644
  
      // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
      if (flags & TENSOR_DUPLICATED) {
-@@ -1409,6 +1494,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1399,6 +1484,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          n_created++;
      }
  
@@ -8946,7 +9174,7 @@ index 3a63afa..bb79a60 100644
  }
  
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index 2348cc1..5d17a28 100644
+index ed59079a4..edd688a6a 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -12,6 +12,7 @@
@@ -9018,7 +9246,7 @@ index 2348cc1..5d17a28 100644
      size_t n_tensors_moved = 0;
      std::string first_tensor_moved_name;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index cab5669..15e7554 100644
+index 0b063e845..a97a309ba 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -31,8 +31,10 @@
@@ -9520,7 +9748,7 @@ index cab5669..15e7554 100644
          pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
  
          ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
-@@ -2144,6 +2558,479 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2144,6 +2558,614 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -9708,7 +9936,7 @@ index cab5669..15e7554 100644
 +    return false;
 +}
 +
-+bool llama_model::park_move(bool to_gpu, size_t * bytes) const {
++bool llama_model::park_move(bool to_gpu, size_t * bytes, bool from_file) const {
 +    // park: every group (flex layers and park copies) off the device, the placement before it is kept; unpark: back to it
 +    // (the park copies are host buffers: the upload is a DMA from pinned memory)
 +    size_t moved = 0;
@@ -9738,11 +9966,11 @@ index cab5669..15e7554 100644
 +            const bool exps = it == pimpl->park_prev.end() || it->second.second;
 +            if (rest && !fl.on_gpu) {
 +                moved += flex_layer_bytes(il, has_exps ? LLAMA_FLEX_REST : LLAMA_FLEX_ALL);
-+                ok = flex_move_part(il, false, true, false) && ok;
++                ok = flex_move_part(il, false, true, from_file) && ok;
 +            }
 +            if (has_exps && exps && !fl.exps_on_gpu) {
 +                moved += flex_layer_bytes(il, LLAMA_FLEX_EXPS);
-+                ok = flex_move_part(il, true, true, false) && ok;
++                ok = flex_move_part(il, true, true, from_file) && ok;
 +            }
 +        }
 +    }
@@ -9874,6 +10102,141 @@ index cab5669..15e7554 100644
 +    return it == pimpl->park_prev.end() || it->second.first;
 +}
 +
++bool llama_model::move_device(ggml_backend_dev_t from, ggml_backend_dev_t to) {
++    if (!from || !to || from == to) {
++        return from == to;
++    }
++    ggml_backend_buffer_type_t gpu_from = ggml_backend_dev_buffer_type(from);
++    ggml_backend_buffer_type_t gpu_to   = ggml_backend_dev_buffer_type(to);
++    // every group is off the device (parked) and in the device's own buffer type, and no other weight is on the device
++    for (const auto & [il, fl] : pimpl->flex) {
++        if (fl.buf_idx == SIZE_MAX) {
++            continue;
++        }
++        if (fl.on_gpu || (fl.buf_idx_exps != SIZE_MAX && fl.exps_on_gpu)) {
++            LLAMA_LOG_ERROR("%s: group %d is on %s: the model must be parked first\n", __func__, il, ggml_backend_dev_name(from));
++            return false;
++        }
++        for (const auto & p : fl.pairs) {
++            if (p.buft != gpu_from && ggml_backend_buft_get_device(p.buft) == from) {
++                LLAMA_LOG_ERROR("%s: %s is in the buffer type %s, it cannot move\n", __func__, ggml_get_name(p.gpu), ggml_backend_buft_name(p.buft));
++                return false;
++            }
++        }
++    }
++    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++        for (const auto & b : bufs) {
++            ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(b.get());
++            if (!ggml_backend_buft_is_host(bt) && ggml_backend_buft_get_device(bt) == from) {
++                LLAMA_LOG_ERROR("%s: a weight buffer outside the park groups is on %s (%s, %.2f MiB), the model cannot move\n", __func__,
++                    ggml_backend_dev_name(from), ggml_backend_buft_name(bt), ggml_backend_buffer_get_size(b.get()) / 1048576.0);
++                return false;
++            }
++        }
++    }
++
++    // the GPU side: the groups go up into the new device's buffer type, the layers compute there
++    for (auto & [il, fl] : pimpl->flex) {
++        for (auto & p : fl.pairs) {
++            if (p.buft == gpu_from) {
++                p.buft = gpu_to;
++            }
++        }
++    }
++    if (pimpl->gpu_buft_list.find(to) == pimpl->gpu_buft_list.end()) {
++        pimpl->gpu_buft_list.emplace(to, make_gpu_buft_list(to, split_mode(), tensor_split()));
++    }
++    buft_list_t * list_to = &pimpl->gpu_buft_list.at(to);
++    auto retarget = [&](impl::layer_dev & ld) {
++        if (ld.dev == from) {
++            ld.dev       = to;
++            ld.buft_list = list_to;
++        }
++    };
++    retarget(pimpl->dev_input);
++    retarget(pimpl->dev_output);
++    for (auto & ld : pimpl->dev_layer) {
++        retarget(ld);
++    }
++    for (auto & d : devices) {
++        if (d.dev == from) {
++            d.dev = to;
++        }
++    }
++
++    // the host copies made for the old device go to the new device's host buffer (a plain RAM buffer if it has none); the
++    // storage of the pairs is swapped between their tensors, so every tensor pointing into a buffer is moved with it
++    ggml_backend_buffer_type_t host_from = ggml_backend_dev_host_buffer_type(from);
++    ggml_backend_buffer_type_t host_to   = ggml_backend_dev_host_buffer_type(to);
++    if (!host_to) {
++        host_to = ggml_backend_cpu_buffer_type();
++    }
++    size_t moved = 0, kept = 0;
++    const int64_t t0 = ggml_time_us();
++    if (host_from && host_from != host_to) {
++        std::vector<ggml_tensor *> all;
++        auto add_ctx = [&](ggml_context * ctx) {
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                all.push_back(t);
++            }
++        };
++        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++            add_ctx(ctx.get());
++        }
++        for (auto & [il, fl] : pimpl->flex) {
++            for (auto & c : fl.demote_ctxs) {
++                add_ctx(c.get());
++            }
++        }
++        const size_t align_to = ggml_backend_buft_get_alignment(host_to);
++        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++            for (auto & b : bufs) {
++                if (ggml_backend_buffer_get_type(b.get()) != host_from) {
++                    continue;
++                }
++                uint8_t *    base = (uint8_t *) ggml_backend_buffer_get_base(b.get());
++                const size_t size = ggml_backend_buffer_get_size(b.get());
++                std::vector<ggml_tensor *> in;
++                bool aligned = true;
++                for (ggml_tensor * t : all) {
++                    const uint8_t * d = (const uint8_t *) t->data;
++                    if (base && t->buffer && d >= base && d < base + size) {
++                        in.push_back(t);
++                        aligned = aligned && (size_t) (d - base) % align_to == 0;
++                    }
++                }
++                // a multi buffer (no base) or a layout the new buffer type cannot keep: the copies stay where they are (they
++                // still work, the uploads then go through a staging copy)
++                if (!base || size == 0 || !aligned || size > ggml_backend_buft_get_max_size(host_to)) {
++                    kept += size;
++                    continue;
++                }
++                ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(host_to, size);
++                if (!nb) {
++                    LLAMA_LOG_WARN("%s: allocating %.2f MiB in %s failed, the host copies stay in %s\n", __func__, size / 1048576.0,
++                        ggml_backend_buft_name(host_to), ggml_backend_buft_name(host_from));
++                    kept += size;
++                    continue;
++                }
++                ggml_backend_buffer_set_usage(nb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                uint8_t * nbase = (uint8_t *) ggml_backend_buffer_get_base(nb);
++                memcpy(nbase, base, size);
++                for (ggml_tensor * t : in) {
++                    t->data   = nbase + ((uint8_t *) t->data - base);
++                    t->buffer = nb;
++                }
++                b.reset(nb); // the old buffer is freed
++                moved += size;
++            }
++        }
++    }
++    LLAMA_LOG_INFO("%s: the GPU part moves from %s to %s; host copies %.2f MiB moved from %s to %s in %.1f ms%s\n", __func__,
++        ggml_backend_dev_name(from), ggml_backend_dev_name(to), moved / 1048576.0, host_from ? ggml_backend_buft_name(host_from) : "-",
++        ggml_backend_buft_name(host_to), (ggml_time_us() - t0) / 1000.0,
++        kept > 0 ? format(", %.2f MiB stay (a multi buffer or another alignment)", kept / 1048576.0).c_str() : "");
++    return true;
++}
++
 +bool llama_model::flex_move(int il, bool to_gpu, bool from_file, int part) const {
 +    auto it = pimpl->flex.find(il);
 +    if (it == pimpl->flex.end() || it->second.buf_idx == SIZE_MAX) {
@@ -10000,7 +10363,7 @@ index cab5669..15e7554 100644
      return true;
  }
  
-@@ -2783,6 +3670,15 @@ void llama_model::print_info() const {
+@@ -2783,6 +3805,15 @@ void llama_model::print_info() const {
  }
  
  ggml_backend_dev_t llama_model::dev_layer(int il) const {
@@ -10016,7 +10379,7 @@ index cab5669..15e7554 100644
      return pimpl->dev_layer.at(il).dev;
  }
  
-@@ -3525,10 +4421,17 @@ llama_model_params llama_model_default_params() {
+@@ -3525,10 +4556,17 @@ llama_model_params llama_model_default_params() {
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
          /*.kv_overrides                =*/ nullptr,
@@ -10035,7 +10398,7 @@ index cab5669..15e7554 100644
          /*.load_mtp                    =*/ false,
      };
 diff --git a/src/llama-model.h b/src/llama-model.h
-index e6768ca..35841dd 100644
+index 9c0a51f3d..7313cab4a 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -763,6 +763,9 @@ struct llama_rope_params {
@@ -10058,7 +10421,7 @@ index e6768ca..35841dd 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -969,6 +975,34 @@ struct llama_model {
+@@ -969,6 +975,39 @@ struct llama_model {
      const float * tensor_split() const;
  
      uint32_t n_gpu_layers() const;
@@ -10083,7 +10446,12 @@ index e6768ca..35841dd 100644
 +    // llama_park: the model has park copies (llama_model_params.park); move every weight group off the device (to_gpu = false,
 +    // the placement before is kept) or back to it; bytes: the weights moved
 +    bool park_available() const;
-+    bool park_move(bool to_gpu, size_t * bytes = nullptr) const;
++    // from_file (to_gpu only): the GPU weights are read from the model file, not uploaded from the host copies
++    bool park_move(bool to_gpu, size_t * bytes = nullptr, bool from_file = false) const;
++    // llama_move_device: the parked model's GPU part goes to another device of the process: the groups' GPU buffer type and
++    // the layers' device change, the host copies made for the old device (dual-buffer copies of the CPU layers, park copies,
++    // zone 2 host copies) move to the new device's host buffer; false (nothing changed) if a weight is not in a parked group
++    bool move_device(ggml_backend_dev_t from, ggml_backend_dev_t to);
 +    bool park_was_on_gpu(int il) const; // a flex layer was on the device before the park
 +    // parked and running on the CPU: the park copies repacked for the CPU (a demote, if the RAM allows), kept until dropped;
 +    // returns the bytes repacked now (0: nothing to do, or no room: the CPU computes from the pinned copies)
@@ -10093,7 +10461,7 @@ index e6768ca..35841dd 100644
      llama_split_mode split_mode() const;
      bool no_alloc() const;
  
-@@ -1014,6 +1048,8 @@ struct llama_model {
+@@ -1014,6 +1053,8 @@ struct llama_model {
      virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
  
  protected:
@@ -10103,7 +10471,7 @@ index e6768ca..35841dd 100644
  
      struct impl;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5f7e67b..205be38 100644
+index 4596e788b..42bbaad7c 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -330,6 +330,7 @@ struct server_slot {
@@ -10146,13 +10514,14 @@ index 5f7e67b..205be38 100644
              SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
  
              init_opt.video_params.fps_target = params_base.video_fps;
-@@ -3178,6 +3190,62 @@ private:
+@@ -3178,6 +3190,99 @@ private:
                  {
                      // do nothing
                  } break;
 +            case SERVER_TASK_TYPE_PARK:
 +            case SERVER_TASK_TYPE_UNPARK:
 +            case SERVER_TASK_TYPE_PARK_DROP:
++            case SERVER_TASK_TYPE_MOVE:
 +                {
 +                    // only between requests: a park moves every weight and the K/V
 +                    bool busy = false;
@@ -10169,6 +10538,39 @@ index 5f7e67b..205be38 100644
 +                    if (task.type == SERVER_TASK_TYPE_PARK_DROP) {
 +                        res->success = true;
 +                        res->demoted = llama_park_drop_demoted(ctx_tgt);
++                    } else if (task.type == SERVER_TASK_TYPE_MOVE) {
++                        // the GPU part to another device of the process; a draft model stays on its device: no move then
++                        const char * before = llama_active_device(ctx_tgt);
++                        const std::string from = before ? before : "";
++                        res->from = from;
++                        if (ctx_dft) {
++                            res->message = "a draft model is loaded, the model does not move";
++                        } else {
++                            res->success = llama_move_device(ctx_tgt, task.device.c_str());
++                            if (!res->success) {
++                                res->message = "the move failed, see the server log";
++                            }
++                        }
++                        res->demoted = llama_park_demoted_bytes(ctx_tgt);
++                        res->host_uncharged = llama_backend_host_uncharged();
++                        const char * now = llama_active_device(ctx_tgt);
++                        // the projector follows the model to its new device
++                        if (res->success && now && from != now && mctx && mparams_park_set && mparams_park.use_gpu) {
++                            mtmd_context_params p = mparams_park;
++                            p.device = ggml_backend_dev_by_name(now);
++                            mtmd_free(mctx);
++                            mctx = mtmd_init_from_file(params_base.mmproj.path.c_str(), model_tgt, p);
++                            for (auto & slot : slots) {
++                                slot.mctx = mctx;
++                            }
++                            if (!mctx) {
++                                SRV_ERR("move: loading the projector on %s failed\n", now);
++                                res->success = false;
++                                res->message = "the projector did not load on the new device";
++                            } else {
++                                SRV_INF("move: the projector is on %s now\n", now);
++                            }
++                        }
 +                    } else {
 +                        const bool to_park = task.type == SERVER_TASK_TYPE_PARK;
 +                        res->success = llama_park(ctx_tgt, to_park);
@@ -10204,12 +10606,15 @@ index 5f7e67b..205be38 100644
 +                    }
 +                    res->parked  = llama_is_parked(ctx_tgt);
 +                    res->t_ms    = (ggml_time_us() - t0) / 1000.0;
++                    if (const char * dev = llama_active_device(ctx_tgt)) {
++                        res->device = dev;
++                    }
 +                    queue_results.send(std::move(res));
 +                } break;
              case SERVER_TASK_TYPE_METRICS:
                  {
                      int n_processing_slots = 0;
-@@ -4341,6 +4409,7 @@ private:
+@@ -4341,6 +4446,7 @@ private:
                          metrics.add_prompt_cached(n_past);
  
                          slot.prompt.tokens.keep_first(n_past);
@@ -10217,7 +10622,7 @@ index 5f7e67b..205be38 100644
  
                          // this is to signal the client that the request has started processing
                          if (slot.task->params.stream) {
-@@ -4372,6 +4441,12 @@ private:
+@@ -4372,6 +4478,12 @@ private:
  
                      slot.mem.seq_rm(slot.id, p0, -1);
  
@@ -10230,7 +10635,7 @@ index 5f7e67b..205be38 100644
                      // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                      bool wait_shared = false;
                      if (slot.task->n_tokens_shared > 0) {
-@@ -5858,6 +5933,33 @@ void server_routes::init_routes() {
+@@ -5858,6 +5970,63 @@ void server_routes::init_routes() {
          return res;
      };
  
@@ -10260,39 +10665,81 @@ index 5f7e67b..205be38 100644
 +    this->post_park      = park_handler(SERVER_TASK_TYPE_PARK);
 +    this->post_unpark    = park_handler(SERVER_TASK_TYPE_UNPARK);
 +    this->post_park_drop = park_handler(SERVER_TASK_TYPE_PARK_DROP);
++    this->post_move = [this](const server_http_req & req) {
++        auto res = create_response();
++        auto & rd = res->rd;
++        std::string device;
++        try {
++            device = json::parse(req.body).value("device", "");
++        } catch (const std::exception &) {
++        }
++        if (device.empty()) {
++            res->error(format_error_response("POST /move needs {\"device\": \"<name or PCI bus id>\"}", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++        {
++            server_task task(SERVER_TASK_TYPE_MOVE);
++            task.id     = rd.get_new_id();
++            task.device = device;
++            rd.post_task(std::move(task));
++        }
++        auto result = rd.next(req.should_stop);
++        if (!result) {
++            GGML_ASSERT(req.should_stop());
++            return res;
++        }
++        if (result->is_error()) {
++            res->error(result->to_json());
++            return res;
++        }
++        res->ok(result->to_json());
++        return res;
++    };
 +
      this->post_slots = [this](const server_http_req & req) {
          auto res = create_response();
          if (params.slot_save_path.empty()) {
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index 53b7e25..a95379e 100644
+index 05c538ea1..d0ec7efcf 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
-@@ -112,6 +112,9 @@ struct server_routes {
+@@ -112,6 +112,10 @@ struct server_routes {
      server_http_context::handler_t get_metrics;
      server_http_context::handler_t get_slots;
      server_http_context::handler_t post_slots;
 +    server_http_context::handler_t post_park;   // dual-buffer fork: llama_park
 +    server_http_context::handler_t post_unpark;
 +    server_http_context::handler_t post_park_drop;
++    server_http_context::handler_t post_move;
      server_http_context::handler_t get_props;
      server_http_context::handler_t post_props;
      server_http_context::handler_t post_infill;
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9455816..e6e6d2a 100644
+index 8faae1f18..380d3dfb3 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -32,6 +32,9 @@ enum server_task_type {
+@@ -32,6 +32,10 @@ enum server_task_type {
      SERVER_TASK_TYPE_GET_LORA,
      SERVER_TASK_TYPE_SET_LORA,
      SERVER_TASK_TYPE_TTS,
 +    SERVER_TASK_TYPE_PARK,   // dual-buffer fork: llama_park (POST /park), when no slot is processing
 +    SERVER_TASK_TYPE_UNPARK, // POST /unpark
 +    SERVER_TASK_TYPE_PARK_DROP, // POST /park/drop: free the demoted (repacked) copies
++    SERVER_TASK_TYPE_MOVE,      // POST /move: llama_move_device (the GPU part to another device of the process)
  };
  
  // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
-@@ -649,6 +652,19 @@ struct server_task_result_slot_save_load : server_task_result {
+@@ -191,6 +195,9 @@ struct server_task {
+ 
+     server_task_type type;
+ 
++    // used by SERVER_TASK_TYPE_MOVE (dual-buffer fork): the target device, a name or a PCI bus id
++    std::string device;
++
+     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
+     struct slot_action {
+         int id_slot;
+@@ -649,6 +656,32 @@ struct server_task_result_slot_save_load : server_task_result {
      virtual json to_json() override;
  };
  
@@ -10303,9 +10750,22 @@ index 9455816..e6e6d2a 100644
 +    double t_ms    = 0.0;
 +    size_t demoted = 0; // bytes of the repacked copies held (after a drop: freed)
 +    size_t host_uncharged = 0; // driver host memory the memory cgroup does not see (llama_backend_host_uncharged)
++    std::string device;  // the GPU device the model is on (or parked from)
++    std::string from;    // a move: the device it was on before
++    std::string message; // why a move did not happen
 +
 +    virtual json to_json() override {
-+        return json { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
++        json j = { { "success", success }, { "parked", parked }, { "demoted_bytes", demoted }, { "host_uncharged_bytes", host_uncharged }, { "timings", { { "ms", t_ms } } } };
++        if (!device.empty()) {
++            j["device"] = device;
++        }
++        if (!from.empty()) {
++            j["from"] = from;
++        }
++        if (!message.empty()) {
++            j["message"] = message;
++        }
++        return j;
 +    }
 +};
 +
@@ -10313,20 +10773,21 @@ index 9455816..e6e6d2a 100644
      size_t n_erased;
  
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index b625ad5..f37c85d 100644
+index 8b1d42650..76ec688b2 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -212,6 +212,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
+@@ -212,6 +212,10 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
      // Save & load slots
      ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
      ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 +    ctx_http.post("/park",                     ex_wrapper(routes.post_park));
 +    ctx_http.post("/unpark",                   ex_wrapper(routes.post_unpark));
 +    ctx_http.post("/park/drop",                ex_wrapper(routes.post_park_drop));
++    ctx_http.post("/move",                     ex_wrapper(routes.post_move));
  
      // Google Cloud Platform (Vertex AI) compat
      ctx_http.register_gcp_compat();
-@@ -680,6 +683,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
+@@ -680,6 +684,8 @@ static int server_run_instance(common_params & params, server_role & role, commo
      ctx_http.is_ready.store(true);
  
      SRV_INF("%s", "model loaded\n");
