@@ -6,14 +6,14 @@
 #   docker exec ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh
 #   docker exec -e QUICK=1 ollama-dualbuf bash /usr/lib/ollama/dualbuf-test/vmm-stress.sh   (one run per case)
 # From a checkout (pattern only, compiled here):
-#   docker run --rm --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:7.2.1 bash tools/dualbuf/vmm-stress.sh
+#   docker run --rm --device /dev/kfd --device /dev/dri/<RENDER_NODE> --group-add video -e HSA_OVERRIDE_GFX_VERSION=10.3.0 -v "$PWD":/src -w /src rocm/dev-ubuntu-24.04:10.2.0-full bash tools/dualbuf/vmm-stress.sh
 # Env: QUICK (1: one run per case), RUNS (3), TESTS ("impl pattern"), SYNCS ("none wait barrier both"), CASES (both tests, "a b c d", e and f: impl only),
 #      IMPL_CASES (impl, default CASES if set, else "a b c d e f"; f: e with one address reservation per arena),
 #      WAIT_MS (5), CHUNK_MIB (64), TARGET_GIB (6), ARCH (gfx1030, only for compiling the pattern)
 set -u
 cd "$(dirname "$0")"
 HERE=$PWD
-export LD_LIBRARY_PATH="/usr/lib/ollama/rocm_v7_2:/usr/lib/ollama:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/usr/lib/ollama/rocm_v10:/usr/lib/ollama:${LD_LIBRARY_PATH:-}"
 unset GGML_CUDA_VMM_DEBUG GGML_CUDA_VMM_SYNC GGML_CUDA_VMM_WAIT_MS  # logging would delay the first access; the mode is set per run
 RUNS=${RUNS:-3}; [ "${QUICK:-0}" = 1 ] && RUNS=1
 WAIT_MS=${WAIT_MS:-5}; CHUNK_MIB=${CHUNK_MIB:-64}; TARGET_GIB=${TARGET_GIB:-6}

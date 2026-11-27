@@ -31,7 +31,7 @@ A dual-buffer a csaki89/llama.cpp repó `dual-buffer` branchében kész és tesz
 ## Hol van a llama.cpp ebben a repóban
 - A llama-server külön épül: `llama/server/CMakeLists.txt`, FetchContent-tel a rögzített llama.cpp forrásból (`LLAMA_CPP_VERSION`: b11351 a v0.40.2-ben, b12177 a v0.40.16-ban).
 - Az Ollama-specifikus patchek: `llama/compat/` (`001-llama-cpp-hooks.patch`; a `002-clef.patch` a v0.40.16-ban megszűnt), utánuk a fork `003-dual-buffer.patch` és `004-cpu-variants.patch` patche.
-- A Linux/ROCm image a `Dockerfile`-ban épül (`llama-server-rocm_v7_2` stage, `cmake -S llama/server --preset rocm_v7_2_linux`, ROCm 7.2.1 az `rocm/dev-almalinux-8` alapon).
+- A Linux/ROCm image a `Dockerfile`-ban épül (`llama-server-rocm_v10` stage, `cmake -S llama/server --preset rocm_v10_linux`, ROCm 10.2.0 a `rocm/dev-ubuntu-24.04` alapon; DECISIONS 123). Az upstream `rocm_v7_2` stage megmaradt, a fork image-e nem használja.
 - Az ROCm image fordítása Linuxon/Dockerben történik, nem ezen a Windows gépen.
 
 ## Fejlesztői környezet (laptop, Windows)

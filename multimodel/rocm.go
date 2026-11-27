@@ -1,6 +1,7 @@
 package multimodel
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,55 +12,79 @@ import (
 	"github.com/ollama/ollama/ml"
 )
 
-// The ROCm runtime opens every GPU of the KFD topology whose render node it can reach when it starts, and it fails as
-// a whole on a card it cannot use (another backend's AMD card, an unsupported one), before ROCR_VISIBLE_DEVICES
-// filters anything. So with a config the ROCm runtime gets a view of the config's rocm cards only: the render nodes of
-// every other card are hidden from it while the HIP backend loads (GGML_HIP_HIDE_RENDER_NODES, the ggml-hide-dri
-// preload library). The gfx_override of the cards of a view is the process' HSA_OVERRIDE_GFX_VERSION: in the view it
-// reaches only them. The per-node HSA_OVERRIDE_GFX_VERSION_<n> of the thunk is not used: with ROCm 7.2 it did not start
-// a card that the same value in the global variable starts (the thunk keeps it apart, OverrideEngineId). So the cards
-// with different overrides are in separate views (docs/MULTIMODEL-DESIGN.md 2.3).
+// With ROCm 10 every ROCm process sees every card: the runtime starts with an AMD card it does not support in the
+// container and skips it. The gfx_override of a rocm device is its own HSA_OVERRIDE_GFX_VERSION_<node>, where <node> is
+// the card's KFD topology node (found by its PCI address); the global HSA_OVERRIDE_GFX_VERSION never goes to a ROCm
+// process with a config, as it would apply to the unsupported card too (docs/MULTIMODEL-DESIGN.md 2.3).
 
-// ROCmCard is a rocm device of the config with its PCI address.
+// ROCmCard is a rocm device of the config with its PCI address and KFD node.
 type ROCmCard struct {
 	Device      string // config device name
 	PCI         string // normalized PCI address
 	GFXOverride string // the device's gfx_override ("" = none)
-	minor       int    // its render node minor (renderD<minor>)
+	Node        int    // its KFD topology node
 }
 
-// ROCmView is a set of rocm cards a ROCm process sees together, and the environment of such a process.
-type ROCmView struct {
-	Cards []ROCmCard
-	Hide  []string          // the render nodes of every other card (renderD<N>)
-	Env   map[string]string // GGML_HIP_HIDE_RENDER_NODES and the gfx overrides
-}
-
-// RenderNodes maps the PCI address of every DRM render node under sysfsRoot (normally /sys) to its node names.
-func RenderNodes(sysfsRoot string) map[string][]string {
-	out := map[string][]string{}
-	nodes, _ := filepath.Glob(filepath.Join(sysfsRoot, "class", "drm", "renderD*"))
-	for _, n := range nodes {
-		dev, err := filepath.EvalSymlinks(filepath.Join(n, "device"))
+// KFDNodes maps the PCI address of every GPU node of the KFD topology under sysfsRoot (normally /sys) to its node
+// number (class/kfd/kfd/topology/nodes/<n>/properties: domain and location_id; a CPU node has neither a GPU id nor a
+// location).
+func KFDNodes(sysfsRoot string) map[string]int {
+	dir := filepath.Join(sysfsRoot, "class", "kfd", "kfd", "topology", "nodes")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	out := map[string]int{}
+	for _, e := range entries {
+		n, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
-		pci := normPCI(filepath.Base(dev))
-		if !pciRe.MatchString(pci) {
+		if gpu, err := os.ReadFile(filepath.Join(dir, e.Name(), "gpu_id")); err != nil || strings.TrimSpace(string(gpu)) == "0" {
 			continue
 		}
-		out[pci] = append(out[pci], filepath.Base(n))
-	}
-	for k := range out {
-		sort.Strings(out[k])
+		if pci := kfdNodePCI(filepath.Join(dir, e.Name(), "properties")); pci != "" {
+			out[pci] = n
+		}
 	}
 	return out
 }
 
+// kfdNodePCI is the PCI address of a KFD node from its properties: location_id is bus<<8 | device<<3 | function.
+func kfdNodePCI(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	loc, domain := int64(-1), int64(0)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fl := strings.Fields(sc.Text())
+		if len(fl) != 2 {
+			continue
+		}
+		v, err := strconv.ParseInt(fl[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fl[0] {
+		case "location_id":
+			loc = v
+		case "domain":
+			domain = v
+		}
+	}
+	if loc <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%04x:%02x:%02x.%x", domain, (loc>>8)&0xff, (loc>>3)&0x1f, loc&0x7)
+}
+
 // ROCmCards are the rocm devices of the config, each by its PCI address: the match itself, or for a name match the
-// PCI address of the one known (already discovered, e.g. by Vulkan) device whose name contains it. nodes are the render
-// nodes by PCI address (RenderNodes). notes says why a device is left out (it is skipped with a warning).
-func (c *Config) ROCmCards(nodes map[string][]string, known []ml.DeviceInfo) (cards []ROCmCard, notes []string) {
+// PCI address of the one known (already discovered, e.g. by Vulkan) device whose name contains it; and its KFD node
+// (KFDNodes). notes says why a device is left out (it is skipped with a warning).
+func (c *Config) ROCmCards(kfd map[string]int, known []ml.DeviceInfo) (cards []ROCmCard, notes []string) {
 	if c == nil {
 		return nil, nil
 	}
@@ -99,64 +124,36 @@ func (c *Config) ROCmCards(nodes map[string][]string, known []ml.DeviceInfo) (ca
 				continue
 			}
 		}
-		if len(nodes[pci]) == 0 {
-			notes = append(notes, fmt.Sprintf("devices.%s: the card %s has no render node in the container (pass its /dev/dri/renderD* device)", name, pci))
+		node, ok := kfd[pci]
+		if !ok {
+			notes = append(notes, fmt.Sprintf("devices.%s: the card %s has no KFD topology node (pass /dev/kfd; is it an amdgpu card?)", name, pci))
 			continue
 		}
-		minor, _ := strconv.Atoi(strings.TrimPrefix(nodes[pci][0], "renderD"))
-		cards = append(cards, ROCmCard{Device: name, PCI: pci, GFXOverride: d.GFXOverride, minor: minor})
+		cards = append(cards, ROCmCard{Device: name, PCI: pci, GFXOverride: d.GFXOverride, Node: node})
 	}
 	return cards, notes
 }
 
-// ROCmViews groups the rocm cards into the views a ROCm process sees: one view per gfx_override value (normally one,
-// with every card), with the global HSA_OVERRIDE_GFX_VERSION of that value (none for the cards without an override).
-// note says when the cards are split (a move between views is a reload).
-func ROCmViews(cards []ROCmCard, nodes map[string][]string) (views []ROCmView, note string) {
-	if len(cards) == 0 {
-		return nil, ""
-	}
-	byValue := map[string][]ROCmCard{}
-	var order []string
+// ROCmEnv is the gfx override environment of every ROCm process: HSA_OVERRIDE_GFX_VERSION_<node> for each card with a
+// gfx_override, never the global HSA_OVERRIDE_GFX_VERSION.
+func ROCmEnv(cards []ROCmCard) map[string]string {
+	env := map[string]string{}
 	for _, c := range cards {
-		if _, ok := byValue[c.GFXOverride]; !ok {
-			order = append(order, c.GFXOverride)
+		if c.GFXOverride != "" {
+			env["HSA_OVERRIDE_GFX_VERSION_"+strconv.Itoa(c.Node)] = c.GFXOverride
 		}
-		byValue[c.GFXOverride] = append(byValue[c.GFXOverride], c)
 	}
-	for _, o := range order {
-		in := byValue[o]
-		keep := map[string]bool{}
-		for _, c := range in {
-			keep[c.PCI] = true
-		}
-		v := ROCmView{Cards: in}
-		for p, ns := range nodes {
-			if !keep[p] {
-				v.Hide = append(v.Hide, ns...)
-			}
-		}
-		sort.Strings(v.Hide)
-		v.Env = map[string]string{"GGML_HIP_HIDE_RENDER_NODES": strings.Join(v.Hide, ",")}
-		if o != "" {
-			v.Env["HSA_OVERRIDE_GFX_VERSION"] = o
-		}
-		views = append(views, v)
-	}
-	if len(views) > 1 {
-		note = "the rocm cards have different gfx_override values: a ROCm process takes one, so each value has its own ROCm view (the other values' cards hidden there); a move between the views is a reload"
-	}
-	return views, note
+	return env
 }
 
-// SysfsRoot is the sysfs mount the render nodes are read from (a test sets another).
+// SysfsRoot is the sysfs mount the KFD topology is read from (a test sets another).
 var SysfsRoot = "/sys"
 
-// sysfsPresent: a Linux sysfs with DRM devices is there.
+// sysfsPresent: a Linux sysfs with a KFD topology is there.
 func sysfsPresent(root string) bool {
-	_, err := os.Stat(filepath.Join(root, "class", "drm"))
+	_, err := os.Stat(filepath.Join(root, "class", "kfd", "kfd", "topology", "nodes"))
 	return err == nil
 }
 
-// HasSysfs reports whether the render nodes can be read (Linux).
+// HasSysfs reports whether the KFD topology can be read (Linux, /dev/kfd's driver loaded).
 func HasSysfs() bool { return sysfsPresent(SysfsRoot) }

@@ -3,6 +3,8 @@
 ARG FLAVOR=${TARGETARCH}
 
 ARG ROCMVERSION=7.2.1
+# dual-buffer fork: the ROCm of the image (rocm, rocm-vulkan); there is no almalinux dev image for ROCm 10
+ARG ROCM10VERSION=10.2.0
 ARG JETPACK5VERSION=r35.4.1
 ARG JETPACK6VERSION=r36.4.0
 ARG CMAKEVERSION=3.31.2
@@ -183,6 +185,57 @@ RUN if [ -n "$ROCM_KEEP_ARCH" ]; then \
 FROM scratch AS publish-llama-server-rocm_v7_2
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama/
 
+# dual-buffer fork: ROCm 10 (its runtime starts with an AMD card it does not support in the container and skips it; the
+# per-node HSA_OVERRIDE_GFX_VERSION_<n> works, docs/DECISIONS.md 123). Built on the ubuntu 24.04 dev image, as the final stage.
+FROM --platform=linux/amd64 rocm/dev-ubuntu-24.04:${ROCM10VERSION}-full AS rocm-10-deps
+ARG CMAKEVERSION
+ARG NINJAVERSION
+ARG CCACHEVERSION=4.10.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --retry 3 -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}/cmake-${CMAKEVERSION}-linux-x86_64.tar.gz | tar xz -C /usr/local --strip-components 1 \
+    && curl --retry 3 -fsSL -o /tmp/ninja.zip https://github.com/ninja-build/ninja/releases/download/v${NINJAVERSION}/ninja-linux.zip \
+    && unzip /tmp/ninja.zip -d /usr/local/bin && rm /tmp/ninja.zip \
+    && curl --retry 3 -fsSL https://github.com/ccache/ccache/releases/download/v${CCACHEVERSION}/ccache-${CCACHEVERSION}-linux-x86_64.tar.xz | tar xJ -C /tmp \
+    && cp /tmp/ccache-${CCACHEVERSION}-linux-x86_64/ccache /usr/local/bin/ccache && rm -rf /tmp/ccache-${CCACHEVERSION}-linux-x86_64
+ENV CMAKE_GENERATOR=Ninja LDFLAGS=-s CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=5G
+ENV ROCM_PATH=/opt/rocm CMAKE_PREFIX_PATH=/opt/rocm
+ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:$PATH
+
+FROM rocm-10-deps AS llama-server-rocm_v10
+ARG LLAMA_SERVER_ROCM_CMAKE_ARGS=
+ARG ROCM_KEEP_ARCH=
+ARG LLAMA_SERVER_ROCM_TARGETS=
+ENV CC=clang CXX=clang++
+COPY LLAMA_CPP_VERSION .
+COPY llama/server llama/server
+COPY llama/compat llama/compat
+COPY cmake cmake
+COPY tools/dualbuf/vmm-stress.cpp tools/dualbuf/vmm-stress-impl.cpp tools/dualbuf/vmm-stress.sh tools/dualbuf/
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e; \
+    cmake -S llama/server --preset rocm_v10_linux ${LLAMA_SERVER_ROCM_CMAKE_ARGS}; \
+    cmake --build build/llama-server-rocm_v10 ${LLAMA_SERVER_ROCM_TARGETS:+--target $LLAMA_SERVER_ROCM_TARGETS} -- -l $(nproc); \
+    cmake --install build/llama-server-rocm_v10 --component llama-server --strip; \
+    test -f dist/lib/ollama/rocm_v10/libggml-hip.so; \
+    T=dist/lib/ollama/dualbuf-test; B=build/llama-server-rocm_v10; mkdir -p "$T"; \
+    INC=$(dirname "$(find "$B" -path '*/ggml/include/ggml-backend.h' | head -1)"); \
+    GGML=$(dirname "$(find "$B" -name libggml.so | head -1)"); \
+    BASE=$(dirname "$(find "$B" -name libggml-base.so | head -1)"); \
+    test -f "$INC/ggml-backend.h"; test -f "$GGML/libggml.so"; test -f "$BASE/libggml-base.so"; \
+    hipcc -O2 --offload-arch="${ROCM_KEEP_ARCH:-gfx1030}" -o "$T/vmm-stress" tools/dualbuf/vmm-stress.cpp; \
+    clang++ -std=c++17 -O2 -I"$INC" -o "$T/vmm-stress-impl" tools/dualbuf/vmm-stress-impl.cpp -L"$GGML" -L"$BASE" -lggml -lggml-base; \
+    cp tools/dualbuf/vmm-stress.sh "$T/"; chmod +x "$T/vmm-stress.sh"; \
+    ccache -s || true; \
+    rm -rf "$B"
+RUN rm -f dist/lib/ollama/rocm_v10/rocblas/library/*gfx90[06]*
+RUN if [ -n "$ROCM_KEEP_ARCH" ]; then \
+        for d in dist/lib/ollama/rocm_v10/rocblas/library dist/lib/ollama/rocm_v10/hipblaslt/library; do \
+            if [ -d "$d" ]; then find "$d" -type f -name "*gfx*" ! -name "*${ROCM_KEEP_ARCH}*" -delete; fi; \
+        done; \
+    fi
+
 FROM vulkan-deps AS llama-server-vulkan
 # Optional build targets (empty = all; only ggml-vulkan is installed). Used by the dual-buffer fork image.
 ARG LLAMA_SERVER_VULKAN_TARGETS=
@@ -343,7 +396,7 @@ COPY --from=jetpack-6 dist/lib/ollama/ /lib/ollama/
 
 FROM scratch AS rocm
 COPY --from=llama-server-cpu  dist/lib/ollama /lib/ollama
-COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama
+COPY --from=llama-server-rocm_v10 dist/lib/ollama /lib/ollama
 
 # dual-buffer fork: ROCm and Vulkan (e.g. a second, older AMD card that ROCm does not support)
 FROM rocm AS rocm-vulkan

@@ -602,9 +602,7 @@ func isLlamaServerGPUBackend(path string) bool {
 			return false
 		}
 	}
-	// dual-buffer fork: the render-node hiding preload library of a ROCm directory is no backend (an older build named
-	// it libggml-hide-dri.so, which sorted before libggml-hip.so and was taken as the backend)
-	return !strings.Contains(name, "hide-dri")
+	return true
 }
 
 func embeddingBatchSize(opts api.Options, numParallel int) int {
@@ -996,8 +994,8 @@ func NewLlamaServerRunner(
 	for k, v := range config.ExtraEnv {
 		serverEnvs[k] = v
 	}
-	// dual-buffer fork: the ROCm view the runner gets (hidden render nodes, gfx override, visible ROCm devices)
-	dualbufLogROCmView(modelPath, serverEnvs)
+	// dual-buffer fork: the per-card gfx overrides and visible ROCm devices the runner gets
+	dualbufLogROCmEnv(modelPath, serverEnvs)
 
 	launch := llamaServerLaunchConfig{
 		modelPath:    splitModel.modelPath,

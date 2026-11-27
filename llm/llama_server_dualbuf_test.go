@@ -146,9 +146,9 @@ func TestRenameDeviceBuffers(t *testing.T) {
 	}
 }
 
-// two ROCm cards of one view in a process: both visible to the ROCm runtime by their view ordinals, the active one first
+// two ROCm cards in a process: both visible to the ROCm runtime by their view ordinals, the active one first
 func TestDualbufExtraDevicesTwoROCm(t *testing.T) {
-	view := map[string]string{"GGML_HIP_HIDE_RENDER_NODES": "renderD129"}
+	view := map[string]string{"HSA_OVERRIDE_GFX_VERSION_2": "10.3.0"}
 	active := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:cc:00.0", Library: "ROCm"}, FilterID: "1", RunnerEnvOverrides: view}
 	other := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "0", RunnerEnvOverrides: view}
 	_, env := dualbufExtraDevices([]ml.DeviceInfo{active}, []ml.DeviceInfo{other}, nil, nil)
@@ -158,21 +158,7 @@ func TestDualbufExtraDevicesTwoROCm(t *testing.T) {
 			got = v
 		}
 	}
-	if got != "1,0" || env["GGML_HIP_HIDE_RENDER_NODES"] != "renderD129" {
+	if got != "1,0" || env["HSA_OVERRIDE_GFX_VERSION_2"] != "10.3.0" {
 		t.Fatalf("env %v", env)
-	}
-}
-
-// the ROCm library directory holds the render-node hiding library too: the GPU backend is still libggml-hip.so (the
-// older name libggml-hide-dri.so sorted first and was taken as the backend: no ROCm device at all)
-func TestFindGPUBackendSkipsHideLibrary(t *testing.T) {
-	dir := t.TempDir()
-	for _, f := range []string{"libggml-base.so", "libggml-hide-dri.so", "libollama-hide-dri.so", "libggml-hip.so"} {
-		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := findLlamaServerGPUBackend(dir); filepath.Base(got) != "libggml-hip.so" {
-		t.Fatalf("backend %q", got)
 	}
 }

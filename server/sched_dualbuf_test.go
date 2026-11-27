@@ -167,11 +167,11 @@ func TestDualbufStartupGFXOverride(t *testing.T) {
 	var buf bytes.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(old); discover.DualbufROCmViews = nil })
+	t.Cleanup(func() { slog.SetDefault(old); discover.DualbufROCm = nil })
 	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 
 	dualbufStartup(dualbufTestScheduler(t, "").dualbuf)
-	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "10.3.0" || discover.DualbufROCmViews != nil {
+	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "10.3.0" || discover.DualbufROCm != nil {
 		t.Fatal("no config: the stock behaviour, the variable applies")
 	}
 	cfg := "default: {}\ndevices:\n  gpu_rocm: { backend: rocm, match: \"0000:aa:00.0\", gfx_override: 10.3.0 }\n"
@@ -196,10 +196,10 @@ func envValues(env []string, key string) []string {
 }
 
 // the gfx override the discovery and runner subprocesses get (both are set up by llm.SetupLlamaServerCommandEnv):
-// without a config the global HSA_OVERRIDE_GFX_VERSION; with one the rocm device's gfx_override (from its ROCm view),
-// and the global one no longer
+// without a config the global HSA_OVERRIDE_GFX_VERSION; with one only the rocm device's gfx_override as
+// HSA_OVERRIDE_GFX_VERSION_<its KFD node>, and the global one no longer
 func TestDualbufSubprocessGFXOverride(t *testing.T) {
-	t.Cleanup(func() { discover.DualbufROCmViews = nil })
+	t.Cleanup(func() { discover.DualbufROCm = nil })
 	exe := filepath.Join(t.TempDir(), "llama-server")
 	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 
@@ -212,27 +212,28 @@ func TestDualbufSubprocessGFXOverride(t *testing.T) {
 		t.Fatalf("no config: %v", got)
 	}
 
-	// config: the device's override through its view
+	// config: the device's override for its KFD node (the other card, node 1, gets none)
 	cfg := "default: {}\ndevices:\n  gpu_rocm: { backend: rocm, match: \"0000:aa:00.0\", gfx_override: 11.0.0 }\n"
 	s := dualbufTestScheduler(t, cfg)
 	dualbufStartup(s.dualbuf)
-	cards, _ := s.dualbuf.Config().ROCmCards(map[string][]string{"0000:aa:00.0": {"renderD128"}, "0000:bb:00.0": {"renderD129"}}, nil)
-	views, _ := multimodel.ROCmViews(cards, map[string][]string{"0000:aa:00.0": {"renderD128"}, "0000:bb:00.0": {"renderD129"}})
-	if len(views) != 1 {
-		t.Fatalf("views %+v", views)
+	cards := dualbufROCmCards(s.dualbuf.Config(), map[string]int{"0000:bb:00.0": 1, "0000:aa:00.0": 2}, nil)
+	if cards == nil || len(cards.PCIs) != 1 || len(cards.Env) != 1 {
+		t.Fatalf("cards %+v", cards)
 	}
-	// the discovery gets the view's environment as its extra environment, the runner the device's overrides
+	// the discovery gets the cards' environment as its extra environment, the runner the device's overrides
 	for name, extra := range map[string]map[string]string{
-		"discovery": views[0].Env,
-		"runner":    ml.GetDevicesEnv([]ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "0", RunnerEnvOverrides: views[0].Env}}),
+		"discovery": cards.Env,
+		"runner":    ml.GetDevicesEnv([]ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "0", RunnerEnvOverrides: cards.Env}}),
 	} {
 		cmd := exec.Command(exe)
 		llm.SetupLlamaServerCommandEnv(cmd, exe, nil, extra)
-		if got := envValues(cmd.Env, "HSA_OVERRIDE_GFX_VERSION"); len(got) != 1 || got[0] != "11.0.0" {
+		if got := envValues(cmd.Env, "HSA_OVERRIDE_GFX_VERSION_2"); len(got) != 1 || got[0] != "11.0.0" {
 			t.Fatalf("%s: %v", name, got)
 		}
-		if got := envValues(cmd.Env, "GGML_HIP_HIDE_RENDER_NODES"); len(got) != 1 || got[0] != "renderD129" {
-			t.Fatalf("%s hidden: %v", name, got)
+		for _, kv := range cmd.Env {
+			if k, _, _ := strings.Cut(kv, "="); k == "HSA_OVERRIDE_GFX_VERSION" || k == "HSA_OVERRIDE_GFX_VERSION_1" || k == "LD_PRELOAD" {
+				t.Fatalf("%s: only the card's own override: %s", name, kv)
+			}
 		}
 	}
 }
