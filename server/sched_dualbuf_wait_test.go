@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/fs/gguf"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/multimodel"
 )
@@ -182,4 +184,47 @@ func TestDualbufWaitingLoadCancelled(t *testing.T) {
 	notServed(t, d, 50*time.Millisecond)
 	cancel()
 	served(t, d, 2*time.Second)
+}
+
+// a runner reporting driver host memory the cgroup does not see (the Vulkan host buffers)
+type unchargedLlm struct{ mockLlm }
+
+func (u *unchargedLlm) HostUncharged() uint64 { return 512 << 20 }
+
+// load runs dualbufServerConfig with loadedMu held: the uncharged host memory of the other runners is read without
+// taking it again (a self-deadlock before), the launch gets it
+func TestDualbufLoadDoesNotDeadlock(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 20*time.Second)
+	defer done()
+	s := InitScheduler(ctx)
+	s.dualbuf = dualbufTestScheduler(t, sprintf(schedTestConfig, "true")).dualbuf
+	cfg := s.dualbuf.Config()
+	other := mkRunner(s, cfg, "other", "gpu1", 1, 0, time.Minute)
+	other.llama = &unchargedLlm{}
+
+	a := newScenarioRequest(t, ctx, "ollama-model-1", 10, &api.Duration{Duration: time.Minute}, nil)
+	a.req.model.ShortName = "small:latest"
+	a.req.model.dualbuf = &dualbufLoad{cfg: cfg, eff: cfg.Resolve("small:latest", nil, nil, nil, nil), placement: multimodel.DeviceCPU, tiers: []string{"gpu0", "cpu"}}
+	var got llm.LlamaServerConfig
+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		got = config
+		return a.newServer(systemInfo, gpus, model, f, adapters, projectors, opts, numParallel, config)
+	}
+	finished := make(chan bool, 1)
+	go func() { finished <- s.load(a.req, getSystemInfoFn(), nil, false) }()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("load did not return: deadlock in the dualbuf launch path")
+	}
+	select {
+	case <-a.req.successCh:
+	case err := <-a.req.errCh:
+		t.Fatalf("load: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the runner did not come up")
+	}
+	if got.ExtraEnv["LLAMA_ARG_RAM_UNCHARGED_MIB"] != "512" {
+		t.Fatalf("the other runner's uncharged host memory goes to the launch: %v", got.ExtraEnv)
+	}
 }

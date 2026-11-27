@@ -275,19 +275,19 @@ func dualbufNumParallel(req *LlmRequest, numParallel int, completion bool) int {
 	return numParallel
 }
 
-// dualbufServerConfig adds the per model llama-server settings and logs the effective ones.
 // dualbufHostUncharged sums the driver host memory of the loaded runners that the memory cgroup does not see
-// (llama-server: "host memory: ... not charged to the cgroup"), except the runner except.
+// (llama-server: "host memory: ... not charged to the cgroup"), except the runner except. It takes loadedMu.
 func (s *Scheduler) dualbufHostUncharged(except *runnerRef) uint64 {
-	type uncharged interface{ HostUncharged() uint64 }
 	s.loadedMu.Lock()
-	runners := make([]*runnerRef, 0, len(s.loaded))
-	for _, r := range s.loaded {
-		runners = append(runners, r)
-	}
-	s.loadedMu.Unlock()
+	defer s.loadedMu.Unlock()
+	return s.dualbufHostUnchargedLocked(except)
+}
+
+// dualbufHostUnchargedLocked is dualbufHostUncharged with loadedMu held by the caller (load).
+func (s *Scheduler) dualbufHostUnchargedLocked(except *runnerRef) uint64 {
+	type uncharged interface{ HostUncharged() uint64 }
 	var sum uint64
-	for _, r := range runners {
+	for _, r := range s.loaded {
 		if r == except || r.llama == nil {
 			continue
 		}
@@ -298,6 +298,8 @@ func (s *Scheduler) dualbufHostUncharged(except *runnerRef) uint64 {
 	return sum
 }
 
+// dualbufServerConfig adds the per model llama-server settings and logs the effective ones. Called by load with
+// loadedMu held: nothing here may take it again.
 func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServerConfig) {
 	db := req.model.dualbuf
 	if db == nil {
@@ -308,7 +310,7 @@ func (s *Scheduler) dualbufServerConfig(req *LlmRequest, config *llm.LlamaServer
 		config.ExtraEnv[k] = v
 	}
 	// the other runners' uncharged driver host memory for the llama-server RAM guard (its own it measures itself)
-	if unch := s.dualbufHostUncharged(nil); unch > 0 {
+	if unch := s.dualbufHostUnchargedLocked(nil); unch > 0 {
 		config.ExtraEnv["LLAMA_ARG_RAM_UNCHARGED_MIB"] = strconv.FormatUint(unch>>20, 10)
 	}
 	// reserve_mib of the GPU the model is placed on: its fit target (and the zones margin), else LLAMA_ARG_FIT_TARGET applies
