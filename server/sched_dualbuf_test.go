@@ -141,7 +141,7 @@ func TestDualbufVictimSameDevice(t *testing.T) {
 	older := mk("/m/old-on-gpu0", "gpu0", 20, 0)
 	busy := mk("/m/busy-on-gpu0", "gpu0", 10, 1)
 	req := &LlmRequest{model: &Model{ModelPath: "/m/want", dualbuf: &dualbufLoad{cfg: cfg, placement: "gpu0"}}}
-	v := s.dualbufVictim(req)
+	v := s.dualbufVictim(req, false)
 	if v != older || !older.dualbufPark.Load() {
 		t.Fatalf("victim %s park %v", v.modelPath, v.dualbufPark.Load())
 	}
@@ -150,7 +150,7 @@ func TestDualbufVictimSameDevice(t *testing.T) {
 	}
 	// a victim chosen for RAM comes first
 	req.dualbufVictim = busy
-	if v := s.dualbufVictim(req); v != busy || req.dualbufVictim != nil {
+	if v := s.dualbufVictim(req, false); v != busy || req.dualbufVictim != nil {
 		t.Fatalf("RAM victim: %v", v)
 	}
 }

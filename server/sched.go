@@ -62,6 +62,11 @@ type LlmRequest struct {
 
 	// dual-buffer fork: the runner to expire for this request's RAM room (sched_dualbuf.go)
 	dualbufVictim *runnerRef
+	// dual-buffer fork: the load waits for room on its device and steps aside (dualbufWaiting); the victim whose
+	// unload it waits for
+	dualbufDeferred  bool
+	dualbufWaitFor   *runnerRef
+	dualbufAnyDevice bool // it waits for an idle model anywhere (OLLAMA_MAX_LOADED_MODELS)
 }
 
 type Scheduler struct {
@@ -88,6 +93,8 @@ type Scheduler struct {
 
 	// dual-buffer fork: the multi-model rules (dualbuf.yaml), nil-safe
 	dualbuf *multimodel.Manager
+	// dual-buffer fork: the loads waiting for room on their device, back to the pending queue on an event
+	dualbufWaiting dualbufWaiting
 }
 
 // loadedModelsForName returns models still owned by loaded runners. The models
@@ -144,6 +151,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		dualbuf:         newDualbufManager(),
 	}
 	sched.loadFn = sched.load
+	sched.dualbufInit()
 	return sched
 }
 
@@ -287,9 +295,13 @@ func (s *Scheduler) processPending(ctx context.Context) {
 
 			if pending.ctx.Err() != nil {
 				slog.Debug("pending request cancelled or timed out, skipping scheduling")
+				s.dualbufDone(pending)
 				continue
 			}
 			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
+			// dual-buffer fork: the events so far; one that comes while the load decides to wait sends it back at once
+			dualbufEvents := s.dualbufEvents()
+			pending.dualbufDeferred = false
 
 			for {
 				var runnerToExpire *runnerRef
@@ -303,6 +315,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					runnersSnapshot = append(runnersSnapshot, r)
 				}
 				s.loadedMu.Unlock()
+
+				// dual-buffer fork: a load waiting for room (its victim still unloading, or an earlier load waiting on its
+				// device) steps aside; the other requests go on
+				if s.dualbufMustWait(ctx, pending, runner) {
+					break
+				}
 
 				if runner != nil {
 					if runner.needsReload(ctx, pending) {
@@ -318,7 +336,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					}
 				} else if maxRunners > 0 && activeCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
-					runnerToExpire = s.dualbufVictim(pending)
+					runnerToExpire = s.dualbufVictim(pending, true)
 				} else {
 					// Either no models are loaded or below envconfig.MaxRunners
 					// Get a refreshed GPU list
@@ -380,11 +398,11 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						continue
 					}
 
-					runnerToExpire = s.dualbufVictim(pending)
+					runnerToExpire = s.dualbufVictim(pending, false)
 				}
 
-				if runnerToExpire == nil && pending.ctx.Err() != nil {
-					// dual-buffer fork: the request ended while waiting for an idle model to make room
+				if runnerToExpire == nil && (pending.ctx.Err() != nil || pending.dualbufDeferred) {
+					// dual-buffer fork: only active models could make room: the load waits for an event, the others go on
 					break
 				}
 				if runnerToExpire == nil {
@@ -409,6 +427,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					s.expiredCh <- runnerToExpire
 				}
 				runnerToExpire.refMu.Unlock()
+				// dual-buffer fork: a placed load waits for the unload aside, the others go on
+				if s.dualbufAwaitUnload(pending, runnerToExpire) {
+					break
+				}
 				// Wait for the unload to happen
 				slog.Debug("waiting for pending requests to complete and unload to occur", "runner", runnerToExpire)
 				select {
@@ -420,6 +442,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					continue
 				}
 			}
+			// dual-buffer fork: a waiting load keeps its turn on its devices until an event sends it back
+			s.dualbufAfterPending(pending, dualbufEvents)
 		case <-s.unloadedCh:
 			// An unload request when there are no pending request can be ignored
 			slog.Debug("ignoring unload event with no pending requests")
@@ -473,7 +497,12 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				}
 			}
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
+			idle := runner.refCount <= 0
 			runner.refMu.Unlock()
+			if idle {
+				// dual-buffer fork: an idle model can make room: the loads waiting on its device try again
+				s.dualbufWake(dualbufRunnerDevices(runner)...)
+			}
 		case runner := <-s.expiredCh:
 			slog.Debug("runner expired event received", "runner", runner)
 			runner.refMu.Lock()
@@ -528,6 +557,8 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				runner.refMu.Unlock()
 				slog.Debug("sending an unloaded event", "runner", runner)
 				s.unloadedCh <- struct{}{}
+				// dual-buffer fork: the device has the room now: the loads waiting on it try again
+				s.dualbufWake(dualbufRunnerDevices(runner)...)
 			}
 		}
 	}

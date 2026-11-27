@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/multimodel"
 )
 
@@ -110,7 +111,7 @@ func TestDualbufVictimIdleLRUNeverActive(t *testing.T) {
 	newer := mkRunner(s, cfg, "newer", "gpu0", 30, 0, time.Minute)
 	older := mkRunner(s, cfg, "older", "gpu0", 20, 0, time.Minute)
 	busy := mkRunner(s, cfg, "busy", "gpu0", 10, 1, time.Minute)
-	if v := s.dualbufVictim(pendingFor(cfg, "want", "gpu0")); v != older || !older.dualbufPark.Load() || older.dualbufDemoteTo.Load() != "" {
+	if v := s.dualbufVictim(pendingFor(cfg, "want", "gpu0"), false); v != older || !older.dualbufPark.Load() || older.dualbufDemoteTo.Load() != "" {
 		t.Fatalf("victim %v park %v", v.modelPath, v.dualbufPark.Load())
 	}
 	if newer.dualbufPark.Load() || busy.dualbufPark.Load() {
@@ -123,7 +124,7 @@ func TestDualbufVictimIdleLRUNeverActive(t *testing.T) {
 	defer cancel()
 	p := pendingFor(cfg2, "want", "gpu0")
 	p.ctx = ctx
-	if v := s2.dualbufVictim(p); v != nil {
+	if v := s2.dualbufVictim(p, false); v != nil {
 		t.Fatalf("an active model is never a victim: %v", v.modelPath)
 	}
 	// active in the coordinator (between the place and the runner) counts too
@@ -133,7 +134,7 @@ func TestDualbufVictimIdleLRUNeverActive(t *testing.T) {
 	defer g.Release()
 	p = pendingFor(cfg3, "want", "gpu0")
 	p.ctx = ctx
-	if v := s3.dualbufVictim(p); v != nil {
+	if v := s3.dualbufVictim(p, false); v != nil {
 		t.Fatal("a model with an active request is never a victim")
 	}
 }
@@ -144,7 +145,7 @@ func TestDualbufVictimDemoteWithWaitingRequest(t *testing.T) {
 	hold, _ := s.dualbuf.Coord.Acquire(context.Background(), multimodel.Request{Model: "big", Key: "/m/big:latest", Devices: []string{"gpu0"}})
 	ch, cancel := waitingRequest(t, s, v.modelKey, "gpu0", "cpu")
 	defer cancel()
-	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu0")); got != v || v.dualbufDemoteTo.Load() != "cpu" {
+	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu0"), false); got != v || v.dualbufDemoteTo.Load() != "cpu" {
 		t.Fatalf("demote: %v to %q", got, v.dualbufDemoteTo.Load())
 	}
 	// once it left gpu0, its waiting request is served one tier down
@@ -163,7 +164,7 @@ func TestDualbufVictimDemoteWithWaitingRequest(t *testing.T) {
 func TestDualbufVictimParkWithoutWaiter(t *testing.T) {
 	s, cfg := schedTest(t, "true")
 	v := mkRunner(s, cfg, "small:latest", "gpu0", 5, 0, time.Minute)
-	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu0")); got != v || v.dualbufDemoteTo.Load() != "" || !v.dualbufPark.Load() {
+	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu0"), false); got != v || v.dualbufDemoteTo.Load() != "" || !v.dualbufPark.Load() {
 		t.Fatalf("park: demote %q park %v", v.dualbufDemoteTo.Load(), v.dualbufPark.Load())
 	}
 	// a waiting request but no lower tier on its list: park
@@ -173,7 +174,7 @@ func TestDualbufVictimParkWithoutWaiter(t *testing.T) {
 	defer hold.Release()
 	_, cancel := waitingRequest(t, s2, low.modelKey, "gpu0")
 	defer cancel()
-	if got := s2.dualbufVictim(pendingFor(cfg2, "big:latest", "cpu")); got != low || low.dualbufDemoteTo.Load() != "" || !low.dualbufPark.Load() {
+	if got := s2.dualbufVictim(pendingFor(cfg2, "big:latest", "cpu"), false); got != low || low.dualbufDemoteTo.Load() != "" || !low.dualbufPark.Load() {
 		t.Fatalf("lowest tier: demote %q park %v", low.dualbufDemoteTo.Load(), low.dualbufPark.Load())
 	}
 }
@@ -187,11 +188,11 @@ func TestDualbufVictimChain(t *testing.T) {
 	defer hold.Release()
 	_, c1 := waitingRequest(t, s, first.modelKey, "gpu0", "gpu1", "cpu")
 	defer c1()
-	if got := s.dualbufVictim(pendingFor(cfg, "new", "gpu0")); got != first || first.dualbufDemoteTo.Load() != "gpu1" {
+	if got := s.dualbufVictim(pendingFor(cfg, "new", "gpu0"), false); got != first || first.dualbufDemoteTo.Load() != "gpu1" {
 		t.Fatalf("first step: %q", first.dualbufDemoteTo.Load())
 	}
 	// big now loads on gpu1, where small sits idle without a waiting request: small is parked
-	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu1")); got != second || second.dualbufDemoteTo.Load() != "" || !second.dualbufPark.Load() {
+	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu1"), false); got != second || second.dualbufDemoteTo.Load() != "" || !second.dualbufPark.Load() {
 		t.Fatalf("second step: %v %q", got.modelPath, second.dualbufDemoteTo.Load())
 	}
 }
@@ -200,12 +201,12 @@ func TestDualbufVictimKeepAlive(t *testing.T) {
 	// without swap an idle victim is unloaded, a keep_alive -1 one is parked (never unloaded)
 	s, cfg := schedTest(t, "false")
 	plain := mkRunner(s, cfg, "plain", "gpu0", 5, 0, 5*time.Minute)
-	if got := s.dualbufVictim(pendingFor(cfg, "want", "gpu0")); got != plain || plain.dualbufPark.Load() {
+	if got := s.dualbufVictim(pendingFor(cfg, "want", "gpu0"), false); got != plain || plain.dualbufPark.Load() {
 		t.Fatal("no swap: unload")
 	}
 	delete(s.loaded, plain.modelKey)
 	keep := mkRunner(s, cfg, "keep", "gpu0", 5, 0, time.Duration(math.MaxInt64))
-	if got := s.dualbufVictim(pendingFor(cfg, "want", "gpu0")); got != keep || !keep.dualbufPark.Load() || !keep.dualbufForever.Load() {
+	if got := s.dualbufVictim(pendingFor(cfg, "want", "gpu0"), false); got != keep || !keep.dualbufPark.Load() || !keep.dualbufForever.Load() {
 		t.Fatal("keep_alive -1: parked, not unloaded")
 	}
 }
@@ -241,5 +242,46 @@ func TestDualbufQueueLimit(t *testing.T) {
 	opts := api.DefaultOptions()
 	if _, _, _, err := s.dualbufPrepare(context.Background(), m, nil, nil, &opts); !errors.Is(err, ErrMaxQueue) {
 		t.Fatalf("a full queue is the stock ErrMaxQueue: %v", err)
+	}
+}
+
+// GPU <-> CPU in process: a demote to the CPU parks the model in its process (whatever swap says); a GPU placement
+// with another tier on its list keeps the park copies and does not map the file; a one-tier model is unchanged
+func TestDualbufDemoteToCPUInProcess(t *testing.T) {
+	s, cfg := schedTest(t, "false")
+	v := mkRunner(s, cfg, "small:latest", "gpu0", 5, 0, time.Minute)
+	hold, _ := s.dualbuf.Coord.Acquire(context.Background(), multimodel.Request{Model: "big", Key: "/m/big:latest", Devices: []string{"gpu0"}})
+	defer hold.Release()
+	_, cancel := waitingRequest(t, s, v.modelKey, "gpu0", "cpu")
+	defer cancel()
+	if got := s.dualbufVictim(pendingFor(cfg, "big:latest", "gpu0"), false); got != v || v.dualbufDemoteTo.Load() != "cpu" || !v.dualbufPark.Load() {
+		t.Fatalf("demote to the cpu without swap: to %q park %v", v.dualbufDemoteTo.Load(), v.dualbufPark.Load())
+	}
+
+	for _, tc := range []struct {
+		name, model string
+		park        bool
+	}{
+		{"two tiers", "small:latest", true}, // [gpu0, cpu]
+		{"one tier", "solo:latest", false},  // [gpu0]
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := dualbufTestScheduler(t, sprintf(schedTestConfig, "false")+"  solo:latest:\n    devices: [gpu0]\n")
+			m := &Model{ModelPath: "/m/" + tc.model, ShortName: tc.model}
+			opts := api.DefaultOptions()
+			m2, _, g, err := s.dualbufPrepare(context.Background(), m, nil, nil, &opts)
+			if err != nil || g == nil || m2.dualbuf.placement != "gpu0" {
+				t.Fatalf("prepare: %+v %v", m2.dualbuf, err)
+			}
+			defer g.Release()
+			if m2.dualbuf.movesInProcess() != tc.park || (opts.UseMMap != nil) != tc.park || (tc.park && *opts.UseMMap) {
+				t.Fatalf("moves in process %v, use_mmap %v", m2.dualbuf.movesInProcess(), opts.UseMMap)
+			}
+			var config llm.LlamaServerConfig
+			s.dualbufServerConfig(&LlmRequest{model: m2}, &config)
+			if (config.ExtraEnv["LLAMA_ARG_PARK"] == "1") != tc.park {
+				t.Fatalf("park copies: %v", config.ExtraEnv)
+			}
+		})
 	}
 }
