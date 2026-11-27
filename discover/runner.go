@@ -81,6 +81,7 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 		// are enumerated, but not actually supported.
 		// We run this in serial to avoid potentially initializing a GPU multiple
 		// times concurrently leading to memory contention
+		var dualbufROCmDirs [][]string
 		for dir := range libDirs {
 			// Typically bootstrapping takes < 1s, but on some systems, with devices
 			// in low power/idle mode, initialization can take multiple seconds.  We
@@ -113,6 +114,12 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 				dirs = []string{ml.LibOllamaPath}
 			}
 
+			if DualbufROCmCards != nil && runtime.GOOS == "linux" && dir != "" && isROCmLibraryDir(filepath.Base(dir)) {
+				// dual-buffer fork: the ROCm discovery runs after the others, once per config card (dualbuf_rocm.go)
+				dualbufROCmDirs = append(dualbufROCmDirs, dirs)
+				continue
+			}
+
 			ctx1stPass, cancel := context.WithTimeout(ctx, bootstrapTimeout)
 			// For this pass, we retain duplicates in case any are incompatible with some libraries
 			discovered := bootstrapDevicesWithMetalRetry(ctx1stPass, ctx, bootstrapTimeout, dirs, nil)
@@ -121,6 +128,17 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 			}
 			devices = append(devices, discovered...)
 			cancel()
+		}
+
+		// dual-buffer fork: the config's rocm cards, each in its own ROCm view (a name match resolved from the devices above)
+		for _, dirs := range dualbufROCmDirs {
+			if cards := DualbufROCmCards(devices); len(cards) > 0 {
+				devices = append(devices, dualbufDiscoverROCm(ctx, 30*time.Second, dirs, cards)...)
+			} else {
+				c, cancel := context.WithTimeout(ctx, 30*time.Second)
+				devices = append(devices, bootstrapDevicesWithMetalRetry(c, ctx, 30*time.Second, dirs, nil)...)
+				cancel()
+			}
 		}
 
 		devices = filterIntegratedGPUs(devices)

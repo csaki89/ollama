@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/llm"
@@ -242,9 +243,16 @@ func (s *Scheduler) dualbufPlacementGPUs(req *LlmRequest, systemInfo ml.SystemIn
 						}
 						if d, ok := dm.ByName[t]; ok {
 							for _, x := range gpus {
-								if x.DeviceID == d.Info.DeviceID {
-									db.extraGPUs = append(db.extraGPUs, x)
+								if x.DeviceID != d.Info.DeviceID {
+									continue
 								}
+								if x.Library == "ROCm" && (g.Library == "ROCm" || slices.ContainsFunc(db.extraGPUs, func(e ml.DeviceInfo) bool { return e.Library == "ROCm" })) {
+									// every ROCm card has a ROCm view of its own (hidden render nodes, gfx override): one per
+									// process, a move between two ROCm cards is a reload
+									slog.Info("dualbuf: a second ROCm card is not loaded into the process", "model", dualbufModelName(req.model), "device", t)
+									continue
+								}
+								db.extraGPUs = append(db.extraGPUs, x)
 							}
 						}
 					}
@@ -1044,3 +1052,31 @@ type demoter interface {
 
 // demotedCopies is the eviction candidate of the demoted copies of a runner (dropped, the runner stays).
 type demotedCopies struct{ r *runnerRef }
+
+// dualbufStartup runs once the config is read: with a config the global HSA_OVERRIDE_GFX_VERSION does not apply (the
+// gfx_override of a rocm device does, for that card only), and the ROCm discovery runs per config card, each in its
+// own ROCm view (docs/MULTIMODEL-DESIGN.md 2.3). Without a config nothing changes.
+func dualbufStartup(m *multimodel.Manager) {
+	cfg := m.Config()
+	if cfg == nil {
+		return
+	}
+	if v := os.Getenv("HSA_OVERRIDE_GFX_VERSION"); v != "" {
+		slog.Warn("dualbuf: HSA_OVERRIDE_GFX_VERSION is ignored with a multi-model config; set gfx_override on the rocm device it is for", "value", v)
+		os.Unsetenv("HSA_OVERRIDE_GFX_VERSION")
+	}
+	if !multimodel.HasSysfs() {
+		return
+	}
+	discover.DualbufROCmCards = func(known []ml.DeviceInfo) []discover.DualbufROCmCard {
+		cards, notes := cfg.ROCmCards(multimodel.RenderNodes(multimodel.SysfsRoot), known)
+		for _, n := range notes {
+			slog.Warn("dualbuf: a rocm device is left out", "reason", n)
+		}
+		out := make([]discover.DualbufROCmCard, 0, len(cards))
+		for _, c := range cards {
+			out = append(out, discover.DualbufROCmCard{Device: c.Device, PCI: c.PCI, Env: c.Env()})
+		}
+		return out
+	}
+}

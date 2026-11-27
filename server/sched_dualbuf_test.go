@@ -1,13 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/multimodel"
 )
 
@@ -152,5 +156,27 @@ func TestDualbufVictimSameDevice(t *testing.T) {
 	req.dualbufVictim = busy
 	if v := s.dualbufVictim(req, false); v != busy || req.dualbufVictim != nil {
 		t.Fatalf("RAM victim: %v", v)
+	}
+}
+
+// with a config the global gfx override does not apply (a warning says where it goes), without one it is kept
+func TestDualbufStartupGFXOverride(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old); discover.DualbufROCmCards = nil })
+	t.Setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+
+	dualbufStartup(dualbufTestScheduler(t, "").dualbuf)
+	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "10.3.0" || discover.DualbufROCmCards != nil {
+		t.Fatal("no config: the stock behaviour, the variable applies")
+	}
+	cfg := "default: {}\ndevices:\n  gpu_rocm: { backend: rocm, match: \"0000:aa:00.0\", gfx_override: 10.3.0 }\n"
+	dualbufStartup(dualbufTestScheduler(t, cfg).dualbuf)
+	if os.Getenv("HSA_OVERRIDE_GFX_VERSION") != "" {
+		t.Fatal("with a config the global override does not apply")
+	}
+	if !strings.Contains(buf.String(), "HSA_OVERRIDE_GFX_VERSION is ignored") || !strings.Contains(buf.String(), "gfx_override") {
+		t.Fatalf("warning: %s", buf.String())
 	}
 }

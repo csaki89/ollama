@@ -2520,6 +2520,7 @@ func Serve(ln net.Listener) error {
 		slog.Error("the server does not start", "error", err)
 		return err
 	}
+	dualbufStartup(dualbuf)
 
 	if !envconfig.NoPrune() {
 		if _, err := manifest.Manifests(false); err != nil {
