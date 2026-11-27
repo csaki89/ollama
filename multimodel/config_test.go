@@ -107,6 +107,8 @@ func TestParseErrors(t *testing.T) {
 		"no default":         {"devices:\n  cpu: { backend: cpu }\n", "default: missing"},
 		"old defaults name":  {"default: {}\ndefaults:\n  threads: 2\n", "called default now"},
 		"duplicate model":    {"default: {}\nmodels:\n  a:b: {}\n  a:b: {}\n", "already defined"},
+		"bad gfx_override":   {"default: {}\ndevices:\n  g: { backend: rocm, match: x, gfx_override: gfx1030 }\n", "is not a gfx version"},
+		"gfx_override vk":    {"default: {}\ndevices:\n  g: { backend: vulkan, match: x, gfx_override: 10.3.0 }\n", "only a rocm device"},
 	}
 	for name, tc := range cases {
 		_, err := Parse([]byte(tc.body))

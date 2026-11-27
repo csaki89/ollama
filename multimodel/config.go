@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -49,6 +50,9 @@ type Device struct {
 	// ReserveMiB: on a GPU the VRAM kept free on it (the llama-server fit target, also the zones' margin; default
 	// LLAMA_ARG_FIT_TARGET); on the CPU the reserve of the whole RAM budget (default max(1 GiB, 5% of the limit))
 	ReserveMiB *int `yaml:"reserve_mib"`
+	// GFXOverride (rocm only): the gfx version the ROCm runtime uses for this card (what HSA_OVERRIDE_GFX_VERSION does
+	// for every card), e.g. "10.3.0"; it applies to this card only. With a config the global variable does not apply.
+	GFXOverride string `yaml:"gfx_override"`
 }
 
 // Settings are the per model fields; the defaults section has the same fields.
@@ -186,6 +190,9 @@ func modelKeyOrder(data []byte) []string {
 
 var kvTypes = []string{"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"}
 
+// gfxVersionRe is a gfx_override value: major.minor.stepping (decimal), as HSA_OVERRIDE_GFX_VERSION takes it.
+var gfxVersionRe = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
 func (c *Config) validate() error {
 	var errs []error
 	if c.OldDefaults != nil {
@@ -207,6 +214,12 @@ func (c *Config) validate() error {
 		}
 		if d.MaxRunning != nil && *d.MaxRunning < 1 {
 			errs = append(errs, fmt.Errorf("devices.%s.max_running: must be at least 1", name))
+		}
+		if d.GFXOverride != "" && !gfxVersionRe.MatchString(d.GFXOverride) {
+			errs = append(errs, fmt.Errorf("devices.%s.gfx_override: %q is not a gfx version (major.minor.stepping, e.g. 10.3.0)", name, d.GFXOverride))
+		}
+		if d.GFXOverride != "" && !strings.EqualFold(d.Backend, "rocm") {
+			errs = append(errs, fmt.Errorf("devices.%s.gfx_override: only a rocm device has one", name))
 		}
 		if d.ReserveMiB != nil && *d.ReserveMiB < 0 {
 			errs = append(errs, fmt.Errorf("devices.%s.reserve_mib: must not be negative", name))
