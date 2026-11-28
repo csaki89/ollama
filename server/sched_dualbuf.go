@@ -221,6 +221,11 @@ func (s *Scheduler) dualbufStarted(ctx context.Context, m *Model, llama llm.Llam
 	grant.ReleaseOnDone(ctx)
 }
 
+// dualbufPlaced: the load has a dualbuf placement (a multi-model config): its room, waits and evictions are the dualbuf's.
+func dualbufPlaced(req *LlmRequest) bool {
+	return req != nil && req.model != nil && req.model.dualbuf != nil && req.model.dualbuf.placement != ""
+}
+
 // dualbufPlacementGPUs picks the device the request was placed on from the discovered devices.
 func (s *Scheduler) dualbufPlacementGPUs(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, predicted uint64) ([]ml.DeviceInfo, api.Options) {
 	db := req.model.dualbuf

@@ -162,3 +162,63 @@ func TestDualbufExtraDevicesTwoROCm(t *testing.T) {
 		t.Fatalf("env %v", env)
 	}
 }
+
+// a mixed ROCm + Vulkan config: a runner placed on the Vulkan card loads the Vulkan backend first and the HIP backend of
+// its list's ROCm card (in-process moves), with the ROCm card's own variables; a runner of the Vulkan card alone gets
+// no ROCm variable and only the Vulkan backend
+func TestDualbufMixedROCmVulkanRunners(t *testing.T) {
+	rocmDir, vkDir := t.TempDir(), t.TempDir()
+	for _, f := range []string{filepath.Join(rocmDir, "libggml-hip.so"), filepath.Join(vkDir, "libggml-vulkan.so")} {
+		if err := os.WriteFile(f, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rocmEnv := map[string]string{"HSA_OVERRIDE_GFX_VERSION_2": "10.3.0"}
+	rocm := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0000:aa:00.0", Library: "ROCm"}, FilterID: "1", LibraryPath: []string{rocmDir}, RunnerEnvOverrides: rocmEnv}
+	vk := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0", Library: "Vulkan"}, LibraryPath: []string{vkDir}}
+
+	// the Vulkan card alone
+	libs0, env0 := ml.LibraryPaths([]ml.DeviceInfo{vk}), ml.GetDevicesEnv([]ml.DeviceInfo{vk})
+	libs, env := dualbufExtraDevices([]ml.DeviceInfo{vk}, nil, libs0, env0)
+	if slices.Contains(libs, rocmDir) {
+		t.Fatalf("vulkan alone: library paths %v", libs)
+	}
+	for k := range env {
+		if strings.HasPrefix(k, "HSA_OVERRIDE_GFX_VERSION") || k == "ROCR_VISIBLE_DEVICES" || k == "HIP_VISIBLE_DEVICES" {
+			t.Fatalf("vulkan alone gets a ROCm variable: %v", env)
+		}
+	}
+
+	// placed on the Vulkan card, the ROCm card of its list in the process too
+	libs, env = dualbufExtraDevices([]ml.DeviceInfo{vk}, []ml.DeviceInfo{rocm}, libs0, env0)
+	want := filepath.Join(vkDir, "libggml-vulkan.so") + string(filepath.ListSeparator) + filepath.Join(rocmDir, "libggml-hip.so")
+	if env["GGML_BACKEND_PATH"] != want || !slices.Contains(libs, rocmDir) || !slices.Contains(libs, vkDir) {
+		t.Fatalf("vulkan first: backends %q libs %v", env["GGML_BACKEND_PATH"], libs)
+	}
+	if env["HSA_OVERRIDE_GFX_VERSION_2"] != "10.3.0" || env["GGML_VK_VISIBLE_DEVICES"] != "0" {
+		t.Fatalf("each backend its own card: %v", env)
+	}
+}
+
+// the runner passes several backends in GGML_BACKEND_PATH (a PATH-like list): the llama.cpp patch must split it, or
+// the whole list is taken as one file name and no GPU backend loads (patch 003 lacked that hunk)
+func TestDualbufPatchSplitsBackendPath(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "llama", "compat", "003-dual-buffer.patch"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := string(b)
+	i := strings.Index(p, "+++ b/ggml/src/ggml-backend-reg.cpp")
+	if i < 0 {
+		t.Fatal("patch 003 does not change ggml-backend-reg.cpp")
+	}
+	hunk := p[i:]
+	if j := strings.Index(hunk, "\ndiff --git"); j > 0 {
+		hunk = hunk[:j]
+	}
+	for _, s := range []string{`std::getenv("GGML_BACKEND_PATH")`, "paths.find(sep, start)", "+                ggml_backend_load(path.c_str());"} {
+		if !strings.Contains(hunk, s) {
+			t.Fatalf("patch 003: the GGML_BACKEND_PATH list is not split (%q missing)", s)
+		}
+	}
+}

@@ -228,3 +228,41 @@ func TestDualbufLoadDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("the other runner's uncharged host memory goes to the launch: %v", got.ExtraEnv)
 	}
 }
+
+// a placed load on a GPU whose free memory the stock estimate finds too small (the room was made by the dualbuf: a park,
+// the rest of the model goes to the CPU) is launched: the stock "predicted to exceed available memory, evicting" branch
+// does not run (it asked for an eviction with nothing left to evict, and the load waited for an event that never came)
+func TestDualbufLoadSkipsStockPreflight(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 20*time.Second)
+	defer done()
+	s := InitScheduler(ctx)
+	s.dualbuf = dualbufTestScheduler(t, sprintf(schedTestConfig, "true")).dualbuf
+	s.dualbuf.NoteDevices([]ml.DeviceInfo{testGPU0, testGPU1})
+	cfg := s.dualbuf.Config()
+	other := mkRunner(s, cfg, "other", "gpu1", 1, 0, time.Minute)
+	other.llama = &unchargedLlm{}
+
+	a := newScenarioRequest(t, ctx, "ollama-model-1", 10, &api.Duration{Duration: time.Minute}, nil)
+	a.req.model.ShortName = "small:latest"
+	a.req.model.dualbuf = &dualbufLoad{cfg: cfg, eff: cfg.Resolve("small:latest", nil, nil, nil, nil), placement: "gpu0", tiers: []string{"gpu0", "cpu"}}
+	launched := false
+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		launched = true
+		return a.newServer(systemInfo, gpus, model, f, adapters, projectors, opts, numParallel, config)
+	}
+	gpu := testGPU0
+	gpu.FreeMemory = 1 // far below any estimate
+	finished := make(chan bool, 1)
+	go func() { finished <- s.load(a.req, getSystemInfoFn(), []ml.DeviceInfo{gpu}, true) }()
+	select {
+	case evict := <-finished:
+		if evict || !launched {
+			t.Fatalf("the placed load is launched, no stock eviction: evict=%v launched=%v", evict, launched)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("load did not return")
+	}
+	if !dualbufPlaced(a.req) || dualbufPlaced(&LlmRequest{model: &Model{}}) {
+		t.Fatal("placed: a dualbuf placement only")
+	}
+}

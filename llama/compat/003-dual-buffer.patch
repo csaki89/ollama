@@ -267,7 +267,7 @@ index afb86338a..aefd49b49 100644
      GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
  
 diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
-index 4e9681c9f..685d5b2cb 100644
+index 4e9681c9f..03dc485bb 100644
 --- a/ggml/src/ggml-backend-reg.cpp
 +++ b/ggml/src/ggml-backend-reg.cpp
 @@ -218,6 +218,31 @@ struct ggml_backend_registry {
@@ -302,6 +302,31 @@ index 4e9681c9f..685d5b2cb 100644
          dl_handle_ptr handle { dl_load_library(path) };
          if (!handle) {
              if (!silent) {
+@@ -591,8 +616,23 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
+     ggml_backend_load_best("openvino", silent, dir_path);
+     ggml_backend_load_best("cpu", silent, dir_path);
+     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
++    // (dual-buffer fork: a list of backends, separated like PATH: ';' on Windows, ':' elsewhere, loaded in that order)
+     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
+     if (backend_path) {
+-        ggml_backend_load(backend_path);
++#ifdef _WIN32
++        const char sep = ';';
++#else
++        const char sep = ':';
++#endif
++        std::string paths(backend_path);
++        size_t start = 0;
++        while (start <= paths.size()) {
++            const size_t end = std::min(paths.find(sep, start), paths.size());
++            const std::string path = paths.substr(start, end - start);
++            if (!path.empty()) {
++                ggml_backend_load(path.c_str());
++            }
++            start = end + 1;
++        }
+     }
+ }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 3520b4349..cfbc3fead 100644
 --- a/ggml/src/ggml-backend.cpp
