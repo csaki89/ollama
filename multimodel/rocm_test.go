@@ -108,3 +108,14 @@ func TestROCmEnv(t *testing.T) {
 		t.Fatal("no cards")
 	}
 }
+
+// the runtime's own numbering counts every KFD GPU node in node order, a card it does not support included
+func TestROCrIndices(t *testing.T) {
+	got := ROCrIndices(map[string]int{"0000:aa:00.0": 2, "0000:bb:00.0": 1, "0000:cc:00.0": 4})
+	if len(got) != 3 || got["0000:bb:00.0"] != 0 || got["0000:aa:00.0"] != 1 || got["0000:cc:00.0"] != 2 {
+		t.Fatalf("indices %v", got)
+	}
+	if len(ROCrIndices(nil)) != 0 {
+		t.Fatal("no topology")
+	}
+}

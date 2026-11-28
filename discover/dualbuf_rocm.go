@@ -19,12 +19,17 @@ import (
 )
 
 // DualbufROCmCards are the rocm cards of the multi-model config: their device names, PCI addresses, and the
-// environment of every ROCm process (the per-card gfx overrides).
+// environment of every ROCm process (the per-card gfx overrides). ROCrIndex is each card's index in the ROCm runtime's
+// numbering (ROCR_VISIBLE_DEVICES), by PCI address: it counts the cards the runtime skips, the HIP ordinals do not.
 type DualbufROCmCards struct {
-	Devices []string
-	PCIs    []string
-	Env     map[string]string
+	Devices   []string
+	PCIs      []string
+	Env       map[string]string
+	ROCrIndex map[string]int
 }
+
+// dualbufBootstrap runs a discovery pass (a test replaces it).
+var dualbufBootstrap = bootstrapDevicesWithStatusWatchdog
 
 // DualbufROCm is set by the server when the config names rocm cards; known are the devices the other libraries found
 // (to resolve a name match to a PCI address). nil, or no cards: the stock ROCm discovery.
@@ -48,7 +53,7 @@ func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []stri
 	env := dualbufROCmEnv(cards)
 	slog.Info("dualbuf: ROCm discovery", "cards", dualbufCardList(cards), "env", DualbufROCmEnvSummary(env))
 	c, cancel := context.WithTimeout(ctx, timeout)
-	devs, status, err := bootstrapDevicesWithStatusWatchdog(c, dirs, env)
+	devs, status, err := dualbufBootstrap(c, dirs, env)
 	cancel()
 	found := map[string]bool{}
 	ordinal := 0
@@ -67,8 +72,14 @@ func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []stri
 			slog.Info("dualbuf: a ROCm card that is not a rocm device of the config is not used", "pci", d.PCIID, "rocm_ordinal", idx)
 			continue
 		}
+		// the filter ID selects the card in every later ROCm process (ROCR_VISIBLE_DEVICES): the runtime's own index,
+		// which counts a skipped card; the HIP ordinal does not, and would select that card instead
+		rocr, ok := cards.ROCrIndex[pci]
+		if !ok {
+			rocr = idx
+		}
 		d.ID = pci
-		d.FilterID = strconv.Itoa(idx)
+		d.FilterID = strconv.Itoa(rocr)
 		d.PCIID = pci
 		if d.RunnerEnvOverrides == nil {
 			d.RunnerEnvOverrides = map[string]string{}
@@ -76,7 +87,7 @@ func dualbufDiscoverROCm(ctx context.Context, timeout time.Duration, dirs []stri
 		maps.Copy(d.RunnerEnvOverrides, env)
 		out = append(out, d)
 		found[pci] = true
-		slog.Info("dualbuf: ROCm card found", "device", cards.Devices[i], "pci", pci, "rocm_ordinal", idx)
+		slog.Info("dualbuf: ROCm card found", "device", cards.Devices[i], "pci", pci, "rocm_ordinal", idx, "rocr_index", rocr)
 	}
 	reason := lastDiscoveryStatusError(status)
 	if reason == "" && err != nil {

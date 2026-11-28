@@ -174,6 +174,8 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 				defer wg.Done()
 				extraEnvs := ml.GetDevicesEnv(devices[i : i+1])
 				devices[i].AddInitValidation(extraEnvs)
+				// dual-buffer fork: the narrowing variables of the verification pass
+				slog.Debug("verifying device: visible devices and overrides", "library", devices[i].Library, "pci_id", devices[i].PCIID, "filter_id", devices[i].FilterID, "env", DualbufROCmEnvSummary(extraEnvs))
 				if len(bootstrapDevicesWithMetalRetry(ctx2ndPass, ctx, 30*time.Second, devices[i].LibraryPath, extraEnvs)) == 0 {
 					slog.Debug("filtering device which didn't fully initialize",
 						"id", devices[i].ID,

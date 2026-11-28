@@ -134,6 +134,26 @@ func (c *Config) ROCmCards(kfd map[string]int, known []ml.DeviceInfo) (cards []R
 	return cards, notes
 }
 
+// ROCrIndices maps the PCI address of every KFD GPU node to its index in the ROCm runtime's own GPU numbering (what
+// ROCR_VISIBLE_DEVICES selects): the GPU nodes in KFD node order, a card the runtime does not support included (it
+// skips that card later, so the HIP ordinals of a process differ from these indices).
+func ROCrIndices(kfd map[string]int) map[string]int {
+	type gpu struct {
+		pci  string
+		node int
+	}
+	gpus := make([]gpu, 0, len(kfd))
+	for p, n := range kfd {
+		gpus = append(gpus, gpu{p, n})
+	}
+	sort.Slice(gpus, func(i, j int) bool { return gpus[i].node < gpus[j].node })
+	out := make(map[string]int, len(gpus))
+	for i, g := range gpus {
+		out[g.pci] = i
+	}
+	return out
+}
+
 // ROCmEnv is the gfx override environment of every ROCm process: HSA_OVERRIDE_GFX_VERSION_<node> for each card with a
 // gfx_override, never the global HSA_OVERRIDE_GFX_VERSION.
 func ROCmEnv(cards []ROCmCard) map[string]string {

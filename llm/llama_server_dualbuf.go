@@ -509,9 +509,10 @@ func dualbufLogROCmEnv(model string, env map[string]string) {
 			perCard = perCard || strings.HasPrefix(k, "HSA_OVERRIDE_GFX_VERSION_")
 		}
 	}
+	sort.Strings(parts)
+	slog.Debug("dualbuf: visible devices and gfx overrides of the runner", "model", model, "env", strings.Join(parts, " "))
 	if !perCard {
 		return
 	}
-	sort.Strings(parts)
 	slog.Info("dualbuf: ROCm gfx overrides of the runner", "model", model, "env", strings.Join(parts, " "))
 }

@@ -30,8 +30,8 @@ jobs:
           cache-dependency-path: go.sum
       - name: go vet
         run: go vet ./multimodel/ ./llm/ ./server/
-      - name: go test (multimodel, llm)
-        run: go test -race -count=1 ./multimodel/ ./llm/
+      - name: go test (multimodel, llm, discover)
+        run: go test -race -count=1 ./multimodel/ ./llm/ ./discover/
       - name: go test (server)
         run: go test -race -count=1 ./server/
 

@@ -1079,7 +1079,7 @@ func dualbufROCmCards(cfg *multimodel.Config, kfd map[string]int, known []ml.Dev
 	if len(cards) == 0 {
 		return nil
 	}
-	out := &discover.DualbufROCmCards{Env: multimodel.ROCmEnv(cards)}
+	out := &discover.DualbufROCmCards{Env: multimodel.ROCmEnv(cards), ROCrIndex: multimodel.ROCrIndices(kfd)}
 	for _, c := range cards {
 		out.Devices = append(out.Devices, c.Device)
 		out.PCIs = append(out.PCIs, c.PCI)
